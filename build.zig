@@ -356,6 +356,121 @@ pub fn build(b: *std.Build) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+
+    // ── fleet embed: text/chat-only C ABI static lib for the BEAM NIF host.
+    //
+    // `zig build mac-lib` → zig-out/lib/libmlxserve_embed.a (macOS host,
+    // MLX safetensors text path; GGUF/ds4 link for parity with the exe).
+    // src/embed.zig exposes init/tokenize/generate/cancel/load/unload/stats
+    // + a versioned ABI handshake (mlxembed_abi_version). No HTTP server,
+    // no media/modality engines — fleet serves the endpoint surface itself.
+    // See fleet: native/mlx_embed_nif.c.
+    addMacLib(b, target, optimize, macos_sdk_frameworks, version);
+}
+
+fn addMacLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    macos_sdk_frameworks: ?[]const u8,
+    version: []const u8,
+) void {
+    // Mirror the macOS exe's options + modules so the shared engine sources
+    // (model.zig, scheduler.zig, model_registry.zig, …) resolve their top-level
+    // @import("...") modules and build_options members. The embed only runs the
+    // text/chat path; the extra modules (opencode2, agent_skills, ANE, gguf) are
+    // imported-but-unused and tree-shake away. Keep this in lockstep with the
+    // exe module above so `zig build mac-lib` survives a main bump.
+    const embed_options = b.addOptions();
+    embed_options.addOption([]const u8, "version", version);
+    embed_options.addOption(bool, "mas", false);
+    embed_options.addOption([]const u8, "mlx_c_version", "unknown");
+    embed_options.addOption([]const u8, "ds4_commit", "unknown");
+    embed_options.addOption([]const u8, "llama_tag", "unknown");
+    embed_options.addOption([]const u8, "git_sha", "");
+    // macOS host: the real ds4 + llama.cpp engines link (no iOS stubs).
+    embed_options.addOption(bool, "ios", false);
+    embed_options.addOption(bool, "macos_engines", true);
+    embed_options.addOption(bool, "slow_tests", false);
+
+    const ds4_metal_sources = b.createModule(.{
+        .root_source_file = b.path("lib/ds4_metal_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const opencode2_plugin = b.createModule(.{
+        .root_source_file = b.path("lib/opencode2_plugin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const agent_skills = b.createModule(.{
+        .root_source_file = b.path("skills/agent_skills.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/embed.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = embed_options.createModule() },
+            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
+            .{ .name = "opencode2_plugin", .module = opencode2_plugin },
+            .{ .name = "agent_skills", .module = agent_skills },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
+        },
+    });
+
+    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    mod.addIncludePath(b.path("lib/jinja_cpp"));
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
+    mod.addIncludePath(b.path("lib"));
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
+    addDs4Sources(b, mod);
+    mod.addIncludePath(b.path("lib/ds4"));
+    addAneSources(b, mod);
+    addLlamaLib(b, mod);
+    addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
+    addMlxLib(b, mod);
+    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    mod.linkSystemLibrary("webp", .{});
+
+    if (macos_sdk_frameworks) |fw_path| {
+        mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+    }
+    mod.linkFramework("IOKit", .{});
+    mod.linkFramework("CoreFoundation", .{});
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("Metal", .{});
+    mod.linkFramework("IOSurface", .{});
+
+    const lib = b.addLibrary(.{
+        .name = "mlxserve_embed",
+        .root_module = mod,
+        .linkage = .static,
+    });
+
+    const install = b.addInstallArtifact(lib, .{});
+    const step = b.step("mac-lib", "Build the fleet-embed text/chat static lib (macOS host)");
+    step.dependOn(&install.step);
 }
 
 /// Hermetic Latent2RGB + JPEG tests. No MLX, no Homebrew — the only `zig build`
