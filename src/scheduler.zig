@@ -1825,11 +1825,23 @@ pub const Scheduler = struct {
         // actually run the request. Critical when two models with
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
-        const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const slot_config: *const ModelConfig = params.model.config orelse {
+            if (params.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+            if (params.mrope_pos) |pos| self.allocator.free(pos);
+            return error.ModelNotReady;
+        };
         // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
-        if (params.prompt_ids.len == 0) return error.EmptyPrompt;
+        if (params.prompt_ids.len == 0) {
+            if (params.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+            if (params.mrope_pos) |pos| self.allocator.free(pos);
+            return error.EmptyPrompt;
+        }
         const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
-        const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
+        const slot = Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant) catch |err| {
+            if (params.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+            if (params.mrope_pos) |pos| self.allocator.free(pos);
+            return err;
+        };
         errdefer slot.deinit();
 
         self.queue_mu.lockUncancelable(self.io);

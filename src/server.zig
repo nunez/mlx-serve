@@ -9707,7 +9707,7 @@ fn handleChatCompletions(
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
     if (lm.vision_encoder != null) {
-        mm = prepareMultimodalPrompt(allocator, lm, config, messages.items, &prompt_ids_raw) catch |err| {
+        mm = prepareMultimodalPrompt(allocator, global_scheduler.?, lm, config, messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
             log.warn("POST /v1/chat/completions -> {d} ({s})\n", .{ f.code, @errorName(err) });
@@ -14788,8 +14788,7 @@ fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
 /// Encode `mp` on the inference thread (the sole mlx caller) and return every
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
 /// item k's row count.
-fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !mlx.mlx_array {
-    const sch = global_scheduler orelse return error.NoScheduler;
+fn encodeMediaItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !mlx.mlx_array {
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
     var req = scheduler_mod.VisionEncodeRequest{
@@ -14885,7 +14884,7 @@ fn computeMiniCpmMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, it
 
 /// One request's media, ready for a slot: the soft tokens, the per-item
 /// prefix-cache key and the M-RoPE table. Owns all three until moved out.
-const MultimodalPrompt = struct {
+pub const MultimodalPrompt = struct {
     embeddings: ?mlx.mlx_array = null,
     media: []prefix_cache_mod.MediaSpan = &.{},
     mrope: MropeData = .{},
@@ -14897,7 +14896,7 @@ const MultimodalPrompt = struct {
         return @as(u64, self.rows) * config.hidden_size * 2;
     }
 
-    fn deinit(self: *MultimodalPrompt, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *MultimodalPrompt, allocator: std.mem.Allocator) void {
         if (self.embeddings) |e| _ = mlx.mlx_array_free(e);
         allocator.free(self.media);
         if (self.mrope.pos) |p| allocator.free(p);
@@ -14907,7 +14906,7 @@ const MultimodalPrompt = struct {
 
 /// Encode every media item in `messages` and expand the placeholders the
 /// template rendered for them; `prompt_ids` is replaced by the expanded prompt.
-fn prepareMultimodalPrompt(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
+pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
     const items = try collectMediaItems(allocator, messages);
     defer allocator.free(items);
     return prepareMultimodalItems(allocator, lm, config, items, prompt_ids);
@@ -14931,7 +14930,7 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
     var out: MultimodalPrompt = .{};
     errdefer out.deinit(allocator);
-    out.embeddings = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
+    out.embeddings = try encodeMediaItems(allocator, sch, lm, items, mp, item_tokens);
     const expanded = try expandMediaPlaceholders(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, config);
     out.media = expanded.media;
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
@@ -16701,7 +16700,7 @@ fn handleAnthropicMessages(
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
     if (lm.vision_encoder != null) {
-        mm = prepareMultimodalPrompt(allocator, lm, config, messages.items, &prompt_ids_raw) catch |err| {
+        mm = prepareMultimodalPrompt(allocator, global_scheduler.?, lm, config, messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
             log.warn("POST /v1/messages -> {d} ({s})\n", .{ f.code, @errorName(err) });
@@ -18521,7 +18520,7 @@ fn handleResponsesInner(
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
     if (lm.vision_encoder != null) {
-        mm = prepareMultimodalPrompt(allocator, lm, config, pi.messages.items, &prompt_ids_raw) catch |err| {
+        mm = prepareMultimodalPrompt(allocator, global_scheduler.?, lm, config, pi.messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
             log.warn("POST /v1/responses -> {d} ({s})\n", .{ f.code, @errorName(err) });
@@ -21726,6 +21725,41 @@ test "expandMediaPlaceholders: each rendered placeholder becomes its own item's 
         try t.expectError(error.MediaPlaceholderMismatch, expandMediaPlaceholders(t.allocator, &.{ 1, 2 }, &one, &.{1}, &.{11}, &config));
         try t.expectError(error.MediaPlaceholderMismatch, expandMediaPlaceholders(t.allocator, &.{ 1, 10, 2 }, &one, &.{1}, &.{11}, &config));
     }
+}
+
+test "Qwen image prompt: expanded grids carry M-RoPE positions and image-specific cache keys" {
+    const a = testing.allocator;
+    const config = model_mod.ModelConfig{
+        .qwen_vision = true,
+        .image_token_id = 9,
+        .video_token_id = 10,
+        .vision_start_token_id = 7,
+        .qv_merge = 2,
+    };
+    const images = [_]chat_mod.ImageData{
+        .{ .pixels = "red", .width = 64, .height = 64, .grid_h = 4, .grid_w = 4 },
+        .{ .pixels = "blue", .width = 64, .height = 32, .grid_h = 2, .grid_w = 4 },
+    };
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "", .images = &images }};
+    const items = try collectMediaItems(a, &messages);
+    defer a.free(items);
+    var pieces = try MediaPieces.init(a, items);
+    defer pieces.deinit(a);
+    try testing.expect(pieces.item_keys[0] != pieces.item_keys[1]);
+    const expanded = try expandMediaPlaceholders(a, &.{ 1, 7, 9, 8, 2, 7, 9, 8, 3 }, items, &.{ 4, 2 }, pieces.item_keys, &config);
+    defer a.free(expanded.ids);
+    defer a.free(expanded.media);
+    const rope = try computeQwenMrope(a, expanded.ids, items, &config);
+    defer if (rope.pos) |pos| a.free(pos);
+    try testing.expectEqual(@as(usize, 13), rope.total);
+    try testing.expectEqual(@as(i32, -2), rope.delta);
+    try testing.expectEqualSlices(i32, &.{
+        0, 1, 2, 2, 2, 2, 4, 5, 6, 7, 7, 9, 10,
+        0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 9, 10,
+        0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    }, rope.pos.?);
+    try testing.expectEqual(pieces.item_keys[0], expanded.media[0].key);
+    try testing.expectEqual(pieces.item_keys[1], expanded.media[1].key);
 }
 
 test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile labelled" {

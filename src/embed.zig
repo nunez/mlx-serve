@@ -1,8 +1,8 @@
-//! fleet embed — text/chat-only C ABI over the mlx-serve engine, for a BEAM
+//! fleet embed — text/vision chat C ABI over the mlx-serve engine, for a BEAM
 //! (Elixir) NIF host.
 //!
-//! Scope: chat-completions surface only (text in, token stream out, stats).
-//! Image / video / music / speech engines stay standalone; media model dirs
+//! Scope: chat-completions surface (text + Qwen images in, token stream out).
+//! Image / video / music / speech generation engines stay standalone; media model dirs
 //! are refused at init. The HTTP server is not used — the host drives the
 //! scheduler directly.
 //!
@@ -20,6 +20,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const gen_mod = @import("gen.zig");
 const scheduler_mod = @import("scheduler.zig");
+const server = @import("server.zig");
 const model_registry_mod = @import("model_registry.zig");
 const transformer_mod = @import("transformer.zig");
 pub const log = @import("log.zig");
@@ -93,6 +94,11 @@ pub const GenParams = extern struct {
     request_timeout_ms: u64, // 0 => none
 };
 
+pub const EncodedImage = extern struct {
+    data: ?[*]const u8,
+    len: usize,
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const Embed = struct {
@@ -105,7 +111,6 @@ const Embed = struct {
     enable_mtp: bool,
     shutting_down: std.atomic.Value(bool) = .init(false),
     feeders: std.atomic.Value(i64) = .init(0),
-    next_id: std.atomic.Value(u64) = .init(1),
 };
 
 const Feeder = struct {
@@ -120,7 +125,11 @@ const Feeder = struct {
 
 var g_embed: ?*Embed = null;
 var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
-var g_last_err: [512:0]u8 = std.mem.zeroes([512:0]u8);
+var g_shutdown_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_generations_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_generations: std.AutoHashMapUnmanaged(u64, *scheduler_mod.Slot) = .{};
+var g_next_id: std.atomic.Value(u64) = .init(1);
+threadlocal var g_last_err: [512:0]u8 = std.mem.zeroes([512:0]u8);
 
 fn setErr(comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.bufPrint(g_last_err[0 .. g_last_err.len - 1], fmt, args) catch {
@@ -135,12 +144,12 @@ fn lastErr() []const u8 {
 }
 
 fn reasonCode(r: []const u8) u8 {
-    if (std.mem.eql(u8, r, "stop")) return @intFromEnum(Reason.stop);
-    if (std.mem.eql(u8, r, "length")) return @intFromEnum(Reason.length);
-    if (std.mem.eql(u8, r, "abort")) return @intFromEnum(Reason.abort);
-    if (std.mem.eql(u8, r, "content_filtered")) return @intFromEnum(Reason.content_filtered);
-    if (std.mem.eql(u8, r, "model_context_window_exceeded")) return @intFromEnum(Reason.model_context_window_exceeded);
-    return @intFromEnum(Reason.other);
+    if (std.mem.eql(u8, r, "stop")) return @backingInt(Reason.stop);
+    if (std.mem.eql(u8, r, "length")) return @backingInt(Reason.length);
+    if (std.mem.eql(u8, r, "abort")) return @backingInt(Reason.abort);
+    if (std.mem.eql(u8, r, "content_filtered")) return @backingInt(Reason.content_filtered);
+    if (std.mem.eql(u8, r, "model_context_window_exceeded")) return @backingInt(Reason.model_context_window_exceeded);
+    return @backingInt(Reason.other);
 }
 
 fn basename(path: []const u8) []const u8 {
@@ -183,11 +192,7 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     }
     if (i >= s.len) return 0;
     const lead = s[i];
-    const expected: usize = if (lead & 0x80 == 0) 1
-    else if (lead & 0xE0 == 0xC0) 2
-    else if (lead & 0xF0 == 0xE0) 3
-    else if (lead & 0xF8 == 0xF0) 4
-    else return 0;
+    const expected: usize = if (lead & 0x80 == 0) 1 else if (lead & 0xE0 == 0xC0) 2 else if (lead & 0xF0 == 0xE0) 3 else if (lead & 0xF8 == 0xF0) 4 else return 0;
     const actual = s.len - i;
     return if (actual < expected) actual else 0;
 }
@@ -198,8 +203,6 @@ fn feederMain(f: *Feeder) void {
     const e = f.embed;
     const alloc = e.allocator;
 
-    var text_buf: [8192]u8 = undefined;
-    var text_len: usize = 0;
     var carry: [4]u8 = undefined;
     var carry_len: usize = 0;
     var result: FeederResult = .ok;
@@ -208,12 +211,15 @@ fn feederMain(f: *Feeder) void {
     const flush = struct {
         fn run(feeder: *Feeder, buf: []const u8) void {
             if (buf.len > 0) {
-                feeder.cb(feeder.cb_ctx, feeder.gen_id, @intFromEnum(Event.text), buf.ptr, @intCast(buf.len));
+                feeder.cb(feeder.cb_ctx, feeder.gen_id, @backingInt(Event.text), buf.ptr, @intCast(buf.len));
             }
         }
     }.run;
 
     defer {
+        _ = std.c.pthread_mutex_lock(&g_generations_mutex);
+        _ = g_generations.remove(f.gen_id);
+        _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
         // Emit DONE or ERR based on result, then release resources.
         if (result == .ok) {
             const info = DoneInfo{
@@ -226,9 +232,9 @@ fn feederMain(f: *Feeder) void {
                 .decode_ns = f.slot.decode_ns,
             };
             const ptr: [*]const u8 = @ptrCast(&info);
-            f.cb(f.cb_ctx, f.gen_id, @intFromEnum(Event.done), ptr, @sizeOf(DoneInfo));
+            f.cb(f.cb_ctx, f.gen_id, @backingInt(Event.done), ptr, @sizeOf(DoneInfo));
         } else {
-            f.cb(f.cb_ctx, f.gen_id, @intFromEnum(Event.err), null, 0);
+            f.cb(f.cb_ctx, f.gen_id, @backingInt(Event.err), null, 0);
         }
         e.scheduler.complete(f.slot);
         e.scheduler.release(f.lm);
@@ -243,7 +249,12 @@ fn feederMain(f: *Feeder) void {
         };
         switch (nr) {
             .token => |tok_id| {
+                if (f.slot.cancelled.load(.acquire)) {
+                    final_reason = "abort";
+                    break;
+                }
                 const raw = decodeToken(alloc, f.lm, tok_id) catch {
+                    setErr("token decode failed", .{});
                     result = .errored;
                     break;
                 };
@@ -256,6 +267,10 @@ fn feederMain(f: *Feeder) void {
                     if (merged) |m| {
                         combined = m;
                         owned = true;
+                    } else {
+                        setErr("oom: UTF-8 token carry", .{});
+                        result = .errored;
+                        break;
                     }
                 }
                 defer if (owned) alloc.free(combined);
@@ -270,27 +285,17 @@ fn feederMain(f: *Feeder) void {
                 const emit_len = combined.len - tail;
                 if (emit_len == 0) continue;
 
-                // Append to buffer, flushing on overflow.
-                var n: usize = 0;
-                while (n < emit_len) {
-                    const room = text_buf.len - text_len;
-                    const chunk = @min(room, emit_len - n);
-                    @memcpy(text_buf[text_len .. text_len + chunk], combined[n .. n + chunk]);
-                    text_len += chunk;
-                    n += chunk;
-                    if (text_len == text_buf.len) {
-                        flush(f, text_buf[0..text_len]);
-                        text_len = 0;
-                    }
-                }
+                flush(f, combined[0..emit_len]);
             },
             .done => {
-                final_reason = f.slot.finish_reason;
-                flush(f, text_buf[0..text_len]);
-                text_len = 0;
+                final_reason = if (f.slot.cancelled.load(.acquire))
+                    "abort"
+                else
+                    f.slot.finish_reason;
                 break;
             },
             .err => {
+                setErr("generation: {s}", .{f.slot.error_code orelse "unknown error"});
                 result = .errored;
                 break;
             },
@@ -453,7 +458,7 @@ export fn mlxembed_init(cfg: *const InitConfig) callconv(.c) i32 {
         .tok = tok,
         .chat_config = chat_config,
         .model_dir = model_dir,
-        .load_vision = false,
+        .load_vision = config_storage.has_vision,
         .warmup_eager = cfg.warmup != 0,
         .mtp_enabled = cfg.enable_mtp != 0,
         .prefix_cache_capacity = 1,
@@ -492,6 +497,8 @@ export fn mlxembed_init(cfg: *const InitConfig) callconv(.c) i32 {
 }
 
 export fn mlxembed_shutdown() callconv(.c) void {
+    _ = std.c.pthread_mutex_lock(&g_shutdown_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_shutdown_mutex);
     _ = std.c.pthread_mutex_lock(&g_mutex);
     const e = g_embed orelse {
         _ = std.c.pthread_mutex_unlock(&g_mutex);
@@ -503,7 +510,8 @@ export fn mlxembed_shutdown() callconv(.c) void {
 
     // Wait for feeder threads to drain (cancel triggers their terminal event).
     var spins: usize = 0;
-    while (e.feeders.load(.acquire) > 0 and spins < 2000) : (spins += 1) {
+    while (e.feeders.load(.acquire) > 0) : (spins += 1) {
+        if (spins == 2000) log.warn("embed shutdown still draining cancelled generations\n", .{});
         const ts = std.c.timespec{ .sec = 0, .nsec = 5_000_000 };
         _ = std.c.nanosleep(&ts, null);
     }
@@ -516,9 +524,27 @@ export fn mlxembed_shutdown() callconv(.c) void {
     const alloc = e.allocator;
     alloc.destroy(e);
     g_embed = null;
+    _ = std.c.pthread_mutex_lock(&g_generations_mutex);
+    g_generations.deinit(alloc);
+    g_generations = .{};
+    _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
 }
 
 export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyopaque) callconv(.c) i64 {
+    return generate(cfg, &.{}, cb, cb_ctx);
+}
+
+/// Encoded bytes are borrowed only until this call returns; preprocessing
+/// is CPU-only and the scheduler runs the encoder on its inference thread.
+export fn mlxembed_generate_images(cfg: *const GenParams, images: ?[*]const EncodedImage, image_count: usize, cb: Callback, cb_ctx: ?*anyopaque) callconv(.c) i64 {
+    if (image_count > 0 and images == null) {
+        setErr("images: missing encoded image array", .{});
+        return -10;
+    }
+    return generate(cfg, if (images) |p| p[0..image_count] else &.{}, cb, cb_ctx);
+}
+
+fn generate(cfg: *const GenParams, images: []const EncodedImage, cb: Callback, cb_ctx: ?*anyopaque) i64 {
     _ = std.c.pthread_mutex_lock(&g_mutex);
     defer _ = std.c.pthread_mutex_unlock(&g_mutex);
     const e = embedOr(-1) orelse return -1;
@@ -547,7 +573,7 @@ export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyop
         setErr("model has no tokenizer", .{});
         return -5;
     };
-    const prompt_ids = t.encode(alloc, prompt) catch |err| {
+    var prompt_ids = t.encode(alloc, prompt) catch |err| {
         e.scheduler.release(lm);
         setErr("tokenize: {s}", .{@errorName(err)});
         return -5;
@@ -560,8 +586,58 @@ export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyop
         return -6;
     };
 
+    var mm: server.MultimodalPrompt = .{};
+    defer mm.deinit(alloc);
+    if (config.qwen_vision and std.mem.count(u32, prompt_ids, &.{config.image_token_id}) != images.len) {
+        e.scheduler.release(lm);
+        setErr("images: prompt must contain one image placeholder per attached image", .{});
+        return -10;
+    }
+    if (images.len > 0) {
+        if (!config.qwen_vision or lm.vision_encoder == null) {
+            e.scheduler.release(lm);
+            setErr("images: model has no Qwen vision encoder", .{});
+            return -10;
+        }
+        const decoded = alloc.alloc(chat_mod.ImageData, images.len) catch {
+            e.scheduler.release(lm);
+            setErr("oom: images", .{});
+            return -11;
+        };
+        var decoded_count: usize = 0;
+        defer {
+            for (decoded[0..decoded_count]) |im| alloc.free(im.pixels);
+            alloc.free(decoded);
+        }
+        const vp = server.visionPreprocFromConfig(config);
+        for (images, 0..) |encoded, i| {
+            if (encoded.data == null or encoded.len == 0 or encoded.len > std.math.maxInt(c_int)) {
+                e.scheduler.release(lm);
+                setErr("images: invalid encoded image {d}", .{i});
+                return -10;
+            }
+            decoded[i] = server.decodeImageToPixels(alloc, encoded.data.?[0..encoded.len], vp) orelse {
+                e.scheduler.release(lm);
+                setErr("images: could not decode image {d}", .{i});
+                return -10;
+            };
+            decoded_count += 1;
+        }
+        const messages = [_]chat_mod.Message{.{ .role = "user", .content = "", .images = decoded }};
+        mm = server.prepareMultimodalPrompt(alloc, e.scheduler, lm, config, &messages, &prompt_ids) catch |err| {
+            e.scheduler.release(lm);
+            setErr("images: {s}", .{@errorName(err)});
+            return if (err == error.MediaPlaceholderMismatch) -10 else -11;
+        };
+        if (mm.mrope.pos == null) {
+            e.scheduler.release(lm);
+            setErr("images: missing Qwen M-RoPE positions", .{});
+            return -11;
+        }
+    }
+
     const enable_mtp = e.enable_mtp and (lm.mtp != null);
-    const temperature: f32 = if (cfg.temperature <= 0) 1.0 else cfg.temperature;
+    const temperature: f32 = @max(0, cfg.temperature);
     const top_p: f32 = if (cfg.top_p <= 0 or cfg.top_p >= 1) 1.0 else cfg.top_p;
     const repeat_penalty: f32 = if (cfg.repeat_penalty == 0) 1.0 else cfg.repeat_penalty;
     const seed: ?u64 = if (cfg.seed == 0) null else cfg.seed;
@@ -590,14 +666,22 @@ export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyop
         .pld_draft_len = 5,
         .pld_key_len = 3,
         .logprobs_n = 0,
+        .vision_embeddings = mm.embeddings,
+        .media = mm.media,
+        .mrope_pos = mm.mrope.pos,
+        .mrope_total = mm.mrope.total,
+        .mrope_delta = mm.mrope.delta,
     };
+    // submit consumes embeddings/positions even on failure, as on the HTTP path.
+    mm.embeddings = null;
+    mm.mrope = .{};
     const slot = e.scheduler.submit(params) catch |err| {
         e.scheduler.release(lm);
         setErr("submit: {s}", .{@errorName(err)});
         return -7;
     };
 
-    const gen_id = e.next_id.fetchAdd(1, .monotonic);
+    const gen_id = g_next_id.fetchAdd(1, .monotonic);
     const f = alloc.create(Feeder) catch {
         e.scheduler.complete(slot);
         e.scheduler.release(lm);
@@ -613,8 +697,21 @@ export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyop
         .cb_ctx = cb_ctx,
         .strip_leading_space = false,
     };
+    _ = std.c.pthread_mutex_lock(&g_generations_mutex);
+    g_generations.put(alloc, gen_id, slot) catch {
+        _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
+        e.scheduler.complete(slot);
+        e.scheduler.release(lm);
+        alloc.destroy(f);
+        setErr("oom: generation registry", .{});
+        return -8;
+    };
+    _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
     _ = e.feeders.fetchAdd(1, .release);
     const th = std.Thread.spawn(.{}, feederMain, .{f}) catch {
+        _ = std.c.pthread_mutex_lock(&g_generations_mutex);
+        _ = g_generations.remove(gen_id);
+        _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
         _ = e.feeders.fetchSub(1, .release);
         e.scheduler.complete(slot);
         e.scheduler.release(lm);
@@ -627,17 +724,14 @@ export fn mlxembed_generate(cfg: *const GenParams, cb: Callback, cb_ctx: ?*anyop
 }
 
 export fn mlxembed_cancel(gen_id: u64) callconv(.c) i32 {
-    _ = std.c.pthread_mutex_lock(&g_mutex);
-    defer _ = std.c.pthread_mutex_unlock(&g_mutex);
-    const e = embedOr(-1) orelse return -1;
-    // Cancel is a no-op when we can't find the slot by gen_id (the feeder owns
-    // it after complete); we track via a small set. For now cancel is best-effort
-    // at the scheduler level: iterate is not exposed, so we expose a global
-    // cancel of in-flight only when gen_id is 0.
-    _ = e;
-    _ = gen_id;
-    setErr("cancel by gen_id not yet wired — use mlxembed_cancel_all", .{});
-    return -2;
+    _ = std.c.pthread_mutex_lock(&g_generations_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
+    const slot = g_generations.get(gen_id) orelse {
+        setErr("generation not found", .{});
+        return -2;
+    };
+    slot.cancel();
+    return 0;
 }
 
 export fn mlxembed_cancel_all() callconv(.c) i32 {
@@ -717,7 +811,7 @@ export fn mlxembed_stats(out: ?[*]u64) callconv(.c) i32 {
 }
 
 test "reason code mapping" {
-    try std.testing.expectEqual(@intFromEnum(Reason.stop), reasonCode("stop"));
-    try std.testing.expectEqual(@intFromEnum(Reason.length), reasonCode("length"));
-    try std.testing.expectEqual(@intFromEnum(Reason.other), reasonCode("nope"));
+    try std.testing.expectEqual(@backingInt(Reason.stop), reasonCode("stop"));
+    try std.testing.expectEqual(@backingInt(Reason.length), reasonCode("length"));
+    try std.testing.expectEqual(@backingInt(Reason.other), reasonCode("nope"));
 }

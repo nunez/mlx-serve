@@ -357,7 +357,7 @@ pub fn build(b: *std.Build) void {
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
 
-    // ── fleet embed: text/chat-only C ABI static lib for the BEAM NIF host.
+    // ── fleet embed: text/vision chat C ABI static lib for the BEAM NIF host.
     //
     // `zig build mac-lib` → zig-out/lib/libmlxserve_embed.a (macOS host,
     // MLX safetensors text path; GGUF/ds4 link for parity with the exe).
@@ -469,7 +469,7 @@ fn addMacLib(
     });
 
     const install = b.addInstallArtifact(lib, .{});
-    const step = b.step("mac-lib", "Build the fleet-embed text/chat static lib (macOS host)");
+    const step = b.step("mac-lib", "Build the fleet-embed text/vision chat static lib (macOS host)");
     step.dependOn(&install.step);
 }
 
