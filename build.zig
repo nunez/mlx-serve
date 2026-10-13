@@ -391,6 +391,10 @@ fn addMacLib(
     // macOS host: the real ds4 + llama.cpp engines link (no iOS stubs).
     embed_options.addOption(bool, "ios", false);
     embed_options.addOption(bool, "macos_engines", true);
+    embed_options.addOption(bool, "embedded_engines", true);
+    // mlx-stream (DeepSeek-V4.1 SSD expert streaming) needs the host's
+    // mtp_acceptance surface; the fleet NIF host never loads that family.
+    embed_options.addOption(bool, "mlx_stream", false);
     embed_options.addOption(bool, "slow_tests", false);
 
     const ds4_metal_sources = b.createModule(.{
@@ -431,6 +435,8 @@ fn addMacLib(
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
+
+    addMlxStreamModule(b, mod, target, optimize);
 
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));

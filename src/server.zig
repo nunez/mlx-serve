@@ -8523,7 +8523,7 @@ fn handleMessagesEmbedding(
         return;
     }
 
-    var mm = prepareMultimodalItems(allocator, lm, config, prompt.items, &ids) catch |err| {
+    var mm = prepareMultimodalItems(allocator, global_scheduler.?, lm, config, prompt.items, &ids) catch |err| {
         const failure = multimodalFailure(err);
         log.warn("POST /v1/embeddings -> {d} ({s})\n", .{ failure.code, @errorName(err) });
         try sendErrorResponse(allocator, stream, failure.status, failure.kind, failure.message, failure.code);
@@ -14909,11 +14909,11 @@ pub const MultimodalPrompt = struct {
 pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
     const items = try collectMediaItems(allocator, messages);
     defer allocator.free(items);
-    return prepareMultimodalItems(allocator, lm, config, items, prompt_ids);
+    return prepareMultimodalItems(allocator, sch, lm, config, items, prompt_ids);
 }
 
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
-fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
+fn prepareMultimodalItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
     // Before the encode: a mismatch is the client's, and cheap to refuse.
     if (!placeholdersMatch(prompt_ids.*, items, config)) {
