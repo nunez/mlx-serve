@@ -35,7 +35,7 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -48,6 +48,9 @@ pub const Event = enum(u32) {
     png = 5,
     /// Media result: WAV bytes (48 kHz stereo 16-bit for YuE2).
     wav = 6,
+    /// Media result: raw HTTP response (status line + headers + JSON body)
+    /// from gen.handleVideo — the canonical /v1/video/generations reply.
+    video = 7,
 };
 
 pub const Callback = *const fn (
@@ -132,6 +135,12 @@ pub const MediaGenConfig = extern struct {
     edit_image_ptrs: ?[*]const [*]const u8 = null,
     edit_image_lens: ?[*]const usize = null,
     edit_image_count: usize = 0,
+    /// Video: the canonical /v1/video/generations JSON body, passed through to
+    /// gen.handleVideo verbatim (prompt/width/height/num_frames/steps/seed/
+    /// cfg_scale/negative_prompt/image refs/stream...). The response arrives
+    /// as one VIDEO event carrying the full JSON reply.
+    video_json: ?[*]const u8 = null,
+    video_json_len: usize = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -860,6 +869,7 @@ export fn mlxembed_stats(out: ?[*]u64) callconv(.c) i32 {
 pub const MediaEngine = union(enum) {
     image: *gen_mod.ImageEngine,
     yue2: *yue2_mod.Engine,
+    video: *gen_mod.VideoEngine,
 };
 
 const MediaGenCtx = struct {
@@ -880,6 +890,7 @@ const MediaGenCtx = struct {
     duration_seconds: u32,
     cot: u8,
     edit_images: []const []const u8,
+    video_json: []u8,
 };
 
 const MediaLoadReq = struct {
@@ -983,6 +994,17 @@ fn doMediaLoad(req: *MediaLoadReq) void {
                     },
                 };
             },
+            .video => {
+                const e = gen_mod.VideoEngine.load(io, alloc, dir) catch |err| {
+                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                    setErr("media video load: {s}", .{@errorName(err)});
+                    req.code = -4;
+                    req.done = true;
+                    _ = std.c.pthread_cond_signal(&req.cond);
+                    return;
+                };
+                break :blk MediaEngine{ .video = e };
+            },
             else => {
                 _ = std.c.pthread_mutex_unlock(&g_media_mutex);
                 setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
@@ -1009,6 +1031,78 @@ fn doMediaLoad(req: *MediaLoadReq) void {
     _ = std.c.pthread_cond_signal(&req.cond);
 }
 
+/// Runs gen.handleVideo over a socketpair and emits the complete raw HTTP
+/// response (status line + headers + JSON body) as one VIDEO event. Elixir
+/// splits the head; the body is the canonical /v1/video/generations reply.
+fn runMediaVideo(c: *MediaGenCtx, eng: *gen_mod.VideoEngine) void {
+    const alloc = c.alloc;
+    const io = g_media_threaded.?.io();
+
+    var sv: [2]std.c.fd_t = undefined;
+    // AF_UNIX, SOCK_STREAM
+    if (std.c.socketpair(1, 1, 0, &sv) != 0) {
+        const msg = "video: socketpair failed";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+
+    const Ctx = struct {
+        eng: *gen_mod.VideoEngine,
+        io: std.Io,
+        fd: std.c.fd_t,
+        cancelled: *std.atomic.Value(bool),
+        body: []const u8,
+        out: *std.ArrayList(u8),
+        fn run(x: *@This()) void {
+            defer _ = std.c.close(x.fd);
+            // Drain the socketpair; handleVideo runs on the caller thread so
+            // its MLX streams stay on the thread that loaded the engine.
+            var buf: [65_536]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(x.fd, &buf) catch break;
+                if (n == 0) break;
+                x.out.appendSlice(std.heap.c_allocator, buf[0..n]) catch break;
+            }
+        }
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    var cx = Ctx{ .eng = eng, .io = io, .fd = sv[1], .cancelled = c.cancelled, .body = c.video_json, .out = &out };
+    const th = std.Thread.spawn(.{}, Ctx.run, .{&cx}) catch {
+        _ = std.c.close(sv[0]);
+        _ = std.c.close(sv[1]);
+        const msg = "video: spawn failed";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    };
+
+    // handleVideo on THIS thread (the media worker) — streams must match the
+    // thread that loaded the engine.
+    var conn: server.Conn = undefined;
+    server.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, io);
+    gen_mod.handleVideo(io, alloc, &conn, c.video_json, eng) catch |err| {
+        _ = std.c.close(sv[0]);
+        th.join();
+        out.deinit(alloc);
+        const msg = std.fmt.allocPrint(alloc, "video: {s}", .{@errorName(err)}) catch "video error";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    };
+    _ = std.c.close(sv[0]);
+    th.join();
+
+    const bytes = out.items;
+    if (bytes.len == 0) {
+        out.deinit(alloc);
+        const msg = "video: empty response";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.video), bytes.ptr, @intCast(bytes.len));
+    mediaEmitDone(c, 0, 0);
+    out.deinit(alloc);
+}
+
 fn runMediaGenerate(c: *MediaGenCtx) void {
     defer mediaFeederCleanup(c);
     const alloc = c.alloc;
@@ -1033,6 +1127,9 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
     }
 
     switch (engine.?) {
+        .video => |eng| {
+            runMediaVideo(c, eng);
+        },
         .image => |eng| {
             const w: u32 = if (c.width == 0) 1024 else c.width;
             const h: u32 = if (c.height == 0) 1024 else c.height;
@@ -1190,6 +1287,7 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     alloc.free(c.abc);
     for (c.edit_images) |b| alloc.free(b);
     if (c.edit_images.len > 0) alloc.free(c.edit_images);
+    if (c.video_json.len > 0) alloc.free(c.video_json);
     _ = std.c.pthread_mutex_lock(&g_media_gen_mutex);
     _ = g_media_gen.remove(c.gen_id);
     _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
@@ -1300,6 +1398,7 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .duration_seconds = cfg.duration_seconds,
         .cot = cfg.cot,
         .edit_images = &.{},
+        .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
     };
     if (cfg.edit_image_count > 0 and cfg.edit_image_ptrs != null and cfg.edit_image_lens != null) {
         const n = cfg.edit_image_count;
@@ -1370,6 +1469,11 @@ fn mediaTeardown() void {
                 alloc.destroy(e);
             },
             .yue2 => |e| {
+                const alloc = std.heap.c_allocator;
+                e.deinit();
+                alloc.destroy(e);
+            },
+            .video => |e| {
                 const alloc = std.heap.c_allocator;
                 e.deinit();
                 alloc.destroy(e);
