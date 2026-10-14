@@ -806,6 +806,15 @@ pub const ImageEngine = struct {
         return krea.imageToPng(allocator, img, self.stream());
     }
 
+    /// PNG variant carrying per-request options (instruction edits via
+    /// `edit_image_bytes`, ref_resolution, etc.). Added for the embed media
+    /// sidecar; `generatePng` stays the zero-opts convenience wrapper.
+    pub fn generatePngOpts(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) ![]u8 {
+        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, opts, progress);
+        defer _ = mlx.mlx_array_free(img);
+        return krea.imageToPng(allocator, img, self.stream());
+    }
+
     /// Generate the raw image [1,3,H,W] f32 [0,1] (owned mlx array). Lets the
     /// caller run the content filter on the pixels before PNG-encoding.
     pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {

@@ -19,6 +19,8 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const gen_mod = @import("gen.zig");
+const yue2_mod = @import("yue2.zig");
+const sse_mod = @import("gen_sse.zig");
 const scheduler_mod = @import("scheduler.zig");
 const server = @import("server.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -33,12 +35,19 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 3;
 
 pub const Event = enum(u32) {
     text = 1,
     done = 2,
     err = 3,
+    /// Media progress: payload "stage step/total" (stage is the engine's own
+    /// label — "[semantic]", "[nar]", "[vae]", "denoise"…).
+    progress = 4,
+    /// Media result: PNG bytes.
+    png = 5,
+    /// Media result: WAV bytes (48 kHz stereo 16-bit for YuE2).
+    wav = 6,
 };
 
 pub const Callback = *const fn (
@@ -97,6 +106,32 @@ pub const GenParams = extern struct {
 pub const EncodedImage = extern struct {
     data: ?[*]const u8,
     len: usize,
+};
+
+/// Media generation config (image + YuE2 music). `model_dir` selects a model
+/// previously loaded via `mlxembed_media_load` (null/empty = the last loaded).
+pub const MediaGenConfig = extern struct {
+    model_dir: ?[*:0]const u8,
+    prompt: ?[*]const u8, // image: the prompt; music: the style tags
+    prompt_len: usize,
+    lyrics: ?[*]const u8, // music only ([Verse]-style section tags on own lines)
+    lyrics_len: usize,
+    width: u32, // image: 0 => 1024
+    height: u32, // image: 0 => 1024
+    steps: u32, // 0 => engine default
+    guidance: f32, // image CFG; <=0 => engine default (1.0)
+    seed: u64, // 0 => random
+    duration_seconds: u32, // music upper bound; 0 => model default
+    abc: ?[*]const u8, // music: an ABC melody score (requires cot != off)
+    abc_len: usize,
+    cot: u8, // music: 0=off 1=melody 2=full (default full)
+    // Image instruction editing: encoded reference buffers (PNG/JPEG), source
+    // first. Routed to edit_image_bytes on byte-preprocessing backends
+    // (Qwen-Image, MageFlow). 0 = plain generation. Pointers only need to
+    // live for the call; the request context copies.
+    edit_image_ptrs: ?[*]const [*]const u8 = null,
+    edit_image_lens: ?[*]const usize = null,
+    edit_image_count: usize = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,6 +844,555 @@ export fn mlxembed_stats(out: ?[*]u64) callconv(.c) i32 {
     }
     return 0;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Media sidecar (ABI v2, append-only): image + YuE2 music generation driven
+// directly by the NIF host. A single dedicated worker thread owns model load
+// and generation — MLX default streams are thread-local, so the thread that
+// loads an engine is the thread that must run it (mirrors the server's
+// scheduler). Media models live beside the chat engine and share the
+// process-global MLX device; the host budgets residency (Fleet resource
+// claims). One generation in flight at a time; cancellation via a
+// per-generation flag polled by the engine's progress probe. Result bytes
+// are borrowed for the duration of the callback — the host copies.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MediaEngine = union(enum) {
+    image: *gen_mod.ImageEngine,
+    yue2: *yue2_mod.Engine,
+};
+
+const MediaGenCtx = struct {
+    cb: Callback,
+    cb_ctx: ?*anyopaque,
+    gen_id: u64,
+    cancelled: *std.atomic.Value(bool),
+    alloc: std.mem.Allocator,
+    dir: []u8,
+    prompt: []u8,
+    lyrics: []u8,
+    abc: []u8,
+    width: u32,
+    height: u32,
+    steps: u32,
+    guidance: f32,
+    seed: u64,
+    duration_seconds: u32,
+    cot: u8,
+    edit_images: []const []const u8,
+};
+
+const MediaLoadReq = struct {
+    dir: []u8,
+    code: i32 = -99,
+    done: bool = false,
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+};
+
+const MediaJob = union(enum) {
+    load: *MediaLoadReq,
+    generate: *MediaGenCtx,
+    shutdown,
+};
+
+var g_media_threaded: ?std.Io.Threaded = null;
+var g_media: std.StringHashMapUnmanaged(MediaEngine) = .{};
+var g_media_default: []const u8 = "";
+var g_media_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_media_gen_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_media_gen: std.AutoHashMapUnmanaged(u64, *std.atomic.Value(bool)) = .{};
+var g_media_inflight: std.atomic.Value(i64) = .init(0);
+var g_jobs: std.ArrayListUnmanaged(MediaJob) = .empty;
+var g_jobs_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_jobs_cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER;
+var g_worker: ?std.Thread = null;
+var g_shutdown: std.atomic.Value(bool) = .init(false);
+
+fn mediaDefaultBasename(dir: []const u8) []const u8 {
+    var key = dir;
+    if (std.mem.indexOfScalar(u8, dir, '/') != null) {
+        var it = std.mem.splitScalar(u8, dir, '/');
+        while (it.next()) |s| key = s;
+    }
+    return key;
+}
+
+fn mediaSetDefaultDir(alloc: std.mem.Allocator, key: []const u8) void {
+    const duped = alloc.dupe(u8, key) catch return;
+    // g_media_default starts as the static ""; free only the heap dupes.
+    if (g_media_default.len > 0) alloc.free(@constCast(g_media_default));
+    g_media_default = duped;
+}
+
+fn doMediaLoad(req: *MediaLoadReq) void {
+    const alloc = std.heap.c_allocator;
+    const io = g_media_threaded.?.io();
+    const dir = req.dir;
+    _ = std.c.pthread_mutex_lock(&req.mutex);
+    defer _ = std.c.pthread_mutex_unlock(&req.mutex);
+    const key = mediaDefaultBasename(dir);
+    _ = std.c.pthread_mutex_lock(&g_media_mutex);
+    if (g_media.contains(key)) {
+        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+        req.code = 0;
+        req.done = true;
+        _ = std.c.pthread_cond_signal(&req.cond);
+        return;
+    }
+    const engine: MediaEngine = blk: {
+        const modality = gen_mod.detectModality(io, alloc, dir) orelse {
+            _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+            setErr("media: undetectable model at {s}", .{dir});
+            req.code = -3;
+            req.done = true;
+            _ = std.c.pthread_cond_signal(&req.cond);
+            return;
+        };
+        switch (modality) {
+            .image => {
+                const e = gen_mod.ImageEngine.load(io, alloc, dir) catch |err| {
+                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                    setErr("media image load: {s}", .{@errorName(err)});
+                    req.code = -4;
+                    req.done = true;
+                    _ = std.c.pthread_cond_signal(&req.cond);
+                    return;
+                };
+                break :blk MediaEngine{ .image = e };
+            },
+            .audio => {
+                const ae = gen_mod.AudioEngine.load(io, alloc, dir) catch |err| {
+                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                    setErr("media audio load: {s}", .{@errorName(err)});
+                    req.code = -4;
+                    req.done = true;
+                    _ = std.c.pthread_cond_signal(&req.cond);
+                    return;
+                };
+                break :blk switch (ae.backend) {
+                    .yue2 => |e| MediaEngine{ .yue2 = e },
+                    else => {
+                        ae.deinit();
+                        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                        setErr("media audio: only YuE2 is supported by embed", .{});
+                        req.code = -3;
+                        req.done = true;
+                        _ = std.c.pthread_cond_signal(&req.cond);
+                        return;
+                    },
+                };
+            },
+            else => {
+                _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
+                req.code = -3;
+                req.done = true;
+                _ = std.c.pthread_cond_signal(&req.cond);
+                return;
+            },
+        }
+    };
+    g_media.put(alloc, alloc.dupe(u8, key) catch key, engine) catch {
+        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+        setErr("oom: media map", .{});
+        req.code = -5;
+        req.done = true;
+        _ = std.c.pthread_cond_signal(&req.cond);
+        return;
+    };
+    mediaSetDefaultDir(alloc, key);
+    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+    log.info("mlx-serve embed media: {s} ({s}) ready\n", .{ key, @tagName(engine) });
+    req.code = 0;
+    req.done = true;
+    _ = std.c.pthread_cond_signal(&req.cond);
+}
+
+fn runMediaGenerate(c: *MediaGenCtx) void {
+    defer mediaFeederCleanup(c);
+    const alloc = c.alloc;
+    const s = mlx.mlx_default_gpu_stream_new();
+    _ = mlx.mlx_set_default_stream(s);
+    _ = mlx.mlx_stream_free(s);
+    const progress = sse_mod.Progress{
+        .ctx = @ptrCast(c),
+        .cb = mediaProgress,
+        .cancelled_cb = mediaCancelled,
+    };
+
+    const key = mediaDefaultBasename(c.dir);
+    _ = std.c.pthread_mutex_lock(&g_media_mutex);
+    const engine = g_media.get(key);
+    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+
+    if (engine == null) {
+        const msg = "media: model not loaded";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+
+    switch (engine.?) {
+        .image => |eng| {
+            const w: u32 = if (c.width == 0) 1024 else c.width;
+            const h: u32 = if (c.height == 0) 1024 else c.height;
+            const seed: u64 = c.seed;
+            var opts = gen_mod.ImageGenOpts{};
+            if (c.edit_images.len > 0) {
+                if (!eng.supportsEdit()) {
+                    const msg = "editing needs an edit-trained image model (Qwen-Image, FLUX.2, Mage-Flow-Edit)";
+                    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                    return;
+                }
+                if (c.edit_images.len > gen_mod.editRefCap(eng.backend)) {
+                    const msg = "too many reference images for this model";
+                    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                    return;
+                }
+                opts.edit_image_bytes = c.edit_images;
+            }
+            const png = eng.generatePngOpts(alloc, c.prompt, w, h, seed, c.steps, opts, progress) catch |err| {
+                const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            };
+            defer alloc.free(png);
+            c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.png), png.ptr, @intCast(png.len));
+            mediaEmitDone(c, c.steps, 0);
+        },
+        .yue2 => |eng| {
+            const cot: yue2_mod.Cot = switch (c.cot) {
+                0 => .off,
+                1 => .melody,
+                else => .full,
+            };
+            if (c.lyrics.len == 0) {
+                const msg = "empty lyrics (YuE2 is lyric-conditioned)";
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            }
+            if (c.abc.len > 0 and cot == .off) {
+                const msg = "abc needs cot melody|full";
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            }
+            const secs: u32 = std.math.clamp(if (c.duration_seconds == 0) yue2_mod.MAX_SECONDS else c.duration_seconds, yue2_mod.MIN_SECONDS, yue2_mod.MAX_SECONDS);
+            const req = yue2_mod.Request{
+                .style = c.prompt,
+                .lyrics = c.lyrics,
+                .cot = cot,
+                .abc = if (c.abc.len > 0) c.abc else null,
+                .seed = if (c.seed == 0) 831001 else c.seed,
+                .cfg_scale = if (c.guidance > 0) @floatCast(c.guidance) else null,
+                .steps = if (c.steps == 0) null else c.steps,
+                .max_frames = secs * yue2_mod.FRAME_RATE,
+            };
+            const fits_ok = eng.fits(alloc, req) catch false;
+            if (!fits_ok) {
+                const msg = "style + lyrics + score leave no room in the context";
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            }
+            const song = eng.generate(alloc, req, progress) catch |err| {
+                const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            };
+            defer {
+                alloc.free(song.wav);
+                if (song.abc) |a| alloc.free(a);
+            }
+            if (song.abc) |a| c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.text), a.ptr, @intCast(a.len));
+            c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.wav), song.wav.ptr, @intCast(song.wav.len));
+            mediaEmitDone(c, req.steps orelse yue2_mod.DEFAULT_STEPS, 0);
+        },
+    }
+}
+
+fn mediaWorkerLoop() void {
+    const alloc = std.heap.c_allocator;
+    g_media_threaded = std.Io.Threaded.init(alloc, .{});
+    // Same device selection as mlxembed_init: Metal when available, else CPU.
+    var metal_avail: bool = false;
+    _ = mlx.mlx_metal_is_available(&metal_avail);
+    const force_cpu = if (std.c.getenv("MLXSERVE_DEVICE")) |d|
+        std.mem.eql(u8, std.mem.span(d), "cpu")
+    else
+        false;
+    if (force_cpu) {
+        const cpu_dev = mlx.mlx_device_new_type(.cpu, 0);
+        defer _ = mlx.mlx_device_free(cpu_dev);
+        _ = mlx.mlx_set_default_device(cpu_dev);
+    } else if (metal_avail) {
+        const gpu_dev = mlx.mlx_device_new_type(.gpu, 0);
+        defer _ = mlx.mlx_device_free(gpu_dev);
+        _ = mlx.mlx_set_default_device(gpu_dev);
+    }
+
+    while (true) {
+        _ = std.c.pthread_mutex_lock(&g_jobs_mutex);
+        while (g_jobs.items.len == 0 and !g_shutdown.load(.acquire)) {
+            _ = std.c.pthread_cond_wait(&g_jobs_cond, &g_jobs_mutex);
+        }
+        if (g_jobs.items.len == 0 and g_shutdown.load(.acquire)) {
+            _ = std.c.pthread_mutex_unlock(&g_jobs_mutex);
+            break;
+        }
+        const job = g_jobs.orderedRemove(0);
+        _ = std.c.pthread_mutex_unlock(&g_jobs_mutex);
+
+        switch (job) {
+            .load => |req| doMediaLoad(req),
+            .generate => |c| runMediaGenerate(c),
+            .shutdown => {},
+        }
+    }
+
+    mediaTeardown();
+}
+
+fn mediaEnsureWorker() void {
+    if (g_worker != null) return;
+    g_worker = std.Thread.spawn(.{}, mediaWorkerLoop, .{}) catch {
+        setErr("media: worker spawn failed", .{});
+        return;
+    };
+}
+
+fn mediaEnqueue(job: MediaJob) void {
+    mediaEnsureWorker();
+    _ = std.c.pthread_mutex_lock(&g_jobs_mutex);
+    g_jobs.append(std.heap.c_allocator, job) catch {
+        _ = std.c.pthread_mutex_unlock(&g_jobs_mutex);
+        return;
+    };
+    _ = std.c.pthread_cond_signal(&g_jobs_cond);
+    _ = std.c.pthread_mutex_unlock(&g_jobs_mutex);
+}
+
+fn mediaProgress(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+    const c: *MediaGenCtx = @ptrCast(@alignCast(ctx));
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s} {d}/{d}", .{ stage, step, total }) catch return;
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.progress), msg.ptr, @intCast(msg.len));
+}
+
+fn mediaCancelled(ctx: *anyopaque) bool {
+    const c: *MediaGenCtx = @ptrCast(@alignCast(ctx));
+    return c.cancelled.load(.acquire);
+}
+
+fn mediaFeederCleanup(c: *MediaGenCtx) void {
+    const alloc = c.alloc;
+    alloc.free(c.dir);
+    alloc.free(c.prompt);
+    alloc.free(c.lyrics);
+    alloc.free(c.abc);
+    for (c.edit_images) |b| alloc.free(b);
+    if (c.edit_images.len > 0) alloc.free(c.edit_images);
+    _ = std.c.pthread_mutex_lock(&g_media_gen_mutex);
+    _ = g_media_gen.remove(c.gen_id);
+    _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
+    _ = g_media_inflight.fetchSub(1, .release);
+    alloc.destroy(c);
+}
+
+fn mediaEmitDone(c: *MediaGenCtx, steps: u32, elapsed_ns: u64) void {
+    var info = DoneInfo{
+        .finish_reason = @backingInt(Reason.stop),
+        ._pad = .{ 0, 0, 0 },
+        .prompt_tokens = 0,
+        .cached_tokens = 0,
+        .completion_tokens = steps,
+        .prefill_ns = 0,
+        .decode_ns = elapsed_ns,
+    };
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.done), @ptrCast(&info), @sizeOf(DoneInfo));
+}
+
+export fn mlxembed_media_load(model_dir: [*:0]const u8) callconv(.c) i32 {
+    const alloc = std.heap.c_allocator;
+    const dir = std.mem.span(model_dir);
+    if (dir.len == 0) {
+        setErr("media: empty model_dir", .{});
+        return -2;
+    }
+    const req = alloc.create(MediaLoadReq) catch return -5;
+    req.* = .{ .dir = alloc.dupe(u8, dir) catch {
+        alloc.destroy(req);
+        return -5;
+    } };
+    mediaEnqueue(.{ .load = req });
+    _ = std.c.pthread_mutex_lock(&req.mutex);
+    defer _ = std.c.pthread_mutex_unlock(&req.mutex);
+    while (!req.done) {
+        _ = std.c.pthread_cond_wait(&req.cond, &req.mutex);
+    }
+    const code = req.code;
+    alloc.free(req.dir);
+    alloc.destroy(req);
+    return code;
+}
+
+export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_ctx: ?*anyopaque) callconv(.c) i64 {
+    if (g_shutdown.load(.acquire)) {
+        setErr("media: shutting down", .{});
+        return -7;
+    }
+    const alloc = std.heap.c_allocator;
+    const dir: []const u8 = if (cfg.model_dir) |p| std.mem.span(p) else g_media_default;
+    if (dir.len == 0) {
+        setErr("media: no model loaded", .{});
+        return -1;
+    }
+    const prompt: []const u8 = if (cfg.prompt) |p| p[0..cfg.prompt_len] else "";
+    const lyrics: []const u8 = if (cfg.lyrics) |p| p[0..cfg.lyrics_len] else "";
+    const abc: []const u8 = if (cfg.abc) |p| p[0..cfg.abc_len] else "";
+    if (prompt.len == 0) {
+        setErr("media: empty prompt", .{});
+        return -3;
+    }
+
+    const c = alloc.create(MediaGenCtx) catch return -3;
+    const cancelled = alloc.create(std.atomic.Value(bool)) catch {
+        alloc.destroy(c);
+        return -3;
+    };
+    cancelled.* = .init(false);
+    c.* = .{
+        .cb = cb,
+        .cb_ctx = cb_ctx,
+        .gen_id = 0,
+        .cancelled = cancelled,
+        .alloc = alloc,
+        .dir = alloc.dupe(u8, dir) catch {
+            alloc.destroy(c);
+            alloc.destroy(cancelled);
+            return -3;
+        },
+        .prompt = alloc.dupe(u8, prompt) catch {
+            alloc.free(c.dir);
+            alloc.destroy(c);
+            alloc.destroy(cancelled);
+            return -3;
+        },
+        .lyrics = alloc.dupe(u8, lyrics) catch {
+            alloc.free(c.dir);
+            alloc.free(c.prompt);
+            alloc.destroy(c);
+            alloc.destroy(cancelled);
+            return -3;
+        },
+        .abc = alloc.dupe(u8, abc) catch {
+            alloc.free(c.dir);
+            alloc.free(c.prompt);
+            alloc.free(c.lyrics);
+            alloc.destroy(c);
+            alloc.destroy(cancelled);
+            return -3;
+        },
+        .width = cfg.width,
+        .height = cfg.height,
+        .steps = cfg.steps,
+        .guidance = cfg.guidance,
+        .seed = cfg.seed,
+        
+        .duration_seconds = cfg.duration_seconds,
+        .cot = cfg.cot,
+        .edit_images = &.{},
+    };
+    if (cfg.edit_image_count > 0 and cfg.edit_image_ptrs != null and cfg.edit_image_lens != null) {
+        const n = cfg.edit_image_count;
+        const cap = gen_mod.MAX_EDIT_IMAGES;
+        if (n > cap) {
+            mediaFeederCleanup(c);
+            setErr("media: too many edit images", .{});
+            return -3;
+        }
+        const slices = alloc.alloc([]const u8, n) catch {
+            mediaFeederCleanup(c);
+            return -3;
+        };
+        const ptrs = cfg.edit_image_ptrs.?;
+        const lens = cfg.edit_image_lens.?;
+        var i: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < i) : (j += 1) alloc.free(slices[j]);
+            alloc.free(slices);
+        }
+        while (i < n) : (i += 1) {
+            if (lens[i] == 0) {
+                mediaFeederCleanup(c);
+                setErr("media: empty edit image", .{});
+                return -3;
+            }
+            slices[i] = alloc.dupe(u8, ptrs[i][0..lens[i]]) catch {
+                mediaFeederCleanup(c);
+                return -3;
+            };
+        }
+        c.edit_images = slices;
+    }
+    const gen_id = g_next_id.fetchAdd(1, .monotonic);
+    c.gen_id = gen_id;
+    _ = std.c.pthread_mutex_lock(&g_media_gen_mutex);
+    g_media_gen.put(alloc, gen_id, cancelled) catch {
+        _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
+        mediaFeederCleanup(c);
+        setErr("oom: media gen registry", .{});
+        return -4;
+    };
+    _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
+    _ = g_media_inflight.fetchAdd(1, .release);
+    mediaEnqueue(.{ .generate = c });
+    return @intCast(gen_id);
+}
+
+export fn mlxembed_media_cancel(gen_id: u64) callconv(.c) i32 {
+    _ = std.c.pthread_mutex_lock(&g_media_gen_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
+    const flag = g_media_gen.get(gen_id) orelse {
+        setErr("media: generation not found", .{});
+        return -2;
+    };
+    flag.store(true, .release);
+    return 0;
+}
+
+fn mediaTeardown() void {
+    var it = g_media.iterator();
+    while (it.next()) |entry| {
+        switch (entry.value_ptr.*) {
+            .image => |e| {
+                const alloc = e.allocator;
+                e.deinit();
+                alloc.destroy(e);
+            },
+            .yue2 => |e| {
+                const alloc = std.heap.c_allocator;
+                e.deinit();
+                alloc.destroy(e);
+            },
+        }
+    }
+    g_media.clearAndFree(std.heap.c_allocator);
+    std.heap.c_allocator.free(@constCast(g_media_default));
+    g_media_default = "";
+    if (g_media_threaded) |*t| t.deinit();
+    g_media_threaded = null;
+}
+
+export fn mlxembed_media_shutdown() callconv(.c) void {
+    mediaEnqueue(.shutdown);
+    g_shutdown.store(true, .release);
+    _ = std.c.pthread_cond_broadcast(&g_jobs_cond);
+    if (g_worker) |w| {
+        w.join();
+        g_worker = null;
+    }
+}
+
 
 test "reason code mapping" {
     try std.testing.expectEqual(@backingInt(Reason.stop), reasonCode("stop"));
