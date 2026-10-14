@@ -35,7 +35,7 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -51,6 +51,9 @@ pub const Event = enum(u32) {
     /// Media result: raw HTTP response (status line + headers + JSON body)
     /// from gen.handleVideo — the canonical /v1/video/generations reply.
     video = 7,
+    /// Media result: raw HTTP response from gen.prepareDecisions +
+    /// gen.handleDecisions — the canonical /v1/decisions reply.
+    decision = 8,
 };
 
 pub const Callback = *const fn (
@@ -141,6 +144,11 @@ pub const MediaGenConfig = extern struct {
     /// as one VIDEO event carrying the full JSON reply.
     video_json: ?[*]const u8 = null,
     video_json_len: usize = 0,
+    /// Typed decisions (/v1/decisions schema): the canonical request JSON,
+    /// passed through gen.prepareDecisions + gen.handleDecisions over a
+    /// socketpair; the full HTTP reply arrives as one DECISION event.
+    decision_json: ?[*]const u8 = null,
+    decision_json_len: usize = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -870,6 +878,7 @@ pub const MediaEngine = union(enum) {
     image: *gen_mod.ImageEngine,
     yue2: *yue2_mod.Engine,
     video: *gen_mod.VideoEngine,
+    decision: *gen_mod.DecisionEngine,
 };
 
 const MediaGenCtx = struct {
@@ -891,6 +900,7 @@ const MediaGenCtx = struct {
     cot: u8,
     edit_images: []const []const u8,
     video_json: []u8,
+    decision_json: []u8,
 };
 
 const MediaLoadReq = struct {
@@ -1005,6 +1015,17 @@ fn doMediaLoad(req: *MediaLoadReq) void {
                 };
                 break :blk MediaEngine{ .video = e };
             },
+            .decision => {
+                const e = gen_mod.DecisionEngine.load(io, alloc, dir) catch |err| {
+                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+                    setErr("media decision load: {s}", .{@errorName(err)});
+                    req.code = -4;
+                    req.done = true;
+                    _ = std.c.pthread_cond_signal(&req.cond);
+                    return;
+                };
+                break :blk MediaEngine{ .decision = e };
+            },
             else => {
                 _ = std.c.pthread_mutex_unlock(&g_media_mutex);
                 setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
@@ -1034,6 +1055,82 @@ fn doMediaLoad(req: *MediaLoadReq) void {
 /// Runs gen.handleVideo over a socketpair and emits the complete raw HTTP
 /// response (status line + headers + JSON body) as one VIDEO event. Elixir
 /// splits the head; the body is the canonical /v1/video/generations reply.
+/// Runs the /v1/decisions pipeline over a socketpair: gen.prepareDecisions
+/// validates (answering errors itself), gen.handleDecisions predicts and
+/// writes the HTTP reply. The captured bytes go out as one DECISION event.
+fn runMediaDecision(c: *MediaGenCtx, eng: *gen_mod.DecisionEngine) void {
+    const alloc = c.alloc;
+    const io = g_media_threaded.?.io();
+
+    var sv: [2]std.c.fd_t = undefined;
+    // AF_UNIX, SOCK_STREAM
+    if (std.c.socketpair(1, 1, 0, &sv) != 0) {
+        const msg = "decision: socketpair failed";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+
+    const Ctx = struct {
+        fd: std.c.fd_t,
+        out: *std.ArrayList(u8),
+        fn run(x: *@This()) void {
+            defer _ = std.c.close(x.fd);
+            var buf: [65_536]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(x.fd, &buf) catch break;
+                if (n == 0) break;
+                x.out.appendSlice(std.heap.c_allocator, buf[0..n]) catch break;
+            }
+        }
+    };
+
+    var cx = Ctx{ .fd = sv[1], .out = &out };
+    const th = std.Thread.spawn(.{}, Ctx.run, .{&cx}) catch {
+        _ = std.c.close(sv[0]);
+        _ = std.c.close(sv[1]);
+        out.deinit(alloc);
+        const msg = "decision: spawn failed";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    };
+
+    // prepare + predict on THIS thread; the engine's stream belongs here.
+    {
+        var conn: server.Conn = undefined;
+        server.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, io);
+        var req_opt = gen_mod.prepareDecisions(alloc, &conn, c.decision_json, eng) catch |err| {
+            _ = std.c.close(sv[0]);
+            th.join();
+            out.deinit(alloc);
+            const msg = std.fmt.allocPrint(alloc, "decision: {s}", .{@errorName(err)}) catch "decision error";
+            c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+            return;
+        };
+        if (req_opt) |*req| {
+            defer req.deinit(alloc);
+            var jobs = [_]gen_mod.DecisionJob{.{ .allocator = alloc, .conn = &conn, .req = req }};
+            gen_mod.handleDecisions(eng, mediaDefaultBasename(c.dir), &jobs);
+        }
+        // else: prepareDecisions already answered (validation error) —
+        // that response was captured like any other.
+    }
+    _ = std.c.close(sv[0]);
+    th.join();
+
+    const bytes = out.items;
+    if (bytes.len == 0) {
+        out.deinit(alloc);
+        const msg = "decision: empty response";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.decision), bytes.ptr, @intCast(bytes.len));
+    mediaEmitDone(c, 0, 0);
+    out.deinit(alloc);
+}
+
 fn runMediaVideo(c: *MediaGenCtx, eng: *gen_mod.VideoEngine) void {
     const alloc = c.alloc;
     const io = g_media_threaded.?.io();
@@ -1129,6 +1226,9 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
     switch (engine.?) {
         .video => |eng| {
             runMediaVideo(c, eng);
+        },
+        .decision => |eng| {
+            runMediaDecision(c, eng);
         },
         .image => |eng| {
             const w: u32 = if (c.width == 0) 1024 else c.width;
@@ -1288,6 +1388,7 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     for (c.edit_images) |b| alloc.free(b);
     if (c.edit_images.len > 0) alloc.free(c.edit_images);
     if (c.video_json.len > 0) alloc.free(c.video_json);
+    if (c.decision_json.len > 0) alloc.free(c.decision_json);
     _ = std.c.pthread_mutex_lock(&g_media_gen_mutex);
     _ = g_media_gen.remove(c.gen_id);
     _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
@@ -1399,6 +1500,7 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .cot = cfg.cot,
         .edit_images = &.{},
         .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
+        .decision_json = if (cfg.decision_json) |p| alloc.dupe(u8, p[0..cfg.decision_json_len]) catch &.{} else &.{},
     };
     if (cfg.edit_image_count > 0 and cfg.edit_image_ptrs != null and cfg.edit_image_lens != null) {
         const n = cfg.edit_image_count;
@@ -1474,6 +1576,11 @@ fn mediaTeardown() void {
                 alloc.destroy(e);
             },
             .video => |e| {
+                const alloc = std.heap.c_allocator;
+                e.deinit();
+                alloc.destroy(e);
+            },
+            .decision => |e| {
                 const alloc = std.heap.c_allocator;
                 e.deinit();
                 alloc.destroy(e);
