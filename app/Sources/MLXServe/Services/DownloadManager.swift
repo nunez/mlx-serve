@@ -364,6 +364,7 @@ class DownloadManager: ObservableObject {
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
+        case "breeze_tts": return "audio_tokenizer/model.safetensors"
         default: return nil
         }
     }

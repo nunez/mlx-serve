@@ -95,6 +95,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
     // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
     if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
+    // Breeze-TTS-2: Mimi lives in `audio_tokenizer/`; a partial pull can miss the subdir.
+    if (std.mem.eql(u8, model_type, "breeze_tts")) return "audio_tokenizer/model.safetensors";
     return null;
 }
 
@@ -118,6 +120,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "yue2") or
+        std.mem.eql(u8, model_type, "breeze_tts") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
         std.mem.eql(u8, model_type, "clef") or
@@ -651,6 +654,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "mageflow") or
         std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
+        std.mem.eql(u8, model_type, "breeze_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "yue2") or
@@ -1486,6 +1490,12 @@ test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
     try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "breeze_tts classifies as audio media with the codec-subdir marker" {
+    try testing.expect(isMediaModelType("breeze_tts"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("breeze_tts"));
+    try testing.expectEqualStrings("audio_tokenizer/model.safetensors", requiredMediaMarker("breeze_tts").?);
 }
 
 test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {

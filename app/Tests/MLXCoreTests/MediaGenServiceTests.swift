@@ -1022,6 +1022,27 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot, fullRoot]), full)
     }
 
+    /// Breeze-TTS-2's completeness marker is the Mimi codec subdir (server twin:
+    /// `model_discovery.requiredMediaMarker`).
+    func testBreezeTTSSkipsAPackWithoutItsCodec() throws {
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "breeze_tts"), "audio_tokenizer/model.safetensors")
+        let fm = FileManager.default
+        let base = NSTemporaryDirectory() + "breeze-resolve-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: base) }
+        let repo = "mlx-community/Breeze-TTS-2-mlx"
+        let cfg = Data("{\"model_type\":\"breeze_tts\"}".utf8)
+
+        let partial = base + "/" + repo
+        try fm.createDirectory(atPath: partial, withIntermediateDirectories: true)
+        fm.createFile(atPath: partial + "/config.json", contents: cfg)
+        fm.createFile(atPath: partial + "/model-00001-of-00002.safetensors", contents: Data([0, 1]))
+        XCTAssertNil(ServerManager.resolveModelDir(repo: repo, roots: [base]))
+
+        try fm.createDirectory(atPath: partial + "/audio_tokenizer", withIntermediateDirectories: true)
+        fm.createFile(atPath: partial + "/audio_tokenizer/model.safetensors", contents: Data([0, 1]))
+        XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [base]), partial)
+    }
+
     // MARK: - Residency default
 
     func testKeepResidentDefaultsOff() {
