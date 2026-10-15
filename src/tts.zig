@@ -3132,7 +3132,14 @@ fn computeCodebook(w: *const Weights, a: std.mem.Allocator, s: S, comptime base_
 pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !CodecDecoder {
     const dir = try std.fmt.allocPrint(allocator, "{s}/speech_tokenizer", .{model_dir});
     defer allocator.free(dir);
-    var w = try model_mod.loadWeights(io, allocator, dir);
+    return loadCodecDecoderFrom(io, allocator, s, dir);
+}
+
+/// Load the codec weights directly from `tokenizer_dir` (the dir holding
+/// `model.safetensors` with this decoder layout): Qwen3-TTS `speech_tokenizer/`
+/// or Breeze `audio_tokenizer/`.
+pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !CodecDecoder {
+    var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
     defer w.deinit();
 
     var d: CodecDecoder = undefined;
