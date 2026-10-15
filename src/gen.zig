@@ -26,6 +26,7 @@ const music3 = @import("music3.zig");
 const yue2 = @import("yue2.zig");
 const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
+const breeze = @import("breeze.zig");
 const laya = @import("laya.zig");
 const kev = @import("kev.zig");
 const d1 = @import("d1.zig");
@@ -65,6 +66,9 @@ pub const Modality = enum {
     /// Typed decisions (`/v1/decisions`, Laya or Kev): scorers, not generators,
     /// but they ride the media plumbing (engine slot, inference-thread job).
     decision,
+    /// Speaker diarization (Nemotron 3 Diarization): no route of its own, the
+    /// speakers of a `diarized_json` transcription.
+    diarization,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -73,6 +77,7 @@ pub const Modality = enum {
             .video => "video",
             .mesh => "3d",
             .decision => "decisions",
+            .diarization => "diarization",
         };
     }
 
@@ -86,6 +91,7 @@ pub const Modality = enum {
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
             .decision => "laya",
+            .diarization => "nemotron_diarization",
         };
     }
 };
@@ -106,10 +112,10 @@ pub const Modality = enum {
 /// waiting. The test at the bottom of this file pins them together.
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
-    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
-    "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",
+    "qwen3_tts", "acestep",    "kokoro",         "breeze_tts",
+    "AudioVideo", "hunyuan3d", "minimax_h3",     "minimax_music3",
+    "qwen_image", "laya",       "kev",            "clef",
+    "d1",         "stable_audio3", "yue2",       "nemotron_diarization",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -118,6 +124,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
+    if (std.mem.eql(u8, model_type, "breeze_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "yue2")) return .audio;
@@ -127,6 +134,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
+    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     return null;
 }
 
@@ -160,6 +168,7 @@ pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
     if (std.mem.eql(u8, model_type, "yue2")) return .yue2;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
+    if (std.mem.eql(u8, model_type, "breeze_tts")) return .breeze;
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
 }
@@ -175,6 +184,9 @@ pub const AudioBackendKind = enum {
     music3,
     yue2,
     kokoro,
+    /// Breeze-TTS-2: speech on /v1/audio/speech — voice-design speaker slots
+    /// (`voice` = S0..S9) + instruction, cloning via `ref_audio`.
+    breeze,
     /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
     sound,
 
@@ -920,6 +932,7 @@ pub const AudioBackend = union(enum) {
     music3: *music3.Engine,
     yue2: *yue2.Engine,
     kokoro: *kokoro.Engine,
+    breeze: *breeze.Engine,
     sound: *stable_audio.Engine,
 };
 
@@ -962,6 +975,11 @@ pub const AudioEngine = struct {
             log.info("[audio] Kokoro TTS ready (sample_rate={d})\n", .{self.backend.kokoro.sampleRate()});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .breeze) {
+            self.backend = .{ .breeze = try breeze.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] Breeze-TTS-2 engine ready (sample_rate={d})\n", .{self.backend.breeze.sampleRate()});
+            return self;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
         self.backend = .{ .tts = try tts.Synthesizer.load(io, allocator, s, model_dir) };
         log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.backend.tts.model.cfg.sample_rate});
@@ -975,6 +993,7 @@ pub const AudioEngine = struct {
             .music3 => |e| e.deinit(),
             .yue2 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
+            .breeze => |e| e.deinit(),
             .sound => |e| e.deinit(),
         }
         self.allocator.destroy(self);
@@ -2742,6 +2761,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
+        .breeze => |b| return handleBreezeSpeech(allocator, conn, body, b),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
     // embeds + caches the clone voice WITHOUT synthesizing, so the FIRST
@@ -2904,6 +2924,49 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     return sendBytes(conn, allocator, "audio/wav", out);
 }
 
+/// `POST /v1/audio/speech` on a Breeze-TTS-2 checkpoint.
+///
+/// Controls: `input` text; optional `voice` speaker slot (S0..S9),
+/// `instruction` voice direction, `ref_audio` (base64 WAV) for zero-shot
+/// cloning, `seed`. The forward (Qwen3 backbone + depth decoder + T5Gemma2
+/// conditioning + Mimi decode) lands on top of `breeze.Config`; until then a
+/// well-formed request is a NAMED 501, never fake silence.
+fn handleBreezeSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *breeze.Engine) !void {
+    _ = engine;
+    if (sse.bodyWantsTrue(body, "warm_only")) {
+        return sendError(conn, 400, "voice-cloning warm-up is not supported yet");
+    }
+    const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse
+        return sendError(conn, 400, "missing 'input'");
+    const text = try jsonUnescape(allocator, input);
+    defer allocator.free(text);
+    if (text.len == 0) return sendError(conn, 400, "empty 'input'");
+
+    if (extractJsonString(body, "voice")) |raw| {
+        const voice = try jsonUnescape(allocator, raw);
+        defer allocator.free(voice);
+        if (voice.len > 0 and !breeze.voiceSlotValid(voice)) {
+            var msg: [256]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "unknown voice '{s}'; speaker slots are S0..S9", .{voice}) catch "unknown voice";
+            return sendError(conn, 400, m);
+        }
+    }
+
+    if (extractJsonString(body, "ref_audio")) |raw_ref| {
+        const b64 = try jsonUnescape(allocator, raw_ref);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio is not valid base64");
+            defer allocator.free(wav_bytes);
+            const samples = decodeWavToF32(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio is not a decodable WAV");
+            allocator.free(samples);
+        }
+    }
+
+    log.info("[breeze] speech request {d} chars stream={}\n", .{ text.len, sse.bodyWantsTrue(body, "stream") });
+    return sendError(conn, 501, "Breeze-TTS-2 synthesis is not implemented yet");
+}
+
 /// `instrumental: true` beside words to sing is contradictory. Letting either
 /// side quietly win is the failure mode — a sticky checkbox silently discards a
 /// verse the user typed, or the checkbox does nothing — so the pair is a NAMED
@@ -2932,7 +2995,7 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
         .yue2 => |m| return handleYue2(allocator, conn, body, m),
-        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+        .tts, .kokoro, .breeze => return sendError(conn, 400, TTS_ROUTE_HINT),
         .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
 }
@@ -2993,7 +3056,7 @@ pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const sa = switch (engine.backend) {
         .sound => |e| e,
         .music, .music3, .yue2 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
-        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+        .tts, .kokoro, .breeze => return sendError(conn, 400, TTS_ROUTE_HINT),
     };
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (a description of the sound)");
     const prompt = try jsonUnescape(allocator, raw_prompt);
@@ -5886,6 +5949,13 @@ test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
 
+test "breeze_tts is a speech audio backend with the codec-subdir marker" {
+    try testing.expectEqual(Modality.audio, modalityFromType("breeze_tts").?);
+    try testing.expect(audioBackendKindForType("breeze_tts") == .breeze);
+    try testing.expect(!AudioBackendKind.breeze.servesMusic());
+    try testing.expectEqualStrings("audio_tokenizer/model.safetensors", requiredMarkerFor("breeze_tts").?);
+}
+
 test "stable_audio3 is a sound backend on its own route, with named bounds" {
     try testing.expectEqual(Modality.audio, modalityFromType("stable_audio3").?);
     try testing.expect(audioBackendKindForType("stable_audio3") == .sound);
@@ -5985,7 +6055,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video, .mesh, .decision }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh, .decision, .diarization }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }
