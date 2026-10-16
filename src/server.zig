@@ -7821,7 +7821,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     defer allocator.free(prompt_text);
     var prompt_ids = try encodeText(allocator, lm, tok, prompt_text, false);
     const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
-    var mm = prepareMultimodalItems(allocator, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &prompt_ids) catch |err| {
+    var mm = prepareMultimodalItems(allocator, global_scheduler.?, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &prompt_ids) catch |err| {
         allocator.free(prompt_ids);
         const f = multimodalFailure(err);
         log.warn("POST /v1/audio/transcriptions -> {d} ({s})\n", .{ f.code, @errorName(err) });
@@ -7919,7 +7919,7 @@ fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm
     defer allocator.free(prompt_text);
     var ids = try encodeText(allocator, lm, lm.tokenizer.?, prompt_text, false);
     const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
-    var mm = prepareMultimodalItems(allocator, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &ids) catch |err| {
+    var mm = prepareMultimodalItems(allocator, global_scheduler.?, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &ids) catch |err| {
         allocator.free(ids);
         const f = multimodalFailure(err);
         log.warn("  aligner -> {d} ({s})\n", .{ f.code, @errorName(err) });
