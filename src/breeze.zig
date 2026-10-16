@@ -245,7 +245,7 @@ fn ownT16(w: *const Weights, s: S, key: []const u8) !mlx.mlx_array {
     var t = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_transpose_axes(&t, arr, &[_]c_int{ 1, 0 }, 2, s));
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, t, .float16, s));
+    try mlx.check(mlx.mlx_astype(&out, t, .bfloat16, s));
     return out;
 }
 
@@ -255,7 +255,7 @@ fn ownF16(w: *const Weights, s: S, key: []const u8) !mlx.mlx_array {
         return error.MissingBreezeWeight;
     };
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, arr, .float16, s));
+    try mlx.check(mlx.mlx_astype(&out, arr, .bfloat16, s));
     return out;
 }
 
@@ -348,8 +348,9 @@ fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) mlx.m
     return r;
 }
 
-// Rejected: applying llama3 scaling (factor 32, orig_ctx 16) to depth rope made head
-// logits diverge from the reference; plain theta matches (whisper-verified).
+// Empirical: the pack config declares llama3 scaling (factor 32, orig_ctx 16) on the
+// depth rope, but sampled audio is word-accurate only with plain theta; the scaled
+// table garbles it. Scaled-path parity against the oracle is still open (early eos).
 fn depthInvFreqs() [D_HD / 2]f32 {
     _ = 0; // kept as oracle note
 
@@ -431,7 +432,7 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&x16, x, .float16, s);
+    _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
     x = x16;
 
     for (layers, 0..) |lw, lidx| {
@@ -496,7 +497,7 @@ fn windowMask(s: S, L: usize, w: usize) mlx.mlx_array {
     }
     const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&r, h, .float16, s);
+    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
     return r;
 }
 
@@ -803,7 +804,11 @@ pub const Engine = struct {
             .codec = try tts.loadCodecDecoderFrom(io, allocator, s, try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir})),
             .scratch = try allocator.alloc(f32, CB_LM),
             .order = try allocator.alloc(usize, CB_LM),
-            .d_freqs = null_arr,
+            .d_freqs = blk: {
+                d_freqs_buf = depthInvFreqs();
+                if (std.c.getenv("BREEZE_FREQS") != null) log.err("[breeze-dump] FR {any}\n", .{d_freqs_buf[0..8]});
+                break :blk hostF32(&d_freqs_buf, &[_]c_int{D_HD / 2});
+            },
         };
         errdefer {
             allocator.free(self.scratch);
