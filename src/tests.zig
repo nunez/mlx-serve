@@ -141,6 +141,7 @@ test {
     _ = @import("texinpaint.zig");
     _ = @import("bake.zig");
     _ = @import("multipart.zig");
+    _ = @import("gen.zig");
     _ = @import("breeze.zig");
     _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
