@@ -34,6 +34,9 @@ pub const TE_VOCAB: usize = 262158;
 pub const NUM_CODEBOOKS: usize = 16;
 pub const CB_VOCAB: usize = 2051;
 pub const CB_PAD: u32 = 2050; // frame-end code (lm_head row 2050)
+pub const CB_LM: usize = 2052; // lm_head rows: codes [0,2048), pad 2048..2050, eos 2051
+pub const CODEBOOK_SIZE: u32 = 2048; // mimi codebook_size; ids >= this never sample
+pub const CB_EOS: u32 = 2051;
 pub const CB_STRIDE: usize = 2051; // audio-table stride per codebook
 
 // ── geometry (Breeze-TTS-2 / Qwen3-0.6B flavor) ────────────────────────────
@@ -131,9 +134,33 @@ pub const Temp = struct { t: f32 = 0.9, top_k: u32 = 50, top_p: f32 = 1.0 };
 /// numpy-order categorical sampler: temperature → top-k (value threshold, the
 /// k-th highest, lowest ids keep) → top-p (strict cumulative drop) →
 /// multinomial. temperature<=0 → argmax. `scratch`/`order` are ≥ n long.
-pub fn sampleToken(rng: *Rng, logits: []const f32, temp: Temp, scratch: []f32, order: []usize) usize {
+pub const SampleOpts = struct {
+    suppress_from: u32 = 0,
+    suppress_to: u32 = 0,
+    history: []const u32 = &[_]u32{},
+    rep: f32 = 1.0,
+};
+
+pub fn sampleToken(rng: *Rng, logits: []const f32, temp: Temp, scratch: []f32, order: []usize, opts: SampleOpts) usize {
     const n = logits.len;
     @memcpy(scratch[0..n], logits);
+    if (opts.history.len > 0 and opts.rep != 1.0) {
+        var seen = _hist_seen;
+        if (seen.len < n) seen = &[_]bool{};
+        if (seen.len >= n) {
+            @memset(seen[0..n], false);
+            for (opts.history) |tok| {
+                if (tok >= n) continue;
+                if (seen[tok]) continue;
+                seen[tok] = true;
+                scratch[tok] = if (scratch[tok] > 0) scratch[tok] / opts.rep else scratch[tok] * opts.rep;
+            }
+        }
+    }
+    if (opts.suppress_to > opts.suppress_from) {
+        var i: usize = opts.suppress_from;
+        while (i < @min(opts.suppress_to, @as(u32, @intCast(n)))) : (i += 1) scratch[i] = -std.math.inf(f32);
+    }
     if (temp.t <= 0) {
         var best: usize = 0;
         var bv: f32 = -std.math.inf(f32);
@@ -232,6 +259,24 @@ fn ownF16(w: *const Weights, s: S, key: []const u8) !mlx.mlx_array {
     return out;
 }
 
+fn ownF16Plus1(w: *const Weights, s: S, alloc: std.mem.Allocator, key: []const u8) !mlx.mlx_array {
+    const arr = w.get(key) orelse {
+        log.err("[breeze] MISSING WEIGHT: {s}\n", .{key});
+        return error.MissingBreezeWeight;
+    };
+    var f32arr = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
+    _ = mlx.mlx_array_eval(f32arr);
+    const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
+    const shape = mlx.getShape(f32arr);
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const buf = try alloc.alloc(f32, n);
+    defer alloc.free(buf);
+    for (0..n) |i| buf[i] = data[i] + 1.0;
+    return hostF32(buf, shape);
+}
+
 fn hostF32(data: []const f32, shape: []const c_int) mlx.mlx_array {
     return mlx.mlx_array_new_data(@constCast(@ptrCast(data.ptr)), shape.ptr, @intCast(shape.len), .float32);
 }
@@ -295,6 +340,42 @@ fn ropeApply(x: mlx.mlx_array, theta: f64, scale: f64, hd: c_int, s: S) mlx.mlx_
     return r;
 }
 
+pub const D_HD: usize = 128;
+
+fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) mlx.mlx_array {
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_fast_rope(&r, x, hd, false, .{}, 1.0, 0, freqs, s);
+    return r;
+}
+
+// Rejected: applying llama3 scaling (factor 32, orig_ctx 16) to depth rope made head
+// logits diverge from the reference; plain theta matches (whisper-verified).
+fn depthInvFreqs() [D_HD / 2]f32 {
+    _ = 0; // kept as oracle note
+
+    var t: [D_HD / 2]f32 = undefined;
+    const factor: f64 = 32.0;
+    const low_f: f64 = 0.001953125;
+    const high_f: f64 = 0.0078125;
+    const old_ctx: f64 = 16.0;
+    const low_wl = old_ctx / low_f;
+    const high_wl = old_ctx / high_f;
+    var i: usize = 0;
+    while (i < D_HD / 2) : (i += 1) {
+        const f0 = 1.0 / std.math.pow(f64, D_THETA, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(D_HD)));
+        const wl = 2.0 * std.math.pi / f0;
+        var f = f0;
+        if (wl > low_wl) {
+            f = f0 / factor;
+        } else if (wl >= high_wl) {
+            const smooth = (old_ctx / wl - low_f) / (high_f - low_f);
+            f = (1.0 - smooth) * (f0 / factor) + smooth * f0;
+        }
+        t[i] = @floatCast(f);
+    }
+    return t;
+}
+
 fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mask: mlx.mlx_array, s: S) mlx.mlx_array {
     var r = mlx.mlx_array_new();
     const mode: [*:0]const u8 = if (mask.ctx == null) "causal" else "array";
@@ -322,14 +403,39 @@ const QLayer = struct {
 /// Full re-forward over a host [L, hidden] f32 embedding span. `pos_scale`
 /// scales RoPE positions (TE full layers), optional causal local-window mask
 /// (`window` 0 = plain causal). qk-norm applies when qn has data.
-fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, out_last: []f32) !void {
+var dbg_layer0 = false;
+
+fn dumpFirst(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
+    var idx_arr: [12]u32 = undefined;
+    for (&idx_arr, 0..) |*v, i| v.* = @intCast(i);
+    var taken = mlx.mlx_array_new();
+    if (mlx.mlx_take_axis(&taken, a, hostU32(&idx_arr, &[_]c_int{1}), 0, s) != 0) return;
+    var buf: [12]f32 = undefined;
+    evalHost(s, taken, &buf) catch return;
+    log.err("[breeze-dump] {s} {any}\n", .{ tag, buf });
+}
+
+fn dumpLast(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
+    const shape = mlx.getShape(a);
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    var buf: [4096]f32 = undefined;
+    const m = @min(n, buf.len);
+    evalHost(s, reshape(a, &[_]c_int{@intCast(m)}, s), buf[0..m]) catch return;
+    log.err("[breeze-dump] {s} {any}\n", .{ tag, buf[0..@min(12, m)] });
+}
+
+fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, out_last: []f32) !void {
+    const dbg_l = std.c.getenv("BREEZE_LAYER0") != null;
+    if (dbg_l) dbg_layer0 = true;
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&x16, x, .float16, s);
     x = x16;
 
-    for (layers) |lw| {
+    for (layers, 0..) |lw, lidx| {
+        if (dbg_l) log.err("[breeze-dump] LAYER {d} qn={any} in={d}\n", .{ lidx, lw.qn.ctx != null, hidden });
         const xn = rmsn(x, lw.in_ln, eps, s);
         const q = mm(xn, lw.q, s);
         const k = mm(xn, lw.k, s);
@@ -344,18 +450,21 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         const hd: c_int = 128;
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
             q4 = reshape(rmsn(reshape(q4, &[_]c_int{ @intCast(lq), hd }, s), lw.qn, eps, s), &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            if (dbg_layer0) dumpFirst(s, reshape(q4, &[_]c_int{ @intCast(lq * 128) }, s), "QNOTH");
             k4 = reshape(rmsn(reshape(k4, &[_]c_int{ @intCast(lk), hd }, s), lw.kn, eps, s), &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         }
         const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        const qr = ropeApply(qt, theta, pos_scale, 128, s);
-        const kr = ropeApply(kt, theta, pos_scale, 128, s);
+        const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, 128, s) else ropeApply(qt, theta, pos_scale, 128, s);
+        if (dbg_layer0) dumpFirst(s, reshape(qr, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh)) * 128) }, s), "QR");
+        const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, 128, s) else ropeApply(kt, theta, pos_scale, 128, s);
         const mask = if (window > 0) windowMask(s, L, window) else null_arr;
         const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), mask, s);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(mlx.getShape(lw.q)[1]) }, s);
         const h1 = addM(x, mm(af, lw.o, s), s);
+        if (dbg_layer0) dumpLast(s, h1, "H1");
         const hn = rmsn(h1, lw.post_ln, eps, s);
         const g = mm(hn, lw.gate, s);
         const u = mm(hn, lw.up, s);
@@ -410,22 +519,22 @@ const Te = struct {
                 .k = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_proj.weight", .{p})),
                 .v = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.v_proj.weight", .{p})),
                 .o = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.o_proj.weight", .{p})),
-                .qn = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})),
-                .kn = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})),
+                .qn = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})),
+                .kn = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})),
                 .gate = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.gate_proj.weight", .{p})),
                 .up = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.up_proj.weight", .{p})),
                 .down = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.down_proj.weight", .{p})),
-                .in_ln = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}pre_self_attn_layernorm.weight", .{p})),
-                .post_ln = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}post_feedforward_layernorm.weight", .{p})),
-                .pre_ff = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}pre_feedforward_layernorm.weight", .{p})),
+                .in_ln = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}pre_self_attn_layernorm.weight", .{p})),
+                .post_ln = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}post_feedforward_layernorm.weight", .{p})),
+                .pre_ff = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}pre_feedforward_layernorm.weight", .{p})),
             };
             // post_self_attn_layernorm rides alongside as the attn post norm.
-            const ps = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}post_self_attn_layernorm.weight", .{p}));
+            const ps = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}post_self_attn_layernorm.weight", .{p}));
             te_post_attn = appendHandle(te_post_attn, alloc, ps);
         }
         return .{
             .layers = layers,
-            .norm = try ownF16(w, s, "text_encoder.norm.weight"),
+            .norm = try ownF16Plus1(w, s, alloc, "text_encoder.norm.weight"),
             .table = &[_]f32{},
         };
     }
@@ -474,9 +583,6 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
     }
     const sh = [_]c_int{ 1, @intCast(L), @intCast(TE_HIDDEN) };
     var x = hostF32(buf, &sh);
-    var x16 = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&x16, x, .float16, s);
-    x = x16;
 
     for (te.layers, te_post_attn, 0..) |lw, ps, li| {
         const full = isFullAttentionLayer(@intCast(li));
@@ -501,7 +607,7 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
         const p_scale = if (full) (1.0 / TE_FACTOR_FULL) else 1.0;
         const qr = ropeApply(qt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
         const kr = ropeApply(kt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
-        const mask = if (full) null_arr else teLocalMask(s, L);
+        const mask = if (full) teFullMask(s, L) else teLocalMask(s, L);
         const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(TE_HEAD_DIM))))), mask, s);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(TE_HEADS * TE_HEAD_DIM) }, s);
@@ -518,22 +624,27 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
     try evalHost(s, last, out);
 }
 
+fn teFullMask(s: S, L: usize) mlx.mlx_array {
+    const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
+    defer std.heap.page_allocator.free(buf);
+    @memset(buf, 0);
+    _ = s;
+    return hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+}
+
 fn teLocalMask(s: S, L: usize) mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
-    const w = TE_WINDOW;
+    const left = (TE_WINDOW + 1) / 2;
+    const right = TE_WINDOW / 2 + 1;
     for (0..L) |i| {
         for (0..L) |j| {
-            const left: usize = if (j <= i) i - j else 0;
-            const right: usize = if (j > i) j - i else 0;
-            const allowed = left < w and right <= w;
+            const allowed = (j <= i and i - j < left) or (j > i and j - i < right);
             buf[i * L + j] = if (allowed) 0 else -std.math.inf(f32);
         }
     }
-    const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
-    var r = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&r, h, .float16, s);
-    return r;
+    _ = s;
+    return hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
 }
 
 fn geluTanhArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
@@ -610,7 +721,8 @@ pub const Engine = struct {
     d_layers: []QLayer,
     d_norm: mlx.mlx_array,
     d_inp: mlx.mlx_array, // depth input projection [2048, 1024] f16
-    lm_host: []f32, // [CB_VOCAB, B_HIDDEN] canonical (audio rows only)
+    lm_host: []f32, // [CB_LM, B_HIDDEN] canonical (codes + pad rows + eos row)
+    d_freqs: mlx.mlx_array = null_arr,
     heads_host: []f32, // [15, CB_VOCAB, D_HIDDEN]
     audio_table: []f32, // HOST [NUM_CODEBOOKS*CB_STRIDE, B_HIDDEN]
     codec: tts.CodecDecoder,
@@ -622,6 +734,7 @@ pub const Engine = struct {
         const s = mlx.mlx_default_gpu_stream_new();
         g_stream = s;
         mlx_allocator = allocator;
+        _hist_seen = allocator.alloc(bool, CB_LM) catch _hist_seen;
 
         var self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -634,7 +747,7 @@ pub const Engine = struct {
         te.table = try Te.loadTable(&w, s, allocator);
         errdefer allocator.free(te.table);
 
-        const lm_host = try allocator.alloc(f32, CB_VOCAB * B_HIDDEN);
+        const lm_host = try allocator.alloc(f32, CB_LM * B_HIDDEN);
         errdefer allocator.free(lm_host);
         // lm_head: torch [2052, 2048] audio rows 0..CB_VOCAB-1, canonical.
         {
@@ -643,7 +756,7 @@ pub const Engine = struct {
             try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
             _ = mlx.mlx_array_eval(f32arr);
             const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
-            for (0..CB_VOCAB) |r| @memcpy(lm_host[r * B_HIDDEN ..][0..B_HIDDEN], data[r * B_HIDDEN ..][0..B_HIDDEN]);
+            for (0..CB_LM) |r| @memcpy(lm_host[r * B_HIDDEN ..][0..B_HIDDEN], data[r * B_HIDDEN ..][0..B_HIDDEN]);
         }
 
         const heads_host = try allocator.alloc(f32, (NUM_CODEBOOKS - 1) * CB_VOCAB * D_HIDDEN);
@@ -688,8 +801,9 @@ pub const Engine = struct {
             .heads_host = heads_host,
             .audio_table = audio_table,
             .codec = try tts.loadCodecDecoderFrom(io, allocator, s, try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir})),
-            .scratch = try allocator.alloc(f32, CB_VOCAB),
-            .order = try allocator.alloc(usize, CB_VOCAB),
+            .scratch = try allocator.alloc(f32, CB_LM),
+            .order = try allocator.alloc(usize, CB_LM),
+            .d_freqs = null_arr,
         };
         errdefer {
             allocator.free(self.scratch);
@@ -729,9 +843,10 @@ pub const Engine = struct {
         if (req.text.len == 0) return error.EmptyText;
         var rng = Rng.init(req.seed orelse 42);
 
-        // text span
+        // text span — tts_plain starts with BOS (template-verified)
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(allocator);
+        try ids.append(allocator, 2);
         if (req.voice) |v| {
             if (!voiceSlotValid(v)) return error.UnknownVoice;
             try ids.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
@@ -752,6 +867,21 @@ pub const Engine = struct {
         var cond = allocator.alloc(f32, text_len * TE_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(cond);
         try teCond(allocator, g_stream, &self.te, ids.items, cond);
+        if (std.c.getenv("BREEZE_DUMP_TE") != null) {
+            var row: usize = 0;
+            while (row < text_len) : (row += 1) {
+                var buf: [16384]u8 = undefined;
+                var pos: usize = 0;
+                const r = cond[row * TE_HIDDEN ..][0..16];
+                for (r, 0..) |v, i| {
+                    if (i > 0) buf[pos] = ',';
+                    pos += 1;
+                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                    pos += sres.len;
+                }
+                log.err("[breeze-dump] te={d} {s}\n", .{ row, buf[0..pos] });
+            }
+        }
         // stream embeds [total, B_HIDDEN] host f32
         var stream = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(stream);
@@ -766,9 +896,26 @@ pub const Engine = struct {
                 for (0..B_HIDDEN) |o| {
                     var acc: f32 = 0;
                     var i: usize = 0;
-                    while (i < TE_HIDDEN) : (i += 1) acc += row[i] * wt[i * B_HIDDEN + o];
+                    while (i < TE_HIDDEN) : (i += 1) acc += row[i] * wt[o * TE_HIDDEN + i];
                     stream[t * B_HIDDEN + o] = acc;
                 }
+            }
+        }
+
+        if (std.c.getenv("BREEZE_DUMP") != null) {
+            log.err("[breeze-dump] ids={any}\n", .{ids.items});
+            var row: usize = 0;
+            while (row < text_len) : (row += 1) {
+                var buf: [32768]u8 = undefined;
+                var pos: usize = 0;
+                const r = stream[row * B_HIDDEN ..][0..B_HIDDEN];
+                for (r, 0..) |v, i| {
+                    if (i > 0) buf[pos] = ',';
+                    pos += 1;
+                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                    pos += sres.len;
+                }
+                log.err("[breeze-dump] row={d} {s}\n", .{ row, buf[0..pos] });
             }
         }
 
@@ -781,8 +928,10 @@ pub const Engine = struct {
         defer allocator.free(h_proj);
         const emb_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(emb_row);
-        const logits = allocator.alloc(f32, CB_VOCAB) catch return error.OutOfMemory;
+        const logits = allocator.alloc(f32, CB_LM) catch return error.OutOfMemory;
         defer allocator.free(logits);
+        var hist: std.ArrayList(u32) = .empty;
+        defer hist.deinit(allocator);
         var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(span);
         var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
@@ -792,38 +941,65 @@ pub const Engine = struct {
         while (frame_i < frames_cap) : (frame_i += 1) {
             const L = text_len + frame_i;
             @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
-            try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, h_row);
+            try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, h_row);
 
-            headLogits(self.lm_host, h_row, logits, CB_VOCAB, B_HIDDEN, 0);
+            headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
             var frame: [NUM_CODEBOOKS]u32 = undefined;
-            frame[0] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order));
-            if (frame[0] == CB_PAD) break;
+            const dbg_depth = std.c.getenv("BREEZE_DEPTH") != null;
+            frame[0] = if (dbg_depth and frame_i == 0) 1221 else @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = hist.items, .rep = 1.1 }));
+            if (std.c.getenv("BREEZE_DUMP") != null and frame_i == 0) {
+                var buf: [65536]u8 = undefined;
+                var pos: usize = 0;
+                for (logits[0..CB_LM], 0..) |v, i| {
+                    if (i > 0) buf[pos] = ',';
+                    pos += 1;
+                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                    pos += sres.len;
+                }
+                log.err("[breeze-dump] lm0 {s}\n", .{buf[0..pos]});
+            }
+            if (frame[0] == CB_EOS) break;
 
             // depth span: [backbone_hidden_proj, emb(cb0), emb(cb1), ...]
             try projHostCached(allocator, g_stream, self.d_inp, h_row, B_HIDDEN, D_HIDDEN, h_proj[0..D_HIDDEN]);
             @memcpy(depth_span[0..D_HIDDEN], h_proj);
+            if (dbg_depth) log.err("[breeze-dump] HPROJ {any}\nHR {any}\n", .{ h_proj[0..12], h_row[0..12] });
             var dl: usize = 1;
             var cb: usize = 1;
             while (cb < NUM_CODEBOOKS) : (cb += 1) {
                 const code = frame[cb - 1];
                 tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
+                if (dbg_depth and cb == 1) log.err("[breeze-dump] FEROW {any}\n", .{emb_row[0..12]});
                 try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
                 dl += 1;
                 const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
                 defer allocator.free(d_last);
-                try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, d_last);
+                try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, null_arr, d_last);
                 headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
-                frame[cb] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order));
+                if (dbg_depth) {
+                    var buf: [16384]u8 = undefined;
+                    var pos: usize = 0;
+                    for (logits[0..12], 0..) |v, i| {
+                        if (i > 0) buf[pos] = ',';
+                        pos += 1;
+                        const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                        pos += sres.len;
+                    }
+                    log.err("[breeze-dump] H{d} {s}\n", .{ cb, buf[0..pos] });
+                }
+                frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
+                if (dbg_depth) log.err("[breeze-dump] CODE {d} {d}\n", .{ cb, frame[cb] });
             }
 
+            if (dbg_depth and frame_i == 0) break;
+            try hist.append(allocator, frame[0]);
             // frame embed row into the stream
             frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
             @memcpy(stream[(text_len + frame_i) * B_HIDDEN ..][0..B_HIDDEN], emb_row);
             try frames.append(allocator, frame);
         }
 
-        var out_frames = frames.items;
-        while (out_frames.len > 0 and out_frames[out_frames.len - 1][0] == CB_PAD) out_frames = out_frames[0 .. out_frames.len - 1];
+        const out_frames = frames.items;
         if (out_frames.len == 0) return error.NoFramesEmitted;
 
         const pcm = try self.codec.decode(out_frames);
@@ -831,6 +1007,8 @@ pub const Engine = struct {
     }
 };
 
+var _hist_seen: []bool = &[_]bool{};
+var d_freqs_buf: [D_HD / 2]f32 = undefined;
 var mlx_allocator: std.mem.Allocator = undefined;
 var g_stream: S = undefined;
 
@@ -849,15 +1027,18 @@ fn frameEmbed(table: []const f32, width: usize, codes: []const u32, out: []f32) 
 
 var d_inp_cache: []f32 = &[_]f32{};
 
+var d_inp_key: [2]usize = .{ 0, 0 };
+
 fn projHostCached(alloc: std.mem.Allocator, s: S, w: mlx.mlx_array, x: []const f32, in: usize, out_ch: usize, out: []f32) !void {
-    if (d_inp_cache.len != in * out_ch) {
+    if (d_inp_key[0] != in or d_inp_key[1] != out_ch) {
         d_inp_cache = alloc.alloc(f32, in * out_ch) catch return error.OutOfMemory;
         try evalHost(s, w, d_inp_cache);
+        d_inp_key = .{ in, out_ch };
     }
     for (0..out_ch) |o| {
         var acc: f32 = 0;
         var i: usize = 0;
-        while (i < in) : (i += 1) acc += x[i] * d_inp_cache[i * out_ch + o];
+        while (i < in) : (i += 1) acc += x[i] * d_inp_cache[o * in + i];
         out[o] = acc;
     }
 }
@@ -928,12 +1109,12 @@ test "sampler deterministic + temp0 argmax" {
     var order: [4]usize = undefined;
     var r1 = Rng.init(7);
     var r2 = Rng.init(7);
-    const g1 = sampleToken(&r1, &logits, .{ .t = 0 }, &scratch, &order);
+    const g1 = sampleToken(&r1, &logits, .{ .t = 0 }, &scratch, &order, .{} );
     try std.testing.expectEqual(@as(usize, 1), g1);
     var s2: [4]f32 = undefined;
     var o2: [4]usize = undefined;
-    const a = sampleToken(&r1, &logits, .{}, &scratch, &order);
-    const b = sampleToken(&r2, &logits, .{}, &s2, &o2);
+    const a = sampleToken(&r1, &logits, .{}, &scratch, &order, .{} );
+    const b = sampleToken(&r2, &logits, .{}, &s2, &o2, .{} );
     try std.testing.expectEqual(a, b);
 }
 
