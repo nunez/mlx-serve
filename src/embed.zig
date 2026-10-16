@@ -20,6 +20,8 @@ const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
 const gen_mod = @import("gen.zig");
 const yue2_mod = @import("yue2.zig");
+const breeze_mod = @import("breeze.zig");
+const wav_mod = @import("wav.zig");
 const sse_mod = @import("gen_sse.zig");
 const scheduler_mod = @import("scheduler.zig");
 const server = @import("server.zig");
@@ -35,7 +37,7 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -149,6 +151,14 @@ pub const MediaGenConfig = extern struct {
     /// socketpair; the full HTTP reply arrives as one DECISION event.
     decision_json: ?[*]const u8 = null,
     decision_json_len: usize = 0,
+    /// Speech (Breeze-TTS / Qwen3-TTS /v1/audio/speech): voice slot text
+    /// ("S0".."S9", empty => backend default), instruction text (nullable),
+    /// frame cap (0 => budget from text length). prompt carries the text.
+    voice: ?[*]const u8 = null,
+    voice_len: usize = 0,
+    instruction: ?[*]const u8 = null,
+    instruction_len: usize = 0,
+    max_frames: u32 = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -877,6 +887,7 @@ export fn mlxembed_stats(out: ?[*]u64) callconv(.c) i32 {
 pub const MediaEngine = union(enum) {
     image: *gen_mod.ImageEngine,
     yue2: *yue2_mod.Engine,
+    tts: *gen_mod.AudioEngine, // speech backends (.breeze / .tts)
     video: *gen_mod.VideoEngine,
     decision: *gen_mod.DecisionEngine,
 };
@@ -898,6 +909,9 @@ const MediaGenCtx = struct {
     seed: u64,
     duration_seconds: u32,
     cot: u8,
+    voice: []u8,
+    instruction: []u8,
+    max_frames: u32,
     edit_images: []const []const u8,
     video_json: []u8,
     decision_json: []u8,
@@ -993,10 +1007,11 @@ fn doMediaLoad(req: *MediaLoadReq) void {
                 };
                 break :blk switch (ae.backend) {
                     .yue2 => |e| MediaEngine{ .yue2 = e },
+                    .breeze => MediaEngine{ .tts = ae },
                     else => {
                         ae.deinit();
                         _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                        setErr("media audio: only YuE2 is supported by embed", .{});
+                        setErr("media audio: backend {s} not supported by embed", .{@tagName(ae.backend)});
                         req.code = -3;
                         req.done = true;
                         _ = std.c.pthread_cond_signal(&req.cond);
@@ -1257,6 +1272,35 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
             c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.png), png.ptr, @intCast(png.len));
             mediaEmitDone(c, c.steps, 0);
         },
+        .tts => |ae| {
+            if (ae.backend != .breeze) {
+                const msg = "speech: only breeze_tts is supported by embed";
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            }
+            const be = ae.backend.breeze;
+            const req = breeze_mod.Request{
+                .text = c.prompt,
+                .voice = if (c.voice.len > 0) c.voice else null,
+                .instruction = if (c.instruction.len > 0) c.instruction else null,
+                .max_frames = if (c.max_frames == 0) null else c.max_frames,
+                .seed = if (c.seed == 0) null else c.seed,
+            };
+            const synth = be.synthesize(alloc, req) catch |err| {
+                const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            };
+            defer alloc.free(synth.pcm);
+            const wav = wav_mod.encodePcm16Mono(alloc, synth.pcm, be.sampleRate()) catch |err| {
+                const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+                c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                return;
+            };
+            defer alloc.free(wav);
+            c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.wav), wav.ptr, @intCast(wav.len));
+            mediaEmitDone(c, 0, 0);
+        },
         .yue2 => |eng| {
             const cot: yue2_mod.Cot = switch (c.cot) {
                 0 => .off,
@@ -1385,6 +1429,8 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     alloc.free(c.prompt);
     alloc.free(c.lyrics);
     alloc.free(c.abc);
+    if (c.voice.len > 0) alloc.free(c.voice);
+    if (c.instruction.len > 0) alloc.free(c.instruction);
     for (c.edit_images) |b| alloc.free(b);
     if (c.edit_images.len > 0) alloc.free(c.edit_images);
     if (c.video_json.len > 0) alloc.free(c.video_json);
@@ -1498,6 +1544,9 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         
         .duration_seconds = cfg.duration_seconds,
         .cot = cfg.cot,
+        .voice = if (cfg.voice) |p| alloc.dupe(u8, p[0..cfg.voice_len]) catch &.{} else &.{},
+        .instruction = if (cfg.instruction) |p| alloc.dupe(u8, p[0..cfg.instruction_len]) catch &.{} else &.{},
+        .max_frames = cfg.max_frames,
         .edit_images = &.{},
         .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
         .decision_json = if (cfg.decision_json) |p| alloc.dupe(u8, p[0..cfg.decision_json_len]) catch &.{} else &.{},
@@ -1585,6 +1634,7 @@ fn mediaTeardown() void {
                 e.deinit();
                 alloc.destroy(e);
             },
+            .tts => |e| e.deinit(),
         }
     }
     g_media.clearAndFree(std.heap.c_allocator);
