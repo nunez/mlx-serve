@@ -2932,7 +2932,7 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
 /// conditioning + Mimi decode) lands on top of `breeze.Config`; until then a
 /// well-formed request is a NAMED 501, never fake silence.
 fn handleBreezeSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *breeze.Engine) !void {
-    _ = engine;
+
     if (sse.bodyWantsTrue(body, "warm_only")) {
         return sendError(conn, 400, "voice-cloning warm-up is not supported yet");
     }
@@ -2942,29 +2942,66 @@ fn handleBreezeSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     defer allocator.free(text);
     if (text.len == 0) return sendError(conn, 400, "empty 'input'");
 
+    var voice_slot: ?[]const u8 = null;
     if (extractJsonString(body, "voice")) |raw| {
         const voice = try jsonUnescape(allocator, raw);
-        defer allocator.free(voice);
         if (voice.len > 0 and !breeze.voiceSlotValid(voice)) {
+            allocator.free(voice);
             var msg: [256]u8 = undefined;
             const m = std.fmt.bufPrint(&msg, "unknown voice '{s}'; speaker slots are S0..S9", .{voice}) catch "unknown voice";
             return sendError(conn, 400, m);
         }
+        voice_slot = if (voice.len > 0) voice else null;
     }
+    defer if (voice_slot) |v| allocator.free(v);
 
+    var instruction: ?[]const u8 = null;
+    if (extractJsonString(body, "instruction")) |raw_ins| {
+        instruction = try jsonUnescape(allocator, raw_ins);
+    }
+    defer if (instruction) |v| allocator.free(v);
+
+    var ref_audio: ?[]const u8 = null;
+    var ref_owned = false;
     if (extractJsonString(body, "ref_audio")) |raw_ref| {
         const b64 = try jsonUnescape(allocator, raw_ref);
         defer allocator.free(b64);
         if (b64.len > 0) {
-            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio is not valid base64");
-            defer allocator.free(wav_bytes);
-            const samples = decodeWavToF32(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio is not a decodable WAV");
-            allocator.free(samples);
+            ref_audio = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio is not valid base64");
+            ref_owned = true;
         }
     }
+    defer if (ref_owned and ref_audio != null) allocator.free(ref_audio.?);
 
-    log.info("[breeze] speech request {d} chars stream={}\n", .{ text.len, sse.bodyWantsTrue(body, "stream") });
-    return sendError(conn, 501, "Breeze-TTS-2 synthesis is not implemented yet");
+    const seed = extractJsonInt(body, "seed");
+    const max_frames: ?u32 = if (extractJsonInt(body, "max_frames")) |m|
+        if (m > 0 and m <= 4096) @intCast(m) else return sendError(conn, 400, "max_frames must be in 1..4096")
+    else null;
+
+    if (sse.bodyWantsTrue(body, "stream")) {
+        return sendError(conn, 501, "Breeze-TTS-2 streaming is not supported yet; use stream=false");
+    }
+
+    log.info("[breeze] speech request {d} chars\n", .{text.len});
+    const synth = engine.synthesize(allocator, .{
+        .text = text,
+        .voice = voice_slot,
+        .instruction = instruction,
+        .ref_audio = ref_audio,
+        .max_frames = max_frames,
+        .seed = seed,
+    }) catch |err| switch (err) {
+        error.CloneNotSupported => return sendError(conn, 400, "Breeze-TTS-2 voice cloning (tokenizer encode) is not supported yet"),
+        error.EmptyText => return sendError(conn, 400, "empty 'input'"),
+        error.UnknownVoice => return sendError(conn, 400, "unknown voice; speaker slots are S0..S9"),
+        error.PromptTooLongForFrameBudget => return sendError(conn, 400, "prompt too long for the frame budget"),
+        error.NoFramesEmitted => return sendError(conn, 500, "Breeze produced no audio frames"),
+        else => return sendError(conn, 500, "Breeze synthesis failed"),
+    };
+    defer allocator.free(synth.pcm);
+    const wav = try wav_mod.encodePcm16Mono(allocator, synth.pcm, engine.sampleRate());
+    defer allocator.free(wav);
+    return sendBytes(conn, allocator, "audio/wav", wav);
 }
 
 /// `instrumental: true` beside words to sing is contradictory. Letting either
