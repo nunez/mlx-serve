@@ -473,6 +473,10 @@ fn addMacLib(
         .root_module = mod,
         .linkage = .static,
     });
+    // The .a is linked into a BEAM NIF whose toolchain lacks the soft-float
+    // and 128-bit integer builtins zig emits; bundle compiler-rt so the .so
+    // dlopens cleanly.
+    lib.bundle_compiler_rt = true;
 
     const install = b.addInstallArtifact(lib, .{});
     const step = b.step("mac-lib", "Build the fleet-embed text/vision chat static lib (macOS host)");
