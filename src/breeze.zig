@@ -72,7 +72,7 @@ pub const MAX_FRAMES: u32 = 750; // generation_config max_new_tokens
 pub const SAMPLE_RATE: u32 = 24000;
 pub const FRAME_RATE: f64 = 12.5;
 pub const CHARS_PER_SEC: f64 = 15.0;
-pub const FRAME_EST_DIV: f64 = 1.2; // headroom factor over the chars-rate estimate
+pub const FRAME_EST_DIV: f64 = 3.0; // model keeps generating ~4.5+ frames per text token; generous ceiling, true stop comes from eos
 
 pub fn isFullAttentionLayer(layer: u32) bool {
     return layer == 5 or layer == 11 or layer == 17 or layer == 23;
@@ -366,11 +366,11 @@ fn depthInvFreqs() [D_HD / 2]f32 {
         const f0 = 1.0 / std.math.pow(f64, D_THETA, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(D_HD)));
         const wl = 2.0 * std.math.pi / f0;
         var f = f0;
-        if (wl > low_wl) {
+        if (wl >= high_wl) {
             f = f0 / factor;
-        } else if (wl >= high_wl) {
-            const smooth = (old_ctx / wl - low_f) / (high_f - low_f);
-            f = (1.0 - smooth) * (f0 / factor) + smooth * f0;
+        } else if (wl > low_wl) {
+            const smooth = (high_wl / wl - 1.0) / (high_wl / low_wl - 1.0);
+            f = (1.0 - smooth) * f0 + smooth * (f0 / factor);
         }
         t[i] = @floatCast(f);
     }
@@ -385,6 +385,22 @@ fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mas
 }
 
 // ─────────────────────────── qwen stack (generic) ────────────────────────────
+
+pub const KV = struct {
+    k: mlx.mlx_array = null_arr,
+    v: mlx.mlx_array = null_arr,
+};
+
+fn concat2(s: S, a: mlx.mlx_array, b: mlx.mlx_array, axis: c_int) mlx.mlx_array {
+    if (a.ctx == null) return b;
+    const vec = mlx.mlx_vector_array_new();
+    _ = mlx.mlx_vector_array_append_value(vec, a);
+    _ = mlx.mlx_vector_array_append_value(vec, b);
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_concatenate_axis(&r, vec, axis, s);
+    _ = mlx.mlx_vector_array_free(vec);
+    return r;
+}
 
 const QLayer = struct {
     q: mlx.mlx_array, // [in, q_dim] f16 (pre-transposed)
@@ -426,7 +442,7 @@ fn dumpLast(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
     log.err("[breeze-dump] {s} {any}\n", .{ tag, buf[0..@min(12, m)] });
 }
 
-fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, out_last: []f32) !void {
+fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, kv_save: ?[]KV, out_last: []f32) !void {
     const dbg_l = std.c.getenv("BREEZE_LAYER0") != null;
     if (dbg_l) dbg_layer0 = true;
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
@@ -460,6 +476,7 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, 128, s) else ropeApply(qt, theta, pos_scale, 128, s);
         if (dbg_layer0) dumpFirst(s, reshape(qr, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh)) * 128) }, s), "QR");
         const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, 128, s) else ropeApply(kt, theta, pos_scale, 128, s);
+        if (kv_save) |ks| ks[lidx] = .{ .k = kr, .v = vt };
         const mask = if (window > 0) windowMask(s, L, window) else null_arr;
         const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), mask, s);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
@@ -478,6 +495,83 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
     var taken = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_take_axis(&taken, last, hostU32(&idx, &[_]c_int{1}), 0, s));
     try evalHost(s, taken, out_last);
+}
+
+fn eval1(a: mlx.mlx_array) c_int {
+    const vec = mlx.mlx_vector_array_new_value(a);
+    const r = mlx.mlx_eval(vec);
+    _ = mlx.mlx_vector_array_free(vec);
+    return r;
+}
+
+fn ropeApplyOff(x: mlx.mlx_array, theta: f64, off: c_int, hd: c_int, s: S) mlx.mlx_array {
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_fast_rope(&r, x, hd, false, .{ .value = @floatCast(theta), .has_value = true }, 1.0, off, null_arr, s);
+    return r;
+}
+
+fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, xrow: []const f32, hidden: usize, pos: c_int, kv: []KV, out_last: []f32) !void {
+    if (std.c.getenv("BREEZE_STEP_TRACE") != null) log.err("[bstep] enter pos={d} kv0.k={any} kv0.v={any}\n", .{ pos, kv[0].k.ctx != null, kv[0].v.ctx != null });
+    const sh = [_]c_int{ 1, 1, @intCast(hidden) };
+    var x = hostF32(xrow, &sh);
+    var x16 = mlx.mlx_array_new();
+    _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
+    x = x16;
+    if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(x); log.err("[beval] x shape={d},{d},{d}\n", .{ mlx.getShape(x)[0], mlx.getShape(x)[1], mlx.getShape(x)[2] }); }
+
+    for (layers, 0..) |lw, lidx| {
+        const xn = rmsn(x, lw.in_ln, eps, s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(xn); log.err("[beval] l{d} xn\n", .{lidx}); }
+        const q = mm(xn, lw.q, s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q); log.err("[beval] l{d} q shape={d}\n", .{ lidx, mlx.getShape(q)[0] }); }
+        const k = mm(xn, lw.k, s);
+        const v = mm(xn, lw.v, s);
+        const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
+        const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k); log.err("[beval] l{d} k shape={d}\n", .{ lidx, mlx.getShape(k)[0] }); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(v); log.err("[beval] l{d} v shape={d}\n", .{ lidx, mlx.getShape(v)[0] }); }
+        var q4 = reshape(q, &[_]c_int{ 1, 1, qh, 128 }, s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} q4 shape={d},{d},{d}\n", .{ lidx, mlx.getShape(q4)[0], mlx.getShape(q4)[2], mlx.getShape(q4)[3] }); }
+        var k4 = reshape(k, &[_]c_int{ 1, 1, kh, 128 }, s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} k4\n", .{lidx}); }
+        const v4 = reshape(v, &[_]c_int{ 1, 1, kh, 128 }, s);
+        if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
+            q4 = reshape(rmsn(reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), 128 }, s), lw.qn, eps, s), &[_]c_int{ 1, 1, qh, 128 }, s);
+            if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} qnorm\n", .{lidx}); }
+            k4 = reshape(rmsn(reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), 128 }, s), lw.kn, eps, s), &[_]c_int{ 1, 1, kh, 128 }, s);
+            if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} knorm\n", .{lidx}); }
+        }
+        const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const qr = ropeApplyOff(qt, theta, pos, 128, s);
+        const kr = ropeApplyOff(kt, theta, pos, 128, s);
+        const pk = kv[lidx].k;
+        const pv = kv[lidx].v;
+        kv[lidx].k = concat2(s, kv[lidx].k, kr, 2);
+        kv[lidx].v = concat2(s, kv[lidx].v, vt, 2);
+        if (pk.ctx != null) _ = mlx.mlx_array_free(pk);
+        if (pv.ctx != null) _ = mlx.mlx_array_free(pv);
+        _ = eval1(kv[lidx].k);
+        _ = eval1(kv[lidx].v);
+        if (std.c.getenv("BREEZE_STEP_TRACE") != null and lidx == 0) log.err("[bstep] L0 k/v ok att=\n", .{});
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(kr); _ = eval1(vt); log.err("[beval] l{d} kr vt\n", .{lidx}); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(qr); _ = eval1(kr); log.err("[beval] l{d} ropes kL={d}\n", .{ lidx, mlx.getShape(kv[lidx].k)[2] }); }
+        const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), null_arr, s);
+        const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const af = reshape(at, &[_]c_int{ 1, 1, @intCast(mlx.getShape(lw.q)[1]) }, s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(att); log.err("[beval] l{d} att shape={d}\n", .{ lidx, mlx.getShape(att)[0] }); }
+        const h1 = addM(x, mm(af, lw.o, s), s);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(h1); log.err("[beval] l{d} h1\n", .{lidx}); }
+        const hn = rmsn(h1, lw.post_ln, eps, s);
+        const g = mm(hn, lw.gate, s);
+        const u = mm(hn, lw.up, s);
+        const mlp = mm(mulEl(s, siluArr(g, s), u), lw.down, s);
+        x = addM(h1, mlp, s);
+    }
+    if (std.c.getenv("BREEZE_STEP_TRACE") != null) log.err("[bstep] done normed\n", .{});
+    x = rmsn(x, norm, eps, s);
+    try evalHost(s, reshape(x, &[_]c_int{@intCast(hidden)}, s), out_last);
 }
 
 fn mulEl(s: S, a: mlx.mlx_array, b: mlx.mlx_array) mlx.mlx_array {
@@ -725,6 +819,8 @@ pub const Engine = struct {
     lm_host: []f32, // [CB_LM, B_HIDDEN] canonical (codes + pad rows + eos row)
     d_freqs: mlx.mlx_array = null_arr,
     heads_host: []f32, // [15, CB_VOCAB, D_HIDDEN]
+    bkv: [B_LAYERS]KV = undefined,
+    bkv_len: usize = 0,
     audio_table: []f32, // HOST [NUM_CODEBOOKS*CB_STRIDE, B_HIDDEN]
     codec: tts.CodecDecoder,
     scratch: []f32,
@@ -804,11 +900,13 @@ pub const Engine = struct {
             .codec = try tts.loadCodecDecoderFrom(io, allocator, s, try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir})),
             .scratch = try allocator.alloc(f32, CB_LM),
             .order = try allocator.alloc(usize, CB_LM),
+            .bkv_len = 0,
             .d_freqs = blk: {
                 d_freqs_buf = depthInvFreqs();
                 if (std.c.getenv("BREEZE_FREQS") != null) log.err("[breeze-dump] FR {any}\n", .{d_freqs_buf[0..8]});
                 break :blk hostF32(&d_freqs_buf, &[_]c_int{D_HD / 2});
             },
+            .bkv = undefined,
         };
         errdefer {
             allocator.free(self.scratch);
@@ -864,6 +962,7 @@ pub const Engine = struct {
         try self.enc(&ids, req.text);
 
         const text_len = ids.items.len;
+        if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
         const frames_cap = estimateFrames(text_len, req.max_frames);
         const total = text_len + frames_cap;
         if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
@@ -937,21 +1036,31 @@ pub const Engine = struct {
         defer allocator.free(logits);
         var hist: std.ArrayList(u32) = .empty;
         defer hist.deinit(allocator);
-        var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
-        defer allocator.free(span);
         var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
 
+        for (&self.bkv) |*e| { e.k.ctx = null; e.v.ctx = null; }
+        var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
+        defer allocator.free(span);
+        const span_mode = std.c.getenv("BREEZE_SPAN") != null;
         var frame_i: usize = 0;
         while (frame_i < frames_cap) : (frame_i += 1) {
-            const L = text_len + frame_i;
-            @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
-            try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, h_row);
-
+            if (span_mode or frame_i == 0) {
+                const L = text_len + frame_i;
+                @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
+                try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, if (frame_i == 0 and !span_mode) self.bkv[0 .. B_LAYERS] else null, h_row);
+                if (!span_mode) self.bkv_len = text_len;
+            } else {
+                try qwenStep(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, stream[(text_len + frame_i - 1) * B_HIDDEN ..][0..B_HIDDEN], B_HIDDEN, @intCast(self.bkv_len), self.bkv[0 .. B_LAYERS], h_row);
+                self.bkv_len += 1;
+            }
             headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
             var frame: [NUM_CODEBOOKS]u32 = undefined;
             const dbg_depth = std.c.getenv("BREEZE_DEPTH") != null;
-            frame[0] = if (dbg_depth and frame_i == 0) 1221 else @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = hist.items, .rep = 1.1 }));
+            const greedy = std.c.getenv("BREEZE_GREEDY") != null;
+            const first_tok = sampleToken(&rng, logits, if (greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = if (std.c.getenv("BREEZE_NOREP") != null) &[_]u32{} else hist.items, .rep = 1.1 });
+            frame[0] = if (dbg_depth and frame_i == 0) @as(u32, 1221) else @intCast(first_tok);
+            if (greedy) log.err("[breeze-dump] F{d} {d}\n", .{ frame_i, frame[0] });
             if (std.c.getenv("BREEZE_DUMP") != null and frame_i == 0) {
                 var buf: [65536]u8 = undefined;
                 var pos: usize = 0;
@@ -975,11 +1084,12 @@ pub const Engine = struct {
                 const code = frame[cb - 1];
                 tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
                 if (dbg_depth and cb == 1) log.err("[breeze-dump] FEROW {any}\n", .{emb_row[0..12]});
+                if (std.c.getenv("BREEZE_ROW2") != null and cb == 3) log.err("[breeze-dump] ROW3 {any}\n", .{emb_row[0..12]});
                 try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
                 dl += 1;
                 const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
                 defer allocator.free(d_last);
-                try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, null_arr, d_last);
+                try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, (if (std.c.getenv("BREEZE_DROPE") != null and std.c.getenv("BREEZE_DROPE").?[0] == 104) self.d_freqs else null_arr), null, d_last);
                 headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
                 if (dbg_depth) {
                     var buf: [16384]u8 = undefined;
@@ -992,11 +1102,12 @@ pub const Engine = struct {
                     }
                     log.err("[breeze-dump] H{d} {s}\n", .{ cb, buf[0..pos] });
                 }
-                frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
+                frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth or greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
                 if (dbg_depth) log.err("[breeze-dump] CODE {d} {d}\n", .{ cb, frame[cb] });
             }
 
             if (dbg_depth and frame_i == 0) break;
+            if (frame_i % 4 == 3) { _ = mlx.mlx_clear_cache(); }
             try hist.append(allocator, frame[0]);
             // frame embed row into the stream
             frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
