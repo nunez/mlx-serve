@@ -2973,6 +2973,12 @@ fn handleBreezeSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     }
     defer if (ref_owned and ref_audio != null) allocator.free(ref_audio.?);
 
+    var ref_text: ?[]const u8 = null;
+    if (extractJsonString(body, "ref_text")) |raw_rt| {
+        ref_text = try jsonUnescape(allocator, raw_rt);
+    }
+    defer if (ref_text) |v| allocator.free(v);
+
     const seed = extractJsonInt(body, "seed");
     const max_frames: ?u32 = if (extractJsonInt(body, "max_frames")) |m|
         if (m > 0 and m <= 4096) @intCast(m) else return sendError(conn, 400, "max_frames must be in 1..4096")
@@ -2988,10 +2994,11 @@ fn handleBreezeSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
         .voice = voice_slot,
         .instruction = instruction,
         .ref_audio = ref_audio,
+        .ref_text = ref_text,
         .max_frames = max_frames,
         .seed = seed,
     }) catch |err| switch (err) {
-        error.CloneNotSupported => return sendError(conn, 400, "Breeze-TTS-2 voice cloning (tokenizer encode) is not supported yet"),
+        error.CloneMissingRefText => return sendError(conn, 400, "'ref_text' is required with 'ref_audio'"),
         error.EmptyText => return sendError(conn, 400, "empty 'input'"),
         error.UnknownVoice => return sendError(conn, 400, "unknown voice; speaker slots are S0..S9"),
         error.PromptTooLongForFrameBudget => return sendError(conn, 400, "prompt too long for the frame budget"),

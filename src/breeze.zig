@@ -17,6 +17,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const tts = @import("tts.zig");
+const wav_mod = @import("wav.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -25,6 +26,7 @@ pub const model_type = "breeze_tts";
 
 // ── token ids (fixed by the published pack) ────────────────────────────────
 pub const AUDIO_TOKEN_ID: u32 = 262144;
+pub const MIMI_RATE: u32 = 24000;
 pub const AUDIO_EOS_ID: u32 = 262145;
 pub const SPEAKER_BASE: u32 = 262146; // [S0]..[S9]
 pub const INS_BOS_ID: u32 = 262156;
@@ -796,7 +798,8 @@ pub const Request = struct {
     text: []const u8 = "",
     voice: ?[]const u8 = null, // "S0".."S9" voice-design slot
     instruction: ?[]const u8 = null,
-    ref_audio: ?[]const u8 = null, // WAV bytes — clone refused until Mimi encode lands
+    ref_audio: ?[]const u8 = null, // WAV bytes → Mimi ref frames (clone)
+    ref_text: ?[]const u8 = null, // transcript of ref_audio (required with it)
     max_frames: ?u32 = null,
     seed: ?u64 = null,
 };
@@ -825,6 +828,9 @@ pub const Engine = struct {
     codec: tts.CodecDecoder,
     scratch: []f32,
     order: []usize,
+    model_dir: []const u8 = "",
+    io: std.Io = undefined,
+    mimi: ?*tts.MimiEncoder = null,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
         if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.InvalidModelDir;
@@ -889,6 +895,9 @@ pub const Engine = struct {
             .tok = try tokenizer_mod.loadTokenizer(io, allocator, model_dir),
             .te = te,
             .te_proj = undefined,
+            .model_dir = try allocator.dupe(u8, model_dir),
+            .io = io,
+            .mimi = null,
             .b_layers = try loadQLayers("backbone_model.layers.{d}.", &w, allocator, s, B_LAYERS, true),
             .b_norm = try ownF16(&w, s, "backbone_model.norm.weight"),
             .d_layers = try loadQLayers("depth_decoder.model.layers.{d}.", &w, allocator, s, D_LAYERS, false),
@@ -924,6 +933,8 @@ pub const Engine = struct {
         self.alloc.free(self.lm_host);
         self.alloc.free(self.heads_host);
         self.alloc.free(self.audio_table);
+        if (self.mimi) |m| { m.deinit(); self.alloc.destroy(m); }
+        self.alloc.free(self.model_dir);
         self.alloc.free(self.scratch);
         self.alloc.free(self.order);
         self.alloc.destroy(self);
@@ -942,66 +953,132 @@ pub const Engine = struct {
 
     /// Plain / tagged / instruction synthesis.
     pub fn synthesize(self: *Engine, allocator: std.mem.Allocator, req: Request) !Synthesis {
-        if (req.ref_audio != null and req.ref_audio.?.len > 0) return error.CloneNotSupported;
         if (req.text.len == 0) return error.EmptyText;
+        const clone = req.ref_audio != null and req.ref_audio.?.len > 0;
+        if (clone and (req.ref_text == null or req.ref_text.?.len == 0)) return error.CloneMissingRefText;
         var rng = Rng.init(req.seed orelse 42);
 
-        // text span — tts_plain starts with BOS (template-verified)
-        var ids: std.ArrayList(u32) = .empty;
-        defer ids.deinit(allocator);
-        try ids.append(allocator, 2);
+        // ref_clone_tata: TE-encodes each text segment over its own positions;
+        // audio slots carry audio_embedding frame sums (zero frame at audio_eos).
+        var seg1: std.ArrayList(u32) = .empty;
+        defer seg1.deinit(allocator);
+        var seg2: std.ArrayList(u32) = .empty;
+        defer seg2.deinit(allocator);
+        try seg1.append(allocator, 2); // BOS on the first text segment
         if (req.voice) |v| {
             if (!voiceSlotValid(v)) return error.UnknownVoice;
-            try ids.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
+            try seg1.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
         }
-        if (req.instruction) |ins| {
-            try ids.append(allocator, INS_BOS_ID);
-            try self.enc(&ids, ins);
-            try ids.append(allocator, INS_EOS_ID);
+        if (clone) {
+            try self.enc(&seg1, req.ref_text.?);
+            if (req.voice) |v| {
+                if (!voiceSlotValid(v)) return error.UnknownVoice;
+                try seg2.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
+            }
+            if (req.instruction) |ins| {
+                try seg2.append(allocator, INS_BOS_ID);
+                try self.enc(&seg2, ins);
+                try seg2.append(allocator, INS_EOS_ID);
+            }
+            try self.enc(&seg2, req.text);
+        } else {
+            if (req.instruction) |ins| {
+                try seg1.append(allocator, INS_BOS_ID);
+                try self.enc(&seg1, ins);
+                try seg1.append(allocator, INS_EOS_ID);
+            }
+            try self.enc(&seg1, req.text);
         }
-        try self.enc(&ids, req.text);
+
+        var ref_frames: std.ArrayList([]u32) = .empty;
+        defer for (ref_frames.items) |f| allocator.free(f);
+        if (clone) {
+            const d = try wav_mod.decode(allocator, req.ref_audio.?);
+            defer allocator.free(d.pcm);
+            var pcm = d.pcm;
+            if (d.channels == 2) {
+                const m = try allocator.alloc(f32, d.pcm.len / 2);
+                defer allocator.free(m);
+                for (0..m.len) |i| m[i] = (d.pcm[i * 2] + d.pcm[i * 2 + 1]) / 2;
+                if (d.sample_rate != MIMI_RATE) return error.UnsupportedRefRate; // mixed resample skipped
+                pcm = m;
+            }
+            if (self.mimi == null) {
+                const tok_dir = try std.fs.path.join(allocator, &.{ self.model_dir, "audio_tokenizer" });
+                defer allocator.free(tok_dir);
+                const enc2 = try allocator.create(tts.MimiEncoder);
+                errdefer allocator.destroy(enc2);
+                enc2.* = try tts.loadMimiEncoder(self.io, allocator, g_stream, tok_dir);
+                self.mimi = enc2;
+            }
+            const fr = try self.mimi.?.encodeSamples(pcm);
+            defer allocator.free(fr);
+            for (fr) |f| try ref_frames.append(allocator, f);
+        }
+
+        var ids: std.ArrayList(u32) = .empty; // meta prompt; audio slots = placeholder ids
+        defer ids.deinit(allocator);
+        try ids.appendSlice(allocator, seg1.items);
+        if (clone) {
+            for (0..ref_frames.items.len) |_| try ids.append(allocator, AUDIO_TOKEN_ID);
+            try ids.append(allocator, AUDIO_EOS_ID);
+            try ids.appendSlice(allocator, seg2.items);
+        } else {
+            try ids.appendSlice(allocator, seg1.items);
+        }
 
         const text_len = ids.items.len;
         if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
-        const frames_cap = estimateFrames(text_len, req.max_frames);
+        const est_text = if (clone) seg2.items.len else text_len;
+        const frames_cap = estimateFrames(est_text, req.max_frames);
         const total = text_len + frames_cap;
         if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
 
-        // TE conditioning → project to backbone width (host rows)
-        var cond = allocator.alloc(f32, text_len * TE_HIDDEN) catch return error.OutOfMemory;
+        // TE conditioning → backbone-width stream rows.
+        var cond = allocator.alloc(f32, @max(seg1.items.len, seg2.items.len) * TE_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(cond);
-        try teCond(allocator, g_stream, &self.te, ids.items, cond);
-        if (std.c.getenv("BREEZE_DUMP_TE") != null) {
-            var row: usize = 0;
-            while (row < text_len) : (row += 1) {
-                var buf: [16384]u8 = undefined;
-                var pos: usize = 0;
-                const r = cond[row * TE_HIDDEN ..][0..16];
-                for (r, 0..) |v, i| {
-                    if (i > 0) buf[pos] = ',';
-                    pos += 1;
-                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                    pos += sres.len;
-                }
-                log.err("[breeze-dump] te={d} {s}\n", .{ row, buf[0..pos] });
-            }
-        }
-        // stream embeds [total, B_HIDDEN] host f32
         var stream = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(stream);
         @memset(stream, 0);
         {
-            // te_proj host: read device weight once
             const wt = allocator.alloc(f32, TE_HIDDEN * B_HIDDEN) catch return error.OutOfMemory;
             defer allocator.free(wt);
             try evalHost(g_stream, self.te_proj, wt);
-            for (0..text_len) |t| {
-                const row = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
+            const emb_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
+            defer allocator.free(emb_row);
+            var row: usize = 0;
+            try teCond(allocator, g_stream, &self.te, seg1.items, cond[0 .. seg1.items.len * TE_HIDDEN]);
+            for (0..seg1.items.len) |t| {
+                const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
                 for (0..B_HIDDEN) |o| {
                     var acc: f32 = 0;
                     var i: usize = 0;
-                    while (i < TE_HIDDEN) : (i += 1) acc += row[i] * wt[o * TE_HIDDEN + i];
-                    stream[t * B_HIDDEN + o] = acc;
+                    while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
+                    stream[row * B_HIDDEN + o] = acc;
+                }
+                row += 1;
+            }
+            if (clone) {
+                for (ref_frames.items) |f| {
+                    frameEmbed(self.audio_table, B_HIDDEN, f, emb_row);
+                    @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                    row += 1;
+                }
+                var zframe: [NUM_CODEBOOKS]u32 = undefined;
+                @memset(&zframe, 0);
+                frameEmbed(self.audio_table, B_HIDDEN, &zframe, emb_row);
+                @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                row += 1;
+                try teCond(allocator, g_stream, &self.te, seg2.items, cond[0 .. seg2.items.len * TE_HIDDEN]);
+                for (0..seg2.items.len) |t| {
+                    const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
+                    for (0..B_HIDDEN) |o| {
+                        var acc: f32 = 0;
+                        var i: usize = 0;
+                        while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
+                        stream[row * B_HIDDEN + o] = acc;
+                    }
+                    row += 1;
                 }
             }
         }

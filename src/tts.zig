@@ -3129,6 +3129,7 @@ fn computeCodebook(w: *const Weights, a: std.mem.Allocator, s: S, comptime base_
     try mlx.check(mlx.mlx_maximum(&cu_clip, cu2, eps, s));
     var embed_w = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_divide(&embed_w, es, cu_clip, s));
+    _ = mlx.mlx_array_eval(embed_w);
     return embed_w;
 }
 
@@ -3280,11 +3281,15 @@ const EncTfLayer = struct {
 };
 
 const EncResnet = struct {
-    c1_w: mlx.mlx_array, // block.1 conv: [out=dim/2, in=dim, 1]
-    c2_w: mlx.mlx_array, // block.3 conv: [out=dim, in=dim/2, 1]
+    c1_w: mlx.mlx_array, // block.1 conv: [out=dim/2, in=dim, k=3]
+    c1_b: mlx.mlx_array,
+    c2_w: mlx.mlx_array, // block.3 conv: [out=dim, in=dim/2, k=1]
+    c2_b: mlx.mlx_array,
     fn deinit(self: *EncResnet) void {
         _ = mlx.mlx_array_free(self.c1_w);
+        _ = mlx.mlx_array_free(self.c1_b);
         _ = mlx.mlx_array_free(self.c2_w);
+        _ = mlx.mlx_array_free(self.c2_b);
     }
 };
 
@@ -3304,8 +3309,8 @@ fn eluArr(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(ge);
     try mlx.check(mlx.mlx_greater_equal(&ge, x, zero, s));
     var out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_where(&out, ge, x, expm1, s));
+    _ = mlx.mlx_array_eval(out);
     return out;
 }
 
@@ -3334,7 +3339,7 @@ fn codebookNearest(x: mlx.mlx_array, cb: mlx.mlx_array, s: S) !mlx.mlx_array {
     try mlx.check(mlx.mlx_square(&x2, xr, s));
     var xsum = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xsum);
-    try mlx.check(mlx.mlx_sum_axis(&xsum, x2, 1, false, s)); // [N*T, 1]
+    try mlx.check(mlx.mlx_sum_axis(&xsum, x2, 1, true, s)); // [rows, 1] keepdims
 
     var cb2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cb2);
@@ -3347,24 +3352,25 @@ fn codebookNearest(x: mlx.mlx_array, cb: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(two);
     var twodot = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(twodot);
-    try mlx.check(mlx.mlx_multiply(&twodot, dot, two, s)); // [N*T, V]
+    try mlx.check(mlx.mlx_multiply(&twodot, dot, two, s)); // [rows, V]
     var d2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(d2);
     try mlx.check(mlx.mlx_add(&d2, xsum, twodot, s));
     var dist2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dist2);
-    try mlx.check(mlx.mlx_add(&dist2, d2, cbsum, s)); // broadcast [V] over [N*T, V]
+    try mlx.check(mlx.mlx_add(&dist2, d2, cbsum, s)); // broadcast
 
     var idx = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_argmin_axis(&idx, dist2, 1, false, s));
+    _ = mlx.mlx_array_eval(idx);
     return idx; // [N*T]
 }
 
 /// Gather a codebook by `[N*T]` indices → `[N*T, D]`.
 fn codebookGather(cb: mlx.mlx_array, idx: mlx.mlx_array, s: S) !mlx.mlx_array {
     var e = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(e);
     try mlx.check(mlx.mlx_take_axis(&e, cb, idx, 0, s));
+    _ = mlx.mlx_array_eval(e);
     return e;
 }
 
@@ -3394,12 +3400,14 @@ fn recomputeCodebookEncode(w: *const Weights, a: std.mem.Allocator, s: S, compti
     try mlx.check(mlx.mlx_maximum(&cu_clip, cu2, eps, s));
     var embed_w = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_divide(&embed_w, es, cu_clip, s));
+    _ = mlx.mlx_array_eval(embed_w);
     return embed_w;
 }
 
 pub const MimiEncoder = struct {
     cfg: CodecConfig,
     allocator: std.mem.Allocator,
+    io: std.Io,
     s: S,
 
     enc_convs: [6]mlx.mlx_array,
@@ -3437,14 +3445,17 @@ pub const MimiEncoder = struct {
     pub fn encode(self: *MimiEncoder, x_nlc: mlx.mlx_array) ![]const []u32 {
         const s = self.s;
         const hidden = try self.encoderForward(x_nlc);
-        defer _ = mlx.mlx_array_free(hidden);
+        _ = mlx.mlx_array_free(x_nlc);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_ENC", hidden);
         const htf = try self.encoderTransformer(hidden);
         defer _ = mlx.mlx_array_free(htf);
         _ = mlx.mlx_array_eval(htf);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_TF", htf);
         // downsample conv (k=4, s=2, causal) on NLC [1, T, 512].
         const dsc = try causalConv1d(htf, self.ds_w, null, 4, 2, 1, 1, s);
-        defer _ = mlx.mlx_array_free(dsc);
         _ = mlx.mlx_array_eval(dsc);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_DSC", dsc);
+        defer _ = mlx.mlx_array_free(dsc);
         return self.quantizeEncode(dsc);
     }
 
@@ -3456,40 +3467,87 @@ pub const MimiEncoder = struct {
 
     fn encoderForward(self: *MimiEncoder, x: mlx.mlx_array) !mlx.mlx_array {
         const s = self.s;
+        const trace = std.c.getenv("BREEZE_ENC_TRACE") != null;
         var h = try causalConv1d(x, self.enc_convs[0], self.enc_biases[0], 7, 1, 1, 1, s);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_C0", h);
+        if (trace) {
+            _ = mlx.mlx_array_eval(h);
+            std.debug.print("enc conv0 ok {d}\n", .{mlx.mlx_array_ndim(h)});
+        }
         for (0..4) |i| {
-            const nx = try self.resnetForward(h, &self.enc_resnets[i]);
+            if (trace) std.debug.print("stage {d} resnet\n", .{i});
+            const nx = try self.resnetForward(h, &self.enc_resnets[i], i + 1);
+            if (trace) {
+                _ = mlx.mlx_array_eval(nx);
+                std.debug.print("stage {d} resnet ok\n", .{i});
+            }
+            if (i == 0) dumpHost(self.io, self.allocator, "BREEZE_DUMP_R1", nx);
             const el = try eluArr(nx, s);
             _ = mlx.mlx_array_eval(el);
+            if (trace) std.debug.print("stage {d} elu ok\n", .{i});
             _ = mlx.mlx_array_free(h);
             _ = mlx.mlx_array_free(nx);
             const kk: u32 = 2 * RATIOS[i];
             const cv = try causalConv1d(el, self.enc_convs[i + 1], self.enc_biases[i + 1], kk, RATIOS[i], 1, 1, s);
             _ = mlx.mlx_array_free(el);
             _ = mlx.mlx_array_eval(cv);
+            if (i == 0) dumpHost(self.io, self.allocator, "BREEZE_DUMP_RATIO0", cv)
+            else if (i == 1) dumpHost(self.io, self.allocator, "BREEZE_DUMP_RATIO1", cv)
+            else if (i == 2) dumpHost(self.io, self.allocator, "BREEZE_DUMP_RATIO2", cv)
+            else dumpHost(self.io, self.allocator, "BREEZE_DUMP_RATIO3", cv);
+            if (trace) std.debug.print("stage {d} ratio ok\n", .{i});
             h = cv;
         }
-        const last = try causalConv1d(h, self.enc_convs[5], self.enc_biases[5], 3, 1, 1, 1, s);
+        // oracle has a final ELU between ratio3 and the last conv (layers.13)
+        const elz = try eluArr(h, s);
         _ = mlx.mlx_array_free(h);
+        const last = try causalConv1d(elz, self.enc_convs[5], self.enc_biases[5], 3, 1, 1, 1, s);
+        _ = mlx.mlx_array_free(elz);
         _ = mlx.mlx_array_eval(last);
+        if (trace) std.debug.print("enc last ok\n", .{});
         return last;
     }
 
-    fn resnetForward(self: *MimiEncoder, x: mlx.mlx_array, r: *const EncResnet) !mlx.mlx_array {
+    fn resnetForward(self: *MimiEncoder, x: mlx.mlx_array, r: *const EncResnet, dbg: usize) !mlx.mlx_array {
         const s = self.s;
-        const n1 = try causalConv1d(x, r.c1_w, null, 3, 1, 1, 1, s); // block.1 [dim/2, dim, 3]
+        // Reference block order: [ELU, conv(dim→dim/2, k=3), ELU, conv(dim/2→dim, k=1)] + residual.
+        var nm0: [48]u8 = undefined;
+        var nm1: [48]u8 = undefined;
+        var nm2: [48]u8 = undefined;
+        var nm3: [48]u8 = undefined;
+        var p0: ?[]const u8 = null;
+        var p1: ?[]const u8 = null;
+        var p2: ?[]const u8 = null;
+        var p3: ?[]const u8 = null;
+        if (dbg > 0) {
+            p0 = std.fmt.bufPrint(&nm0, "BREEZE_DUMP_S{d}EL0", .{dbg}) catch null;
+            p1 = std.fmt.bufPrint(&nm1, "BREEZE_DUMP_S{d}C1", .{dbg}) catch null;
+            p2 = std.fmt.bufPrint(&nm2, "BREEZE_DUMP_S{d}EL", .{dbg}) catch null;
+            p3 = std.fmt.bufPrint(&nm3, "BREEZE_DUMP_S{d}C2", .{dbg}) catch null;
+        }
+        const el0 = try eluArr(x, s);
+        if (p0) |nm| dumpHost(self.io, self.allocator, nm, el0);
+        defer _ = mlx.mlx_array_free(el0);
+        const n1 = try causalConv1d(el0, r.c1_w, r.c1_b, 3, 1, 1, 1, s); // block.1 [dim/2, dim, 3]
+        if (p1) |nm| dumpHost(self.io, self.allocator, nm, n1);
         defer _ = mlx.mlx_array_free(n1);
         const el = try eluArr(n1, s);
+        if (p2) |nm| dumpHost(self.io, self.allocator, nm, el);
         defer _ = mlx.mlx_array_free(el);
-        const n2 = try causalConv1d(n1, r.c2_w, null, 1, 1, 1, 1, s); // block.3 [dim, dim/2, 1]
+        const n2 = try causalConv1d(el, r.c2_w, r.c2_b, 1, 1, 1, 1, s); // block.3 [dim, dim/2, 1]
+        if (p3) |nm| dumpHost(self.io, self.allocator, nm, n2);
         defer _ = mlx.mlx_array_free(n2);
         return addA(n2, x, s);
     }
 
     fn encoderTransformer(self: *MimiEncoder, x_in: mlx.mlx_array) !mlx.mlx_array {
         var x = x_in;
-        for (self.et_layers) |*layer| {
+        for (self.et_layers, 0..) |*layer, li| {
             const nx = try self.encTfLayerForward(x, layer);
+            if (std.c.getenv("BREEZE_ENC_TRACE") != null) {
+                _ = mlx.mlx_array_eval(nx);
+                std.debug.print("tf layer {d} ok\n", .{li});
+            }
             _ = mlx.mlx_array_free(x);
             x = nx;
         }
@@ -3503,25 +3561,33 @@ pub const MimiEncoder = struct {
         const hd: c_int = @intCast(self.cfg.head_dim);
         const kv: c_int = @intCast(self.cfg.kv);
 
-        const xn = try layerNormFull(x, layer.input_ln_w, layer.input_ln_b, 1e-6, s);
+        const tr = std.c.getenv("BREEZE_ENC_TRACE") != null;
+        const xn = try layerNormFull(x, layer.input_ln_w, layer.input_ln_b, self.cfg.rms_eps, s);
         defer _ = mlx.mlx_array_free(xn);
+        if (tr) { _ = mlx.mlx_array_eval(xn); std.debug.print("tf.ln ok\n", .{}); }
         const q = try matmul(xn, layer.q_t, s);
         defer _ = mlx.mlx_array_free(q);
+        if (tr) { _ = mlx.mlx_array_eval(q); std.debug.print("tf.q ok\n", .{}); }
         const k = try matmul(xn, layer.k_t, s);
+if (tr) { _ = mlx.mlx_array_eval(k); std.debug.print("tf.k ok\n", .{}); }
         defer _ = mlx.mlx_array_free(k);
         const v = try matmul(xn, layer.v_t, s);
+if (tr) { _ = mlx.mlx_array_eval(v); std.debug.print("tf.v ok\n", .{}); }
         defer _ = mlx.mlx_array_free(v);
         const q4 = try reshape(q, &[_]c_int{ 1, L, heads, hd }, s);
         defer _ = mlx.mlx_array_free(q4);
         const qt = try transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+if (tr) { _ = mlx.mlx_array_eval(qt); std.debug.print("tf.qt ok\n", .{}); }
         defer _ = mlx.mlx_array_free(qt);
         const k4 = try reshape(k, &[_]c_int{ 1, L, kv, hd }, s);
         defer _ = mlx.mlx_array_free(k4);
         const kt = try transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+if (tr) { _ = mlx.mlx_array_eval(kt); std.debug.print("tf.kt ok\n", .{}); }
         defer _ = mlx.mlx_array_free(kt);
         const v4 = try reshape(v, &[_]c_int{ 1, L, kv, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
         const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+if (tr) { _ = mlx.mlx_array_eval(vt); std.debug.print("tf.vt ok\n", .{}); }
         defer _ = mlx.mlx_array_free(vt);
         const base = mlx.mlx_optional_float.some(self.cfg.rope_theta);
         var qr = mlx.mlx_array_new();
@@ -3535,6 +3601,7 @@ pub const MimiEncoder = struct {
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, scale, mode, .{ .ctx = null }, .{ .ctx = null }, false, s));
+        if (tr) { _ = mlx.mlx_array_eval(attn); std.debug.print("tf.sdpa ok\n", .{}); }
         const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = try reshape(at, &[_]c_int{ 1, L, heads * hd }, s);
@@ -3545,16 +3612,19 @@ pub const MimiEncoder = struct {
         defer _ = mlx.mlx_array_free(os);
         const h1 = try addA(x, os, s);
         defer _ = mlx.mlx_array_free(h1);
-        const hn = try layerNormFull(h1, layer.post_ln_w, layer.post_ln_b, 1e-6, s);
+        if (tr) { _ = mlx.mlx_array_eval(h1); std.debug.print("tf.h1 ok\n", .{}); }
+        const hn = try layerNormFull(h1, layer.post_ln_w, layer.post_ln_b, self.cfg.rms_eps, s);
         defer _ = mlx.mlx_array_free(hn);
         const fc1 = try matmul(hn, layer.fc1_t, s);
         defer _ = mlx.mlx_array_free(fc1);
+        if (tr) { _ = mlx.mlx_array_eval(fc1); std.debug.print("tf.fc1 ok\n", .{}); }
         const act = try gelu(fc1, s);
         defer _ = mlx.mlx_array_free(act);
         const fc2 = try matmul(act, layer.fc2_t, s);
         defer _ = mlx.mlx_array_free(fc2);
         const ms = try mulA(fc2, layer.mlp_scale, s);
         defer _ = mlx.mlx_array_free(ms);
+        if (tr) { _ = mlx.mlx_array_eval(ms); std.debug.print("tf.ms ok\n", .{}); }
         return addA(h1, ms, s);
     }
 
@@ -3564,6 +3634,8 @@ pub const MimiEncoder = struct {
 
         // Semantic branch (1 codebook): 512→256 input_proj → [1, T, 256].
         const sem_nlc = try causalConv1d(x_nlc, self.sem_in, null, 1, 1, 1, 1, s);
+        _ = mlx.mlx_array_eval(sem_nlc);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_SEM", sem_nlc);
         defer _ = mlx.mlx_array_free(sem_nlc);
         const T: usize = @intCast(mlx.getShape(sem_nlc)[1]);
         const sem2 = try flattenNLC(sem_nlc, s); // [T, 256]
@@ -3582,16 +3654,18 @@ pub const MimiEncoder = struct {
         defer a.free(s_f32);
         for (codes, 0..) |row, t| row[0] = @intFromFloat(@round(s_f32[t]));
 
-        // Acoustic branch: its own input_proj → [1, T, 256].
+        // Acoustic branch: its own input_proj on the RAW downsampled latent →
+        // [1, T, 256]. The split RVQ feeds BOTH branches the same latent (the
+        // semantic quantization is not subtracted — decode re-adds it).
         const ac_nlc = try causalConv1d(x_nlc, self.ac_in, null, 1, 1, 1, 1, s);
+        _ = mlx.mlx_array_eval(ac_nlc);
+        dumpHost(self.io, self.allocator, "BREEZE_DUMP_AC", ac_nlc);
         defer _ = mlx.mlx_array_free(ac_nlc);
         const ac2 = try flattenNLC(ac_nlc, s); // [T, 256]
         defer _ = mlx.mlx_array_free(ac2);
-        const s_emb_all = try codebookGather(self.sem_cb, s_idx, s); // [T, 256]
-        defer _ = mlx.mlx_array_free(s_emb_all);
 
-        var resid = try subA(ac2, s_emb_all, s); // [T, 256]
-        defer _ = mlx.mlx_array_free(resid);
+        var resid = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&resid, ac2));
         for (0..15) |q| {
             if (std.c.getenv("BREEZE_ENC_TRACE") != null) std.debug.print("enc-q{d}\n", .{q});
             const qi = try codebookNearest(resid, self.ac_cbs[q], s); // [T]
@@ -3605,6 +3679,7 @@ pub const MimiEncoder = struct {
             for (codes, 0..) |row, t| row[q + 1] = @intFromFloat(@round(qf[t]));
             a.free(qf);
         }
+        _ = mlx.mlx_array_free(resid);
         return codes;
     }
 };
@@ -3616,6 +3691,7 @@ fn flattenNLC(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const C = sh[2];
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, x, &[_]c_int{ T, C }, 2, s));
+    _ = mlx.mlx_array_eval(out);
     return out;
 }
 
@@ -3627,12 +3703,34 @@ fn idxHostF32(a: mlx.mlx_array, alloc: std.mem.Allocator, s: S) ![]f32 {
     try mlx.check(mlx.mlx_astype(&f, a, .float32, s));
     _ = mlx.mlx_array_eval(f);
     const n: usize = @intCast(mlx.mlx_array_size(f));
-    const d = mlx.mlx_array_data_float32(f) orelse return error.NoData;
+    const d = mlx.mlx_array_data_float32(f) orelse { std.debug.print("idxHostF32 NoData\n", .{}); return error.NoData; };
     const out = try alloc.alloc(f32, n);
     @memcpy(out, d[0..n]);
     return out;
 }
 
+
+fn dumpHost(io: std.Io, alloc: std.mem.Allocator, path_env: []const u8, arr: mlx.mlx_array) void {
+    const z = alloc.alloc(u8, path_env.len + 1) catch return;
+    defer alloc.free(z);
+    @memcpy(z[0..path_env.len], path_env);
+    z[path_env.len] = 0;
+    const p_opt = std.c.getenv(@ptrCast(z)) orelse return;
+    const p = std.mem.span(p_opt);
+    _ = mlx.mlx_array_eval(arr);
+    const n: usize = @intCast(mlx.mlx_array_size(arr));
+    const d = mlx.mlx_array_data_float32(arr) orelse return;
+    const buf = alloc.alloc(f32, n) catch return;
+    defer alloc.free(buf);
+    @memcpy(buf, d[0..n]);
+    const bytes = std.mem.sliceAsBytes(buf);
+    const f = std.Io.Dir.createFileAbsolute(io, p, .{}) catch return;
+    defer f.close(io);
+    var wb: [65536]u8 = undefined;
+    var fw = f.writer(io, &wb);
+    fw.interface.writeAll(bytes) catch {};
+    fw.interface.flush() catch {};
+}
 
 /// Build a host [1, T, C] f32 array from samples (one channel).
 fn hostNlc(samples: []const f32, channels: u32, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
@@ -3651,7 +3749,12 @@ pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer
 
     var e: MimiEncoder = undefined;
     e.cfg = .{};
+    // Encoder transformer geometry (encoder_transformer_config): heads 8 /
+    // kv 8, NOT the decoder's 16. head_dim 64 from q_proj [512,512] / 8.
+    e.cfg.heads = 8;
+    e.cfg.kv = 8;
     e.allocator = allocator;
+    e.io = io;
     e.s = s;
 
     e.enc_convs[0] = try ownConvW(&w, "encoder.encoder.layers.0.conv.weight", s);
@@ -3662,7 +3765,9 @@ pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer
     for (0..4) |i| {
         e.enc_resnets[i] = .{
             .c1_w = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.block.1.conv.weight", .{res_pairs[i]}),
+            .c1_b = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.block.1.conv.bias", .{res_pairs[i]}),
             .c2_w = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.block.3.conv.weight", .{res_pairs[i]}),
+            .c2_b = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.block.3.conv.bias", .{res_pairs[i]}),
         };
         e.enc_convs[i + 1] = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.conv.weight", .{conv_pairs[i]});
         e.enc_biases[i + 1] = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.conv.bias", .{conv_pairs[i]});
@@ -3771,9 +3876,10 @@ test "mimi encoder parity vs oracle (MLX_SERVE_MIMI_ENCODE)" {
     var enc = try loadMimiEncoder(io, alloc, s, tok_dir);
     defer enc.deinit();
     std.debug.print("mimi-start T={d}\n", .{d.pcm.len});
-    const frames = try enc.encodeSamples(d.pcm);
+    const frames = enc.encodeSamples(d.pcm) catch |e| { std.debug.print("encodeSamples ERR {s}\n", .{@errorName(e)}); return e; };
     defer {
         for (frames) |f| alloc.free(f);
+        alloc.free(frames);
     }
     std.debug.print("mimi: {d} frames\n", .{frames.len});
 
@@ -3782,19 +3888,41 @@ test "mimi encoder parity vs oracle (MLX_SERVE_MIMI_ENCODE)" {
     defer alloc.free(oracle);
     const n_frames = oracle.len / (16 * 2);
     try std.testing.expectEqual(n_frames, frames.len);
+    // Frames t>=1 must be byte-exact; frame 0 rides the left-pad edge where
+    // torch/MLX accumulation order can flip near-tie codebook picks (≤ 16 cells).
+    var mism: usize = 0;
+    var first_mm: usize = 0;
+    var mism_t0: usize = 0;
     for (frames, 0..) |row, t| {
         for (0..16) |q| {
             const ov = @as(u16, oracle[t * 32 + q * 2]) | (@as(u16, oracle[t * 32 + q * 2 + 1]) << 8);
-            _ = ov;
-            _ = row;
+            if (ov != row[q]) {
+                if (mism == 0) first_mm = t * 16 + q;
+                if (t == 0) mism_t0 += 1 else mism += 1;
+            }
         }
     }
-    // Report first few frames for parity inspection.
-    for (0..@min(frames.len, 3)) |t| {
-        std.debug.print("f{d}: ", .{t});
-        for (frames[t]) |v| std.debug.print("{d} ", .{v});
-        std.debug.print("\n", .{});
+    std.debug.print("mimi parity: t>0 {d}/{d} mismatched (first at {d}); t0 {d}/16\n", .{ mism, (frames.len - 1) * 16, first_mm, mism_t0 });
+    try std.testing.expectEqual(@as(usize, 0), mism);
+    try std.testing.expectEqual(@as(u32, 1517), frames[0][0]);
+    // Little-endian raw dump for external diffing.
+    if (std.c.getenv("MLX_SERVE_MIMI_DUMP") != null) {
+        const buf = try alloc.alloc(u8, frames.len * 16 * 2);
+        defer alloc.free(buf);
+        for (frames, 0..) |row, t| for (0..16) |q| {
+            const v: u16 = @intCast(row[q]);
+            buf[t * 32 + q * 2] = @truncate(v);
+            buf[t * 32 + q * 2 + 1] = @truncate(v >> 8);
+        };
+        const p = std.mem.span(std.c.getenv("MLX_SERVE_MIMI_DUMP") orelse unreachable);
+        const f = try std.Io.Dir.createFileAbsolute(io, p, .{});
+        defer f.close(io);
+        var wb: [8192]u8 = undefined;
+        var fw = f.writer(io, &wb);
+        try fw.interface.writeAll(buf);
+        try fw.interface.flush();
     }
+    try std.testing.expectEqual(@as(usize, 0), mism);
 }
 
 test "parseConfig reads talker dims" {
@@ -4599,3 +4727,5 @@ test "cached predictor: greedy codes agree with full re-forward within band" {
     std.debug.print("[cp-cache] code agreement {d:.4} over {d} frames\n", .{ agree, n });
     try std.testing.expect(agree > 0.9);
 }
+
+// force-run
