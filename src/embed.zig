@@ -159,6 +159,10 @@ pub const MediaGenConfig = extern struct {
     instruction: ?[*]const u8 = null,
     instruction_len: usize = 0,
     max_frames: u32 = 0,
+    ref_audio: ?[*]const u8 = null,
+    ref_audio_len: usize = 0,
+    ref_text: ?[*]const u8 = null,
+    ref_text_len: usize = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,6 +207,56 @@ fn setErr(comptime fmt: []const u8, args: anytype) void {
 
 fn lastErr() []const u8 {
     return std.mem.span(g_last_err[0..].ptr);
+}
+
+/// mlx-c's default error handler is printf + exit(-1): any MLX failure
+/// (e.g. a Metal resource-limit) would kill the host BEAM. Trap it instead:
+/// log it, record it in the thread-local last error (mlxembed_last_error
+/// surfaces it on the ERR event), and let the caller's return code carry the
+/// failure. Installed process-wide; the handler is not re-entrant into MLX.
+fn trapMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    log.err("[mlx] {s}\n", .{span});
+    setErr("{s}", .{span});
+    mlxFailRecord(span);
+}
+
+fn installErrorTrap() void {
+    mlx.mlx_set_error_handler(trapMlxError, null, null);
+}
+
+// Process-wide failure latch: the trap handler records the first MLX failure
+// here. The metal resource limit is a process-wide GPU budget — once it is
+// exhausted, engine state (KV caches, weight buffers) is corrupt and no
+// engine can reload its way out; the host must restart the process. TTS
+// fails fast on this instead of spinning on corrupt arrays; other engines
+// keep serving until the pool recovers.
+var g_mlx_fail_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_mlx_fail_msg: [512:0]u8 = std.mem.zeroes([512:0]u8);
+var g_mlx_fail_len: usize = 0;
+var g_mlx_fail_set: std.atomic.Value(bool) = .init(false);
+
+fn mlxFailRecord(msg: []const u8) void {
+    _ = std.c.pthread_mutex_lock(&g_mlx_fail_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_mlx_fail_mutex);
+    if (!g_mlx_fail_set.load(.acquire)) {
+        const n = @min(msg.len, g_mlx_fail_msg.len - 1);
+        @memcpy(g_mlx_fail_msg[0..n], msg[0..n]);
+        g_mlx_fail_len = n;
+        g_mlx_fail_set.store(true, .release);
+        log.err("[mlx-poison] latched first failure\n", .{});
+    }
+}
+
+/// Copy of the latched failure message, or null when no failure was recorded.
+fn mlxFailPeek(dst: []u8) ?[]const u8 {
+    _ = std.c.pthread_mutex_lock(&g_mlx_fail_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_mlx_fail_mutex);
+    if (!g_mlx_fail_set.load(.acquire)) return null;
+    const n = @min(g_mlx_fail_len, dst.len);
+    @memcpy(dst[0..n], g_mlx_fail_msg[0..n]);
+    return dst[0..n];
 }
 
 fn reasonCode(r: []const u8) u8 {
@@ -404,6 +458,7 @@ export fn mlxembed_init(cfg: *const InitConfig) callconv(.c) i32 {
         setErr("already initialized", .{});
         return -1;
     }
+    installErrorTrap();
     const alloc = std.heap.c_allocator;
     const model_dir = std.mem.span(cfg.model_dir);
     if (model_dir.len == 0) {
@@ -911,8 +966,11 @@ const MediaGenCtx = struct {
     cot: u8,
     voice: []u8,
     instruction: []u8,
+    ref_audio: []u8,
+    ref_text: []u8,
     max_frames: u32,
     edit_images: []const []const u8,
+    failbuf: [512:0]u8 = std.mem.zeroes([512:0]u8),
     video_json: []u8,
     decision_json: []u8,
 };
@@ -927,6 +985,7 @@ const MediaLoadReq = struct {
 
 const MediaJob = union(enum) {
     load: *MediaLoadReq,
+    unload: *MediaLoadReq,
     generate: *MediaGenCtx,
     shutdown,
 };
@@ -960,6 +1019,94 @@ fn mediaSetDefaultDir(alloc: std.mem.Allocator, key: []const u8) void {
     g_media_default = duped;
 }
 
+/// Detect the modality at `dir` and load the matching engine on the media
+/// worker thread. Returns null (and sets the last error) on any failure.
+/// Does NOT register the engine in g_media — the caller owns that.
+/// One-time process-wide MLX cache limit for the media path. The text-engine
+/// init sets its own via cfg.mlx_cache_mb; media-only nodes (fleet) never run
+/// that path, so latch a sane bound here. Env: MLXSERVE_MEDIA_CACHE_MB (MB).
+var g_media_cache_latched: bool = false;
+
+fn ensureMediaCacheLimit() void {
+    if (g_media_cache_latched) return;
+    g_media_cache_latched = true;
+    var mb: usize = 1024;
+    if (std.c.getenv("MLXSERVE_MEDIA_CACHE_MB")) |v| {
+        mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
+    }
+    var old: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&old, mb * 1024 * 1024);
+    log.info("[memstat] media cache limit set to {d}MB (was {d}B)\n", .{ mb, old });
+}
+
+/// Memory pressure snapshot — active/cache/peak MLX bytes. Cheap (mutex + ints).
+fn logMemStat(tag: []const u8) void {
+    var act: usize = 0;
+    var cac: usize = 0;
+    var pek: usize = 0;
+    _ = mlx.mlx_get_active_memory(&act);
+    _ = mlx.mlx_get_cache_memory(&cac);
+    _ = mlx.mlx_get_peak_memory(&pek);
+    log.info("[memstat] {s}: active={d}MB cache={d}MB peak={d}MB\n", .{
+        tag,
+        act / (1024 * 1024),
+        cac / (1024 * 1024),
+        pek / (1024 * 1024),
+    });
+}
+
+fn mediaConstructEngine(io: std.Io, alloc: std.mem.Allocator, dir: []const u8) ?MediaEngine {
+    ensureMediaCacheLimit();
+    const modality = gen_mod.detectModality(io, alloc, dir) orelse {
+        setErr("media: undetectable model at {s}", .{dir});
+        return null;
+    };
+    return blk: {
+        switch (modality) {
+            .image => {
+                const e = gen_mod.ImageEngine.load(io, alloc, dir) catch |err| {
+                    setErr("media image load: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                break :blk MediaEngine{ .image = e };
+            },
+            .audio => {
+                const ae = gen_mod.AudioEngine.load(io, alloc, dir) catch |err| {
+                    setErr("media audio load: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                switch (ae.backend) {
+                    .yue2 => |ye| break :blk MediaEngine{ .yue2 = ye },
+                    .breeze => break :blk MediaEngine{ .tts = ae },
+                    else => {
+                        ae.deinit();
+                        setErr("media audio: backend {s} not supported by embed", .{@tagName(ae.backend)});
+                        break :blk null;
+                    },
+                }
+            },
+            .video => {
+                const e = gen_mod.VideoEngine.load(io, alloc, dir) catch |err| {
+                    setErr("media video load: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                break :blk MediaEngine{ .video = e };
+            },
+            .decision => {
+                const e = gen_mod.DecisionEngine.load(io, alloc, dir) catch |err| {
+                    setErr("media decision load: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                break :blk MediaEngine{ .decision = e };
+            },
+            else => {
+                setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
+                break :blk null;
+            },
+        }
+    };
+}
+
 fn doMediaLoad(req: *MediaLoadReq) void {
     const alloc = std.heap.c_allocator;
     const io = g_media_threaded.?.io();
@@ -968,91 +1115,20 @@ fn doMediaLoad(req: *MediaLoadReq) void {
     defer _ = std.c.pthread_mutex_unlock(&req.mutex);
     const key = mediaDefaultBasename(dir);
     _ = std.c.pthread_mutex_lock(&g_media_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_media_mutex);
     if (g_media.contains(key)) {
-        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
         req.code = 0;
         req.done = true;
         _ = std.c.pthread_cond_signal(&req.cond);
         return;
     }
-    const engine: MediaEngine = blk: {
-        const modality = gen_mod.detectModality(io, alloc, dir) orelse {
-            _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-            setErr("media: undetectable model at {s}", .{dir});
-            req.code = -3;
-            req.done = true;
-            _ = std.c.pthread_cond_signal(&req.cond);
-            return;
-        };
-        switch (modality) {
-            .image => {
-                const e = gen_mod.ImageEngine.load(io, alloc, dir) catch |err| {
-                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                    setErr("media image load: {s}", .{@errorName(err)});
-                    req.code = -4;
-                    req.done = true;
-                    _ = std.c.pthread_cond_signal(&req.cond);
-                    return;
-                };
-                break :blk MediaEngine{ .image = e };
-            },
-            .audio => {
-                const ae = gen_mod.AudioEngine.load(io, alloc, dir) catch |err| {
-                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                    setErr("media audio load: {s}", .{@errorName(err)});
-                    req.code = -4;
-                    req.done = true;
-                    _ = std.c.pthread_cond_signal(&req.cond);
-                    return;
-                };
-                break :blk switch (ae.backend) {
-                    .yue2 => |e| MediaEngine{ .yue2 = e },
-                    .breeze => MediaEngine{ .tts = ae },
-                    else => {
-                        ae.deinit();
-                        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                        setErr("media audio: backend {s} not supported by embed", .{@tagName(ae.backend)});
-                        req.code = -3;
-                        req.done = true;
-                        _ = std.c.pthread_cond_signal(&req.cond);
-                        return;
-                    },
-                };
-            },
-            .video => {
-                const e = gen_mod.VideoEngine.load(io, alloc, dir) catch |err| {
-                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                    setErr("media video load: {s}", .{@errorName(err)});
-                    req.code = -4;
-                    req.done = true;
-                    _ = std.c.pthread_cond_signal(&req.cond);
-                    return;
-                };
-                break :blk MediaEngine{ .video = e };
-            },
-            .decision => {
-                const e = gen_mod.DecisionEngine.load(io, alloc, dir) catch |err| {
-                    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                    setErr("media decision load: {s}", .{@errorName(err)});
-                    req.code = -4;
-                    req.done = true;
-                    _ = std.c.pthread_cond_signal(&req.cond);
-                    return;
-                };
-                break :blk MediaEngine{ .decision = e };
-            },
-            else => {
-                _ = std.c.pthread_mutex_unlock(&g_media_mutex);
-                setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
-                req.code = -3;
-                req.done = true;
-                _ = std.c.pthread_cond_signal(&req.cond);
-                return;
-            },
-        }
+    const engine = mediaConstructEngine(io, alloc, dir) orelse {
+        req.code = -3;
+        req.done = true;
+        _ = std.c.pthread_cond_signal(&req.cond);
+        return;
     };
     g_media.put(alloc, alloc.dupe(u8, key) catch key, engine) catch {
-        _ = std.c.pthread_mutex_unlock(&g_media_mutex);
         setErr("oom: media map", .{});
         req.code = -5;
         req.done = true;
@@ -1060,8 +1136,59 @@ fn doMediaLoad(req: *MediaLoadReq) void {
         return;
     };
     mediaSetDefaultDir(alloc, key);
-    _ = std.c.pthread_mutex_unlock(&g_media_mutex);
     log.info("mlx-serve embed media: {s} ({s}) ready\n", .{ key, @tagName(engine) });
+    logMemStat("after-load");
+    req.code = 0;
+    req.done = true;
+    _ = std.c.pthread_cond_signal(&req.cond);
+}
+
+/// Free a single media engine. Every engine's deinit() already destroys its
+/// own struct (self.allocator.destroy(self)), so calling destroy again is a
+/// double-free — that is what aborted the worker mid-lifecycle before the
+/// fix. Do NOT destroy here.
+fn mediaDeinitEngine(engine: MediaEngine) void {
+    switch (engine) {
+        .image => |e| e.deinit(),
+        .yue2 => |e| e.deinit(),
+        .video => |e| e.deinit(),
+        .decision => |e| e.deinit(),
+        .tts => |e| e.deinit(),
+    }
+}
+
+/// Unload one resident media engine by dir (matched on basename), freeing its
+/// weights. Serialized on the media worker queue, so it cannot race an
+/// in-flight generation: any earlier `.generate` job finishes first.
+fn doMediaUnload(req: *MediaLoadReq) void {
+    const alloc = std.heap.c_allocator;
+    const dir = req.dir;
+    _ = std.c.pthread_mutex_lock(&req.mutex);
+    defer _ = std.c.pthread_mutex_unlock(&req.mutex);
+    const key = mediaDefaultBasename(dir);
+    _ = std.c.pthread_mutex_lock(&g_media_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_media_mutex);
+    const entry = g_media.getEntry(key) orelse {
+        setErr("media: model not loaded: {s}", .{key});
+        req.code = -2;
+        req.done = true;
+        _ = std.c.pthread_cond_signal(&req.cond);
+        return;
+    };
+    const key_slice: []const u8 = entry.key_ptr.*;
+    const engine = entry.value_ptr.*;
+    // remove does not free the key string (unmanaged); free it explicitly.
+    g_media.removeByPtr(entry.key_ptr);
+    alloc.free(key_slice);
+    mediaDeinitEngine(engine);
+    // If this was the last-loaded default, drop it so a null-dir generate
+    // fails cleanly instead of pointing at a dead engine.
+    if (g_media_default.len > 0 and std.mem.eql(u8, g_media_default, key_slice)) {
+        alloc.free(@constCast(g_media_default));
+        g_media_default = "";
+    }
+    log.info("mlx-serve embed media: {s} unloaded\n", .{key});
+    logMemStat("after-unload");
     req.code = 0;
     req.done = true;
     _ = std.c.pthread_cond_signal(&req.cond);
@@ -1228,8 +1355,23 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
     };
 
     const key = mediaDefaultBasename(c.dir);
+    const io = g_media_threaded.?.io();
     _ = std.c.pthread_mutex_lock(&g_media_mutex);
-    const engine = g_media.get(key);
+    var engine = g_media.get(key);
+    if (engine == null) {
+        // On-demand: auto-load on first use. Serialized on this worker thread
+        // so it cannot race another generation; freed weights (from a later
+        // unload) return to the Metal allocator and lower the buffer count.
+        const loaded = mediaConstructEngine(io, c.alloc, c.dir);
+        if (loaded) |e| {
+            g_media.put(c.alloc, c.alloc.dupe(u8, key) catch key, e) catch {
+                setErr("oom: media map", .{});
+            };
+            mediaSetDefaultDir(c.alloc, key);
+            log.info("mlx-serve embed media: {s} ({s}) ready (auto)\n", .{ key, @tagName(e) });
+            engine = e;
+        }
+    }
     _ = std.c.pthread_mutex_unlock(&g_media_mutex);
 
     if (engine == null) {
@@ -1278,11 +1420,17 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
                 c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
                 return;
             }
+            if (mlxFailPeek(c.failbuf[0..]) != null) {
+                ttsMlxFailEvent(c);
+                return;
+            }
             const be = ae.backend.breeze;
             const req = breeze_mod.Request{
                 .text = c.prompt,
                 .voice = if (c.voice.len > 0) c.voice else null,
                 .instruction = if (c.instruction.len > 0) c.instruction else null,
+                .ref_audio = if (c.ref_audio.len > 0) c.ref_audio else null,
+                .ref_text = if (c.ref_text.len > 0) c.ref_text else null,
                 .max_frames = if (c.max_frames == 0) null else c.max_frames,
                 .seed = if (c.seed == 0) null else c.seed,
             };
@@ -1292,6 +1440,13 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
                 return;
             };
             defer alloc.free(synth.pcm);
+            // A Metal failure mid-synthesis (e.g. the resource limit) can leave
+            // empty arrays behind; synthesize may still return "successfully"
+            // with corrupt PCM. Drop it and fail the job instead.
+            if (mlxFailPeek(c.failbuf[0..]) != null) {
+                ttsMlxFailEvent(c);
+                return;
+            }
             const wav = wav_mod.encodePcm16Mono(alloc, synth.pcm, be.sampleRate()) catch |err| {
                 const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
                 c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
@@ -1300,6 +1455,7 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
             defer alloc.free(wav);
             c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.wav), wav.ptr, @intCast(wav.len));
             mediaEmitDone(c, 0, 0);
+            logMemStat("after-tts");
         },
         .yue2 => |eng| {
             const cot: yue2_mod.Cot = switch (c.cot) {
@@ -1351,6 +1507,7 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
 }
 
 fn mediaWorkerLoop() void {
+    installErrorTrap();
     const alloc = std.heap.c_allocator;
     g_media_threaded = std.Io.Threaded.init(alloc, .{});
     // Same device selection as mlxembed_init: Metal when available, else CPU.
@@ -1384,6 +1541,7 @@ fn mediaWorkerLoop() void {
 
         switch (job) {
             .load => |req| doMediaLoad(req),
+            .unload => |req| doMediaUnload(req),
             .generate => |c| runMediaGenerate(c),
             .shutdown => {},
         }
@@ -1430,6 +1588,8 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     alloc.free(c.lyrics);
     alloc.free(c.abc);
     if (c.voice.len > 0) alloc.free(c.voice);
+    if (c.ref_audio.len > 0) alloc.free(c.ref_audio);
+    if (c.ref_text.len > 0) alloc.free(c.ref_text);
     if (c.instruction.len > 0) alloc.free(c.instruction);
     for (c.edit_images) |b| alloc.free(b);
     if (c.edit_images.len > 0) alloc.free(c.edit_images);
@@ -1440,6 +1600,22 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     _ = std.c.pthread_mutex_unlock(&g_media_gen_mutex);
     _ = g_media_inflight.fetchSub(1, .release);
     alloc.destroy(c);
+}
+
+/// ERR event for a TTS job aborted by a process-wide MLX failure; payload
+/// carries "speech: mlx failure: <latched message>" (the host's send_err
+/// prefers the last-error string; the payload is for the logs).
+fn ttsMlxFailEvent(c: *MediaGenCtx) void {
+    const prefix: []const u8 = "speech: mlx failure: ";
+    var out: [600:0]u8 = std.mem.zeroes([600:0]u8);
+    if (mlxFailPeek(c.failbuf[0..])) |m| {
+        const n = @min(m.len, out.len - prefix.len);
+        std.mem.copyForwards(u8, out[0..prefix.len], prefix);
+        std.mem.copyForwards(u8, out[prefix.len .. prefix.len + n], m[0..n]);
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), out[0..].ptr, @intCast(prefix.len + n));
+    } else {
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), out[0..].ptr, @intCast(prefix.len));
+    }
 }
 
 fn mediaEmitDone(c: *MediaGenCtx, steps: u32, elapsed_ns: u64) void {
@@ -1468,6 +1644,30 @@ export fn mlxembed_media_load(model_dir: [*:0]const u8) callconv(.c) i32 {
         return -5;
     } };
     mediaEnqueue(.{ .load = req });
+    _ = std.c.pthread_mutex_lock(&req.mutex);
+    defer _ = std.c.pthread_mutex_unlock(&req.mutex);
+    while (!req.done) {
+        _ = std.c.pthread_cond_wait(&req.cond, &req.mutex);
+    }
+    const code = req.code;
+    alloc.free(req.dir);
+    alloc.destroy(req);
+    return code;
+}
+
+export fn mlxembed_media_unload(model_dir: [*:0]const u8) callconv(.c) i32 {
+    const alloc = std.heap.c_allocator;
+    const dir = std.mem.span(model_dir);
+    if (dir.len == 0) {
+        setErr("media: empty model_dir", .{});
+        return -2;
+    }
+    const req = alloc.create(MediaLoadReq) catch return -5;
+    req.* = .{ .dir = alloc.dupe(u8, dir) catch {
+        alloc.destroy(req);
+        return -5;
+    } };
+    mediaEnqueue(.{ .unload = req });
     _ = std.c.pthread_mutex_lock(&req.mutex);
     defer _ = std.c.pthread_mutex_unlock(&req.mutex);
     while (!req.done) {
@@ -1546,6 +1746,8 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .cot = cfg.cot,
         .voice = if (cfg.voice) |p| alloc.dupe(u8, p[0..cfg.voice_len]) catch &.{} else &.{},
         .instruction = if (cfg.instruction) |p| alloc.dupe(u8, p[0..cfg.instruction_len]) catch &.{} else &.{},
+        .ref_audio = if (cfg.ref_audio) |p| alloc.dupe(u8, p[0..cfg.ref_audio_len]) catch &.{} else &.{},
+        .ref_text = if (cfg.ref_text) |p| alloc.dupe(u8, p[0..cfg.ref_text_len]) catch &.{} else &.{},
         .max_frames = cfg.max_frames,
         .edit_images = &.{},
         .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
@@ -1613,29 +1815,7 @@ export fn mlxembed_media_cancel(gen_id: u64) callconv(.c) i32 {
 fn mediaTeardown() void {
     var it = g_media.iterator();
     while (it.next()) |entry| {
-        switch (entry.value_ptr.*) {
-            .image => |e| {
-                const alloc = e.allocator;
-                e.deinit();
-                alloc.destroy(e);
-            },
-            .yue2 => |e| {
-                const alloc = std.heap.c_allocator;
-                e.deinit();
-                alloc.destroy(e);
-            },
-            .video => |e| {
-                const alloc = std.heap.c_allocator;
-                e.deinit();
-                alloc.destroy(e);
-            },
-            .decision => |e| {
-                const alloc = std.heap.c_allocator;
-                e.deinit();
-                alloc.destroy(e);
-            },
-            .tts => |e| e.deinit(),
-        }
+        mediaDeinitEngine(entry.value_ptr.*);
     }
     g_media.clearAndFree(std.heap.c_allocator);
     std.heap.c_allocator.free(@constCast(g_media_default));

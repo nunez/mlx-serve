@@ -245,6 +245,7 @@ fn ownT16(w: *const Weights, s: S, key: []const u8) !mlx.mlx_array {
         return error.MissingBreezeWeight;
     };
     var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
     try mlx.check(mlx.mlx_transpose_axes(&t, arr, &[_]c_int{ 1, 0 }, 2, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, t, .bfloat16, s));
@@ -267,8 +268,9 @@ fn ownF16Plus1(w: *const Weights, s: S, alloc: std.mem.Allocator, key: []const u
         return error.MissingBreezeWeight;
     };
     var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
     try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-    _ = mlx.mlx_array_eval(f32arr);
+    try mlx.check(mlx.mlx_array_eval(f32arr));
     const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
     const shape = mlx.getShape(f32arr);
     var n: usize = 1;
@@ -291,8 +293,9 @@ const null_arr = mlx.mlx_array{ .ctx = null };
 
 fn evalHost(s: S, arr: mlx.mlx_array, out: []f32) !void {
     var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
     try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-    _ = mlx.mlx_array_eval(f32arr);
+    try mlx.check(mlx.mlx_array_eval(f32arr));
     const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
     @memcpy(out, data[0..out.len]);
 }
@@ -329,6 +332,7 @@ inline fn transpose(x: mlx.mlx_array, axes: []const c_int, s: S) mlx.mlx_array {
 
 fn siluArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
     var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
     _ = mlx.mlx_sigmoid(&sig, x, s);
     var r = mlx.mlx_array_new();
     _ = mlx.mlx_multiply(&r, x, sig, s);
@@ -428,6 +432,7 @@ fn dumpFirst(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
     var idx_arr: [12]u32 = undefined;
     for (&idx_arr, 0..) |*v, i| v.* = @intCast(i);
     var taken = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(taken);
     if (mlx.mlx_take_axis(&taken, a, hostU32(&idx_arr, &[_]c_int{1}), 0, s) != 0) return;
     var buf: [12]f32 = undefined;
     evalHost(s, taken, &buf) catch return;
@@ -440,7 +445,9 @@ fn dumpLast(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
     for (shape) |d| n *= @intCast(d);
     var buf: [4096]f32 = undefined;
     const m = @min(n, buf.len);
-    evalHost(s, reshape(a, &[_]c_int{@intCast(m)}, s), buf[0..m]) catch return;
+    const flat = reshape(a, &[_]c_int{@intCast(m)}, s);
+    defer _ = mlx.mlx_array_free(flat);
+    evalHost(s, flat, buf[0..m]) catch return;
     log.err("[breeze-dump] {s} {any}\n", .{ tag, buf[0..@min(12, m)] });
 }
 
@@ -451,52 +458,103 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
+    _ = mlx.mlx_array_free(x); // x16's graph owns the impl now
     x = x16;
 
     for (layers, 0..) |lw, lidx| {
         if (dbg_l) log.err("[breeze-dump] LAYER {d} qn={any} in={d}\n", .{ lidx, lw.qn.ctx != null, hidden });
         const xn = rmsn(x, lw.in_ln, eps, s);
+        defer _ = mlx.mlx_array_free(xn);
         const q = mm(xn, lw.q, s);
+        defer _ = mlx.mlx_array_free(q);
         const k = mm(xn, lw.k, s);
+        defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
+        defer _ = mlx.mlx_array_free(v);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
         var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, 128 }, s);
         var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, 128 }, s);
         const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, 128 }, s);
+        defer _ = mlx.mlx_array_free(v4);
         const lq: usize = L * @as(usize, @intCast(qh));
         const lk: usize = L * @as(usize, @intCast(kh));
         const hd: c_int = 128;
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-            q4 = reshape(rmsn(reshape(q4, &[_]c_int{ @intCast(lq), hd }, s), lw.qn, eps, s), &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
+            const q4n1 = rmsn(q4f, lw.qn, eps, s);
+            _ = mlx.mlx_array_free(q4f);
+            const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            _ = mlx.mlx_array_free(q4n1);
+            _ = mlx.mlx_array_free(q4);
+            q4 = q4n;
             if (dbg_layer0) dumpFirst(s, reshape(q4, &[_]c_int{ @intCast(lq * 128) }, s), "QNOTH");
-            k4 = reshape(rmsn(reshape(k4, &[_]c_int{ @intCast(lk), hd }, s), lw.kn, eps, s), &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+            const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
+            const k4n1 = rmsn(k4f, lw.kn, eps, s);
+            _ = mlx.mlx_array_free(k4f);
+            const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+            _ = mlx.mlx_array_free(k4n1);
+            _ = mlx.mlx_array_free(k4);
+            k4 = k4n;
         }
+        defer _ = mlx.mlx_array_free(q4);
+        defer _ = mlx.mlx_array_free(k4);
         const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(qt);
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, 128, s) else ropeApply(qt, theta, pos_scale, 128, s);
+        defer _ = mlx.mlx_array_free(qr);
         if (dbg_layer0) dumpFirst(s, reshape(qr, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh)) * 128) }, s), "QR");
         const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, 128, s) else ropeApply(kt, theta, pos_scale, 128, s);
-        if (kv_save) |ks| ks[lidx] = .{ .k = kr, .v = vt };
-        const mask = if (window > 0) windowMask(s, L, window) else null_arr;
+        const has_mask = window > 0;
+        const mask = if (has_mask) windowMask(s, L, window) else null_arr;
         const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), mask, s);
+        defer _ = mlx.mlx_array_free(att);
+        if (has_mask) _ = mlx.mlx_array_free(mask);
+        if (kv_save) |ks| {
+            ks[lidx] = .{ .k = kr, .v = vt }; // ownership moves to the caller's KV cache
+        } else {
+            _ = mlx.mlx_array_free(kr);
+            _ = mlx.mlx_array_free(vt);
+        }
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(at);
         const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(mlx.getShape(lw.q)[1]) }, s);
-        const h1 = addM(x, mm(af, lw.o, s), s);
+        defer _ = mlx.mlx_array_free(af);
+        const o = mm(af, lw.o, s);
+        defer _ = mlx.mlx_array_free(o);
+        const h1 = addM(x, o, s);
+        defer _ = mlx.mlx_array_free(h1);
         if (dbg_layer0) dumpLast(s, h1, "H1");
         const hn = rmsn(h1, lw.post_ln, eps, s);
+        defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
+        defer _ = mlx.mlx_array_free(g);
         const u = mm(hn, lw.up, s);
-        const mlp = mm(mulEl(s, siluArr(g, s), u), lw.down, s);
+        defer _ = mlx.mlx_array_free(u);
+        const gs = siluArr(g, s);
+        defer _ = mlx.mlx_array_free(gs);
+        const gu = mulEl(s, gs, u);
+        defer _ = mlx.mlx_array_free(gu);
+        const mlp = mm(gu, lw.down, s);
+        defer _ = mlx.mlx_array_free(mlp);
+        const x_prev = x;
         x = addM(h1, mlp, s);
+        _ = mlx.mlx_array_free(x_prev);
     }
+    const x_norm_prev = x;
     x = rmsn(x, norm, eps, s);
+    _ = mlx.mlx_array_free(x_norm_prev);
     const last = reshape(x, &[_]c_int{ @intCast(L), @intCast(hidden) }, s);
+    defer _ = mlx.mlx_array_free(last);
     var idx = [_]u32{@intCast(L - 1)};
     var taken = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(taken);
     try mlx.check(mlx.mlx_take_axis(&taken, last, hostU32(&idx, &[_]c_int{1}), 0, s));
     try evalHost(s, taken, out_last);
+    _ = mlx.mlx_array_free(x);
 }
 
 fn eval1(a: mlx.mlx_array) c_int {
@@ -518,62 +576,113 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
     var x = hostF32(xrow, &sh);
     var x16 = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
+    _ = mlx.mlx_array_free(x); // x16's graph owns the impl now
     x = x16;
     if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(x); log.err("[beval] x shape={d},{d},{d}\n", .{ mlx.getShape(x)[0], mlx.getShape(x)[1], mlx.getShape(x)[2] }); }
 
     for (layers, 0..) |lw, lidx| {
         const xn = rmsn(x, lw.in_ln, eps, s);
+        defer _ = mlx.mlx_array_free(xn);
         if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(xn); log.err("[beval] l{d} xn\n", .{lidx}); }
         const q = mm(xn, lw.q, s);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q); log.err("[beval] l{d} q shape={d}\n", .{ lidx, mlx.getShape(q)[0] }); }
+        defer _ = mlx.mlx_array_free(q);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q); log.err("[beval] l{d} q shape={d}\n", .{lidx, mlx.getShape(q)[0]}); }
         const k = mm(xn, lw.k, s);
+        defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
+        defer _ = mlx.mlx_array_free(v);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k); log.err("[beval] l{d} k shape={d}\n", .{ lidx, mlx.getShape(k)[0] }); }
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(v); log.err("[beval] l{d} v shape={d}\n", .{ lidx, mlx.getShape(v)[0] }); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k); log.err("[beval] l{d} k shape={d}\n", .{lidx, mlx.getShape(k)[0]}); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(v); log.err("[beval] l{d} v shape={d}\n", .{lidx, mlx.getShape(v)[0]}); }
         var q4 = reshape(q, &[_]c_int{ 1, 1, qh, 128 }, s);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} q4 shape={d},{d},{d}\n", .{ lidx, mlx.getShape(q4)[0], mlx.getShape(q4)[2], mlx.getShape(q4)[3] }); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} q4 shape={d},{d},{d}\n", .{lidx, mlx.getShape(q4)[0], mlx.getShape(q4)[2], mlx.getShape(q4)[3]}); }
         var k4 = reshape(k, &[_]c_int{ 1, 1, kh, 128 }, s);
         if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} k4\n", .{lidx}); }
         const v4 = reshape(v, &[_]c_int{ 1, 1, kh, 128 }, s);
+        defer _ = mlx.mlx_array_free(v4);
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-            q4 = reshape(rmsn(reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), 128 }, s), lw.qn, eps, s), &[_]c_int{ 1, 1, qh, 128 }, s);
+            const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), 128 }, s);
+            const q4n1 = rmsn(q4f, lw.qn, eps, s);
+            _ = mlx.mlx_array_free(q4f);
+            const q4n = reshape(q4n1, &[_]c_int{ 1, 1, qh, 128 }, s);
+            _ = mlx.mlx_array_free(q4n1);
+            _ = mlx.mlx_array_free(q4);
+            q4 = q4n;
             if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} qnorm\n", .{lidx}); }
-            k4 = reshape(rmsn(reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), 128 }, s), lw.kn, eps, s), &[_]c_int{ 1, 1, kh, 128 }, s);
+            const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), 128 }, s);
+            const k4n1 = rmsn(k4f, lw.kn, eps, s);
+            _ = mlx.mlx_array_free(k4f);
+            const k4n = reshape(k4n1, &[_]c_int{ 1, 1, kh, 128 }, s);
+            _ = mlx.mlx_array_free(k4n1);
+            _ = mlx.mlx_array_free(k4);
+            k4 = k4n;
             if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} knorm\n", .{lidx}); }
         }
+        defer _ = mlx.mlx_array_free(q4);
+        defer _ = mlx.mlx_array_free(k4);
         const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(qt);
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         const qr = ropeApplyOff(qt, theta, pos, 128, s);
+        defer _ = mlx.mlx_array_free(qr);
         const kr = ropeApplyOff(kt, theta, pos, 128, s);
         const pk = kv[lidx].k;
         const pv = kv[lidx].v;
-        kv[lidx].k = concat2(s, kv[lidx].k, kr, 2);
-        kv[lidx].v = concat2(s, kv[lidx].v, vt, 2);
+        const kc = concat2(s, kv[lidx].k, kr, 2);
+        const vc = concat2(s, kv[lidx].v, vt, 2);
+        kv[lidx].k = kc;
+        kv[lidx].v = vc;
         if (pk.ctx != null) _ = mlx.mlx_array_free(pk);
         if (pv.ctx != null) _ = mlx.mlx_array_free(pv);
         _ = eval1(kv[lidx].k);
         _ = eval1(kv[lidx].v);
         if (std.c.getenv("BREEZE_STEP_TRACE") != null and lidx == 0) log.err("[bstep] L0 k/v ok att=\n", .{});
         if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(kr); _ = eval1(vt); log.err("[beval] l{d} kr vt\n", .{lidx}); }
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(qr); _ = eval1(kr); log.err("[beval] l{d} ropes kL={d}\n", .{ lidx, mlx.getShape(kv[lidx].k)[2] }); }
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(qr); _ = eval1(kr); log.err("[beval] l{d} ropes kL={d}\n", .{lidx, mlx.getShape(kv[lidx].k)[2]}); }
         const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), null_arr, s);
+        defer _ = mlx.mlx_array_free(att);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(at);
         const af = reshape(at, &[_]c_int{ 1, 1, @intCast(mlx.getShape(lw.q)[1]) }, s);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(att); log.err("[beval] l{d} att shape={d}\n", .{ lidx, mlx.getShape(att)[0] }); }
-        const h1 = addM(x, mm(af, lw.o, s), s);
+        defer _ = mlx.mlx_array_free(af);
+        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(att); log.err("[beval] l{d} att shape={d}\n", .{lidx, mlx.getShape(att)[0]}); }
+        const o = mm(af, lw.o, s);
+        defer _ = mlx.mlx_array_free(o);
+        const h1 = addM(x, o, s);
+        defer _ = mlx.mlx_array_free(h1);
         if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(h1); log.err("[beval] l{d} h1\n", .{lidx}); }
         const hn = rmsn(h1, lw.post_ln, eps, s);
+        defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
+        defer _ = mlx.mlx_array_free(g);
         const u = mm(hn, lw.up, s);
-        const mlp = mm(mulEl(s, siluArr(g, s), u), lw.down, s);
+        defer _ = mlx.mlx_array_free(u);
+        const gs = siluArr(g, s);
+        defer _ = mlx.mlx_array_free(gs);
+        const gu = mulEl(s, gs, u);
+        defer _ = mlx.mlx_array_free(gu);
+        const mlp = mm(gu, lw.down, s);
+        defer _ = mlx.mlx_array_free(mlp);
+        const x_prev = x;
         x = addM(h1, mlp, s);
+        _ = mlx.mlx_array_free(x_prev);
+        // concat2 returns `b` unchanged when the cache is still empty, in which
+        // case the kv entry aliases kr/vt's handles and they must stay alive
+        // until here (last uses are the sdpa above / debug evals).
+        if (kc.ctx != kr.ctx) _ = mlx.mlx_array_free(kr);
+        if (vc.ctx != vt.ctx) _ = mlx.mlx_array_free(vt);
     }
     if (std.c.getenv("BREEZE_STEP_TRACE") != null) log.err("[bstep] done normed\n", .{});
+    const x_norm_prev = x;
     x = rmsn(x, norm, eps, s);
-    try evalHost(s, reshape(x, &[_]c_int{@intCast(hidden)}, s), out_last);
+    _ = mlx.mlx_array_free(x_norm_prev);
+    const lasth = reshape(x, &[_]c_int{@intCast(hidden)}, s);
+    defer _ = mlx.mlx_array_free(lasth);
+    try evalHost(s, lasth, out_last);
+    _ = mlx.mlx_array_free(x);
 }
 
 fn mulEl(s: S, a: mlx.mlx_array, b: mlx.mlx_array) mlx.mlx_array {
@@ -592,6 +701,7 @@ fn windowMask(s: S, L: usize, w: usize) mlx.mlx_array {
         }
     }
     const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+    defer _ = mlx.mlx_array_free(h);
     var r = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&r, h, .bfloat16, s);
     return r;
@@ -639,8 +749,9 @@ const Te = struct {
     fn loadTable(w: *const Weights, s: S, alloc: std.mem.Allocator) ![]const f32 {
         const arr = w.get("text_encoder.embed_tokens.weight") orelse return error.MissingBreezeWeight;
         var f32arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32arr);
         try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-        _ = mlx.mlx_array_eval(f32arr);
+        try mlx.check(mlx.mlx_array_eval(f32arr));
         const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
         const out = try alloc.alloc(f32, TE_VOCAB * TE_HIDDEN);
         const scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(TE_HIDDEN))));
@@ -684,40 +795,93 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
     for (te.layers, te_post_attn, 0..) |lw, ps, li| {
         const full = isFullAttentionLayer(@intCast(li));
         const xn = rmsn(x, lw.in_ln, 1e-6, s);
+        defer _ = mlx.mlx_array_free(xn);
         const q = mm(xn, lw.q, s);
+        defer _ = mlx.mlx_array_free(q);
         const k = mm(xn, lw.k, s);
+        defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
+        defer _ = mlx.mlx_array_free(v);
         const qh: c_int = @divExact(mlx.getShape(lw.q)[1], @as(c_int, @intCast(TE_HEAD_DIM)));
         const kh: c_int = @divExact(mlx.getShape(lw.k)[1], @as(c_int, @intCast(TE_HEAD_DIM)));
         var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, @intCast(TE_HEAD_DIM) }, s);
         var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, @intCast(TE_HEAD_DIM) }, s);
         const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, @intCast(TE_HEAD_DIM) }, s);
+        defer _ = mlx.mlx_array_free(v4);
         const lq: usize = L * @as(usize, @intCast(qh));
         const lk: usize = L * @as(usize, @intCast(kh));
         const hd: c_int = @intCast(TE_HEAD_DIM);
-        q4 = reshape(rmsn(reshape(q4, &[_]c_int{ @intCast(lq), hd }, s), lw.qn, 1e-6, s), &[_]c_int{ 1, @intCast(L), qh, hd }, s);
-        k4 = reshape(rmsn(reshape(k4, &[_]c_int{ @intCast(lk), hd }, s), lw.kn, 1e-6, s), &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        {
+            const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
+            const q4n1 = rmsn(q4f, lw.qn, 1e-6, s);
+            _ = mlx.mlx_array_free(q4f);
+            const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            _ = mlx.mlx_array_free(q4n1);
+            _ = mlx.mlx_array_free(q4);
+            q4 = q4n;
+            const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
+            const k4n1 = rmsn(k4f, lw.kn, 1e-6, s);
+            _ = mlx.mlx_array_free(k4f);
+            const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+            _ = mlx.mlx_array_free(k4n1);
+            _ = mlx.mlx_array_free(k4);
+            k4 = k4n;
+        }
+        defer _ = mlx.mlx_array_free(q4);
+        defer _ = mlx.mlx_array_free(k4);
         const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(qt);
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(vt);
         const theta = if (full) TE_THETA_FULL else TE_THETA_SLIDE;
         const p_scale = if (full) (1.0 / TE_FACTOR_FULL) else 1.0;
         const qr = ropeApply(qt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
+        defer _ = mlx.mlx_array_free(qr);
         const kr = ropeApply(kt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
+        defer _ = mlx.mlx_array_free(kr);
         const mask = if (full) teFullMask(s, L) else teLocalMask(s, L);
+        const mask_live = mask.ctx != null;
+        defer {
+            if (mask_live) _ = mlx.mlx_array_free(mask);
+        }
         const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(TE_HEAD_DIM))))), mask, s);
+        defer _ = mlx.mlx_array_free(att);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(at);
         const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(TE_HEADS * TE_HEAD_DIM) }, s);
-        const h1 = addM(x, rmsn(mm(af, lw.o, s), ps, 1e-6, s), s);
+        defer _ = mlx.mlx_array_free(af);
+        const o = mm(af, lw.o, s);
+        defer _ = mlx.mlx_array_free(o);
+        const on = rmsn(o, ps, 1e-6, s);
+        defer _ = mlx.mlx_array_free(on);
+        const h1 = addM(x, on, s);
+        defer _ = mlx.mlx_array_free(h1);
         const hn = rmsn(h1, lw.pre_ff, 1e-6, s);
+        defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
+        defer _ = mlx.mlx_array_free(g);
         const u = mm(hn, lw.up, s);
+        defer _ = mlx.mlx_array_free(u);
         const act = geluTanhArr(g, s);
-        x = addM(h1, rmsn(mm(mulEl(s, act, u), lw.down, s), lw.post_ln, 1e-6, s), s);
+        defer _ = mlx.mlx_array_free(act);
+        const gu = mulEl(s, act, u);
+        defer _ = mlx.mlx_array_free(gu);
+        const dn = mm(gu, lw.down, s);
+        defer _ = mlx.mlx_array_free(dn);
+        const dnn = rmsn(dn, lw.post_ln, 1e-6, s);
+        defer _ = mlx.mlx_array_free(dnn);
+        const x_prev = x;
+        x = addM(h1, dnn, s);
+        _ = mlx.mlx_array_free(x_prev);
     }
-    var xn = rmsn(x, te.norm, 1e-6, s);
-    _ = &xn;
+    const x_norm_prev = x;
+    const xn = rmsn(x, te.norm, 1e-6, s);
+    defer _ = mlx.mlx_array_free(xn);
+    _ = mlx.mlx_array_free(x_norm_prev);
     const last = reshape(xn, &[_]c_int{ @intCast(L), @intCast(TE_HIDDEN) }, s);
+    defer _ = mlx.mlx_array_free(last);
     try evalHost(s, last, out);
 }
 
@@ -725,8 +889,11 @@ fn teFullMask(s: S, L: usize) mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
     @memset(buf, 0);
-    _ = s;
-    return hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+    const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+    defer _ = mlx.mlx_array_free(h);
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
+    return r;
 }
 
 fn teLocalMask(s: S, L: usize) mlx.mlx_array {
@@ -740,28 +907,47 @@ fn teLocalMask(s: S, L: usize) mlx.mlx_array {
             buf[i * L + j] = if (allowed) 0 else -std.math.inf(f32);
         }
     }
-    _ = s;
-    return hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+    const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
+    defer _ = mlx.mlx_array_free(h);
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
+    return r;
 }
 
 fn geluTanhArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
     // 0.5·x·(1+tanh(√(2/π)(x+0.044715x³))) — TE hidden_activation
     var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
     _ = mlx.mlx_multiply(&x2, x, x, s);
     var x3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x3);
     _ = mlx.mlx_multiply(&x3, x2, x, s);
+    const sc1 = mlx.mlx_array_new_float(0.044715);
+    defer _ = mlx.mlx_array_free(sc1);
     var k = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&k, x3, mlx.mlx_array_new_float(0.044715), s);
+    defer _ = mlx.mlx_array_free(k);
+    _ = mlx.mlx_multiply(&k, x3, sc1, s);
     var inner = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inner);
     _ = mlx.mlx_add(&inner, x, k, s);
+    const sc2 = mlx.mlx_array_new_float(0.7978845608);
+    defer _ = mlx.mlx_array_free(sc2);
     var lin = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&lin, inner, mlx.mlx_array_new_float(0.7978845608), s);
+    defer _ = mlx.mlx_array_free(lin);
+    _ = mlx.mlx_multiply(&lin, inner, sc2, s);
     var th = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(th);
     _ = mlx.mlx_tanh(&th, lin, s);
+    const sc3 = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(sc3);
     var one = mlx.mlx_array_new();
-    _ = mlx.mlx_add(&one, th, mlx.mlx_array_new_float(1.0), s);
+    defer _ = mlx.mlx_array_free(one);
+    _ = mlx.mlx_add(&one, th, sc3, s);
+    const sc4 = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(sc4);
     var half = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&half, one, mlx.mlx_array_new_float(0.5), s);
+    defer _ = mlx.mlx_array_free(half);
+    _ = mlx.mlx_multiply(&half, one, sc4, s);
     var r = mlx.mlx_array_new();
     _ = mlx.mlx_multiply(&r, x, half, s);
     return r;
@@ -775,8 +961,9 @@ fn readTable(s: S, w: *const Weights, key: []const u8, out: []f32) !void {
         return error.MissingBreezeWeight;
     };
     var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
     try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-    _ = mlx.mlx_array_eval(f32arr);
+    try mlx.check(mlx.mlx_array_eval(f32arr));
     const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
     @memcpy(out, data[0..out.len]);
 }
@@ -856,8 +1043,9 @@ pub const Engine = struct {
         {
             const arr = w.get("lm_head.weight") orelse return error.MissingBreezeWeight;
             var f32arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32arr);
             try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-            _ = mlx.mlx_array_eval(f32arr);
+            try mlx.check(mlx.mlx_array_eval(f32arr));
             const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
             for (0..CB_LM) |r| @memcpy(lm_host[r * B_HIDDEN ..][0..B_HIDDEN], data[r * B_HIDDEN ..][0..B_HIDDEN]);
         }
@@ -868,8 +1056,9 @@ pub const Engine = struct {
         {
             const arr = w.get("depth_decoder.codebooks_head.weight") orelse return error.MissingBreezeWeight;
             var f32arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32arr);
             try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
-            _ = mlx.mlx_array_eval(f32arr);
+            try mlx.check(mlx.mlx_array_eval(f32arr));
             const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
             const shp = mlx.getShape(arr);
             if (shp.len == 3 and shp[1] == CB_VOCAB) {
@@ -915,7 +1104,11 @@ pub const Engine = struct {
                 if (std.c.getenv("BREEZE_FREQS") != null) log.err("[breeze-dump] FR {any}\n", .{d_freqs_buf[0..8]});
                 break :blk hostF32(&d_freqs_buf, &[_]c_int{D_HD / 2});
             },
-            .bkv = undefined,
+            .bkv = blk: {
+                var tmp: [B_LAYERS]KV = undefined;
+                for (&tmp) |*e| e.* = .{ .k = null_arr, .v = null_arr };
+                break :blk tmp;
+            },
         };
         errdefer {
             allocator.free(self.scratch);
@@ -928,6 +1121,12 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         self.tok.deinit();
         self.codec.deinit();
+        for (&self.bkv) |*e| {
+            if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
+            if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
+            e.k.ctx = null;
+            e.v.ctx = null;
+        }
         self.alloc.free(self.te.table);
         self.alloc.free(self.te.layers);
         self.alloc.free(self.lm_host);
@@ -1116,7 +1315,12 @@ pub const Engine = struct {
         var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
 
-        for (&self.bkv) |*e| { e.k.ctx = null; e.v.ctx = null; }
+        for (&self.bkv) |*e| {
+            if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
+            if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
+            e.k.ctx = null;
+            e.v.ctx = null;
+        }
         var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(span);
         const span_mode = std.c.getenv("BREEZE_SPAN") != null;
