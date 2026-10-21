@@ -37,7 +37,7 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -56,6 +56,9 @@ pub const Event = enum(u32) {
     /// Media result: raw HTTP response from gen.prepareDecisions +
     /// gen.handleDecisions — the canonical /v1/decisions reply.
     decision = 8,
+    /// Speech stream chunk: raw s16le mono PCM (engine sample rate).
+    /// Prefix-exact with the one-shot WAV under the causal codec decoder.
+    pcm = 9,
 };
 
 pub const Callback = *const fn (
@@ -163,6 +166,11 @@ pub const MediaGenConfig = extern struct {
     ref_audio_len: usize = 0,
     ref_text: ?[*]const u8 = null,
     ref_text_len: usize = 0,
+    /// Speech streaming: 0 = one-shot WAV event, 1 = PCM chunks via the
+    /// PCM event (raw s16le mono at the engine sample rate).
+    stream: u8 = 0,
+    /// Streaming: emit every N completed frames (0 = engine default 12).
+    stream_chunk_frames: u32 = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -969,6 +977,8 @@ const MediaGenCtx = struct {
     ref_audio: []u8,
     ref_text: []u8,
     max_frames: u32,
+    stream: u8,
+    stream_chunk_frames: u32,
     edit_images: []const []const u8,
     failbuf: [512:0]u8 = std.mem.zeroes([512:0]u8),
     video_json: []u8,
@@ -1434,6 +1444,30 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
                 .max_frames = if (c.max_frames == 0) null else c.max_frames,
                 .seed = if (c.seed == 0) null else c.seed,
             };
+            if (c.stream != 0) {
+                const synth = be.synthesizeStream(alloc, req, breeze_mod.StreamSpec{
+                    .emit = ttsPcmEmit,
+                    .emit_user = c,
+                    .chunk_frames = c.stream_chunk_frames,
+                    .cancel = mediaCancelled,
+                    .cancel_user = c,
+                }) catch |err| {
+                    const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+                    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                    return;
+                };
+                // Stream mode: PCM left via ttsPcmEmit; Synthesis.pcm is a
+                // static empty slice (do not free). On success the frames
+                // buffer is ours (run's errdefer only fires on error).
+                alloc.free(@constCast(synth.frames));
+                if (mlxFailPeek(c.failbuf[0..]) != null) {
+                    ttsMlxFailEvent(c);
+                    return;
+                }
+                mediaEmitDone(c, 0, 0);
+                logMemStat("after-tts");
+                return;
+            }
             const synth = be.synthesize(alloc, req) catch |err| {
                 const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
                 c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
@@ -1579,6 +1613,30 @@ fn mediaProgress(ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void
 fn mediaCancelled(ctx: *anyopaque) bool {
     const c: *MediaGenCtx = @ptrCast(@alignCast(ctx));
     return c.cancelled.load(.acquire);
+}
+
+/// Streaming speech emit: f32 → s16le mono PCM with the wav.encodePcm16
+/// scaling (clamp ±1, round to 32767), sent as one PCM event per chunk.
+/// Runs on the media feeder thread; the callback copies the payload before
+/// returning, so the buffer is safe to free afterwards.
+fn ttsPcmEmit(user: *anyopaque, pcm: []const f32) void {
+    const c: *MediaGenCtx = @ptrCast(@alignCast(user));
+    if (pcm.len == 0) return;
+    const out = c.alloc.alloc(u8, pcm.len * 2) catch {
+        const msg = "speech: pcm encode failed";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    };
+    defer c.alloc.free(out);
+    var off: usize = 0;
+    for (pcm) |s| {
+        const clamped = std.math.clamp(s, -1.0, 1.0);
+        const v: i16 = @intFromFloat(std.math.round(clamped * 32767.0));
+        out[off] = @intCast(v & 0xFF);
+        out[off + 1] = @intCast((v >> 8) & 0xFF);
+        off += 2;
+    }
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.pcm), out.ptr, @intCast(out.len));
 }
 
 fn mediaFeederCleanup(c: *MediaGenCtx) void {
@@ -1749,6 +1807,8 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .ref_audio = if (cfg.ref_audio) |p| alloc.dupe(u8, p[0..cfg.ref_audio_len]) catch &.{} else &.{},
         .ref_text = if (cfg.ref_text) |p| alloc.dupe(u8, p[0..cfg.ref_text_len]) catch &.{} else &.{},
         .max_frames = cfg.max_frames,
+        .stream = cfg.stream,
+        .stream_chunk_frames = cfg.stream_chunk_frames,
         .edit_images = &.{},
         .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
         .decision_json = if (cfg.decision_json) |p| alloc.dupe(u8, p[0..cfg.decision_json_len]) catch &.{} else &.{},

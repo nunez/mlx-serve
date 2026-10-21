@@ -996,6 +996,20 @@ pub const Synthesis = struct {
     frames: []const [NUM_CODEBOOKS]u32,
 };
 
+/// Streaming synthesis controls. `emit` receives f32 PCM slices in
+/// completion order, non-overlapping, covering the full utterance once;
+/// each slice is the chunk freshly decoded at its frame boundary.
+pub const StreamSpec = struct {
+    emit: *const fn (user: *anyopaque, pcm: []const f32) void,
+    emit_user: *anyopaque,
+    /// Emit every N completed frames (0 = default 12).
+    chunk_frames: u32 = 12,
+    /// Checked before each frame; true aborts with error.Cancelled.
+    /// Same signature as the sse Progress cancelled_cb.
+    cancel: ?*const fn (ctx: *anyopaque) bool = null,
+    cancel_user: ?*anyopaque = null,
+};
+
 pub const Engine = struct {
     alloc: std.mem.Allocator,
     tok: tokenizer_mod.Tokenizer,
@@ -1013,6 +1027,7 @@ pub const Engine = struct {
     bkv_len: usize = 0,
     audio_table: []f32, // HOST [NUM_CODEBOOKS*CB_STRIDE, B_HIDDEN]
     codec: tts.CodecDecoder,
+    samples_per_frame: usize = 0, // codec total upsample ratio (1920 = 12.5 fps @ 24 kHz)
     scratch: []f32,
     order: []usize,
     model_dir: []const u8 = "",
@@ -1115,6 +1130,7 @@ pub const Engine = struct {
             allocator.free(self.order);
         }
         self.te_proj = try ownT16(&w, s, "text_encoder_proj.weight");
+        self.samples_per_frame = self.codec.samplesPerFrame();
         return self;
     }
 
@@ -1152,6 +1168,23 @@ pub const Engine = struct {
 
     /// Plain / tagged / instruction synthesis.
     pub fn synthesize(self: *Engine, allocator: std.mem.Allocator, req: Request) !Synthesis {
+        return self.run(allocator, req, null);
+    }
+
+    /// Streaming synthesis. Result is prefix-exact with `synthesize` (the
+    /// codec decoder is fully causal, so each chunk decode is identical to
+    /// the corresponding prefix of the final decode). `Synthesis.pcm` is
+    /// empty — the PCM left via `st.emit`; the caller does not free it.
+    pub fn synthesizeStream(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        req: Request,
+        st: StreamSpec,
+    ) !Synthesis {
+        return self.run(allocator, req, &st);
+    }
+
+    fn run(self: *Engine, allocator: std.mem.Allocator, req: Request, st: ?*const StreamSpec) !Synthesis {
         if (req.text.len == 0) return error.EmptyText;
         const clone = req.ref_audio != null and req.ref_audio.?.len > 0;
         if (clone and (req.ref_text == null or req.ref_text.?.len == 0)) return error.CloneMissingRefText;
@@ -1326,6 +1359,13 @@ pub const Engine = struct {
         const span_mode = std.c.getenv("BREEZE_SPAN") != null;
         var frame_i: usize = 0;
         while (frame_i < frames_cap) : (frame_i += 1) {
+            if (st) |spec| {
+                if (spec.cancel) |cb| {
+                    if (spec.cancel_user) |u| {
+                        if (cb(u)) return error.Cancelled;
+                    }
+                }
+            }
             if (span_mode or frame_i == 0) {
                 const L = text_len + frame_i;
                 @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
@@ -1394,13 +1434,44 @@ pub const Engine = struct {
             frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
             @memcpy(stream[(text_len + frame_i) * B_HIDDEN ..][0..B_HIDDEN], emb_row);
             try frames.append(allocator, frame);
+            if (st) |spec| {
+                const n = frames.items.len;
+                const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
+                if (n % k == 0) {
+                    // Prefix-exact under the causal codec decoder: this
+                    // decode's tail equals the final decode's same region.
+                    const dec = try self.codec.decode(frames.items);
+                    defer allocator.free(dec);
+                    const dec_total = @min(dec.len, n * self.samples_per_frame);
+                    const from = @min(dec_total, (n - k) * self.samples_per_frame);
+                    spec.emit(spec.emit_user, dec[from..dec_total]);
+                }
+            }
         }
 
         const out_frames = frames.items;
         if (out_frames.len == 0) return error.NoFramesEmitted;
 
-        const pcm = try self.codec.decode(out_frames);
-        return .{ .pcm = pcm, .frames = out_frames };
+        if (st) |spec| {
+            const n = out_frames.len;
+            const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
+            const rem = n % k;
+            if (k > 0 and rem > 0) {
+                const dec = try self.codec.decode(out_frames);
+                defer allocator.free(dec);
+                const dec_total = @min(dec.len, n * self.samples_per_frame);
+                const from = @min(dec_total, (n - rem) * self.samples_per_frame);
+                spec.emit(spec.emit_user, dec[from..dec_total]);
+            }
+        }
+
+        if (st == null) {
+            const pcm = try self.codec.decode(out_frames);
+            return .{ .pcm = pcm, .frames = out_frames };
+        }
+        // Stream mode: PCM already emitted in chunks; Synthesis.pcm is empty
+        // and must not be freed.
+        return .{ .pcm = &[_]f32{}, .frames = out_frames };
     }
 };
 

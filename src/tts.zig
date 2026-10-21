@@ -2818,6 +2818,16 @@ pub const CodecDecoder = struct {
     out_conv_w: mlx.mlx_array,
     out_conv_b: mlx.mlx_array,
 
+    /// Output samples per input frame: the total upsample ratio
+    /// (2·2 from the upsample blocks · 8·5·4·3 from the decoder blocks) =
+    /// 1920, i.e. 12.5 fps at 24 kHz.
+    pub fn samplesPerFrame(self: *const CodecDecoder) usize {
+        var n: usize = 1;
+        for (self.cfg.upsampling_ratios) |r| n *= @as(usize, r);
+        for (self.cfg.upsample_rates) |r| n *= @as(usize, r);
+        return n;
+    }
+
     pub fn deinit(self: *CodecDecoder) void {
         const a = self.allocator;
         _ = mlx.mlx_array_free(self.rvq_first_cb);
