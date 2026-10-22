@@ -70,7 +70,11 @@ pub const D_LAYERS: usize = 12;
 pub const D_THETA: f64 = 500_000;
 
 pub const MAX_SEQ: usize = 2048; // span guard: text + frame budget
-pub const MAX_FRAMES: u32 = 750; // generation_config max_new_tokens
+// generation_config max_new_tokens (750 = 60 s at 12.5 Hz) is a sampling
+// default, not a model limit: the true ceiling is the MAX_SEQ position span.
+// 1500 matches the legacy Python bridge (max_new_tokens=1500, max_seq_len=2048)
+// so speech isn't truncated at 60 s; the real stop is CB_EOS.
+pub const MAX_FRAMES: u32 = 1500;
 pub const SAMPLE_RATE: u32 = 24000;
 pub const FRAME_RATE: f64 = 12.5;
 pub const CHARS_PER_SEC: f64 = 15.0;
@@ -1260,7 +1264,12 @@ pub const Engine = struct {
         const text_len = ids.items.len;
         if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
         const est_text = req.text.len; // chars: the budget formula is chars/CHARS_PER_SEC, not token counts
-        const frames_cap = estimateFrames(est_text, req.max_frames);
+        var frames_cap = estimateFrames(est_text, req.max_frames);
+        // Spend the whole remaining 2048-position window, not just the
+        // estimate's MAX_FRAMES clamp: long text gets every frame it can
+        // (≤ ~120 s) instead of truncating at 60 s or erroring outright.
+        if (text_len < MAX_SEQ and frames_cap > MAX_SEQ - text_len)
+            frames_cap = @intCast(MAX_SEQ - text_len);
         const total = text_len + frames_cap;
         if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
 
