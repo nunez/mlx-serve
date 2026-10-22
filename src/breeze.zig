@@ -105,13 +105,132 @@ pub fn voiceSlotValid(name: []const u8) bool {
     return name[1] >= '0' and name[1] <= '9';
 }
 
-/// Frame budget from text length: chars / CHARS_PER_SEC × FRAME_RATE, with a
-/// headroom factor, clamped by a request cap and MAX_FRAMES.
-pub fn estimateFrames(text_len: usize, req_max: ?u32) u32 {
-    const est: f64 = @as(f64, @floatFromInt(text_len)) / CHARS_PER_SEC * FRAME_RATE * FRAME_EST_DIV + 4.0;
+/// Frame budget from speak units (see speakUnits): units / CHARS_PER_SEC ×
+/// FRAME_RATE, with a headroom factor, clamped by a request cap and
+/// MAX_FRAMES. The true stop is always CB_EOS; this is a runaway ceiling.
+pub fn estimateFrames(units: usize, req_max: ?u32) u32 {
+    const est: f64 = @as(f64, @floatFromInt(units)) / CHARS_PER_SEC * FRAME_RATE * FRAME_EST_DIV + 4.0;
     var frames: u32 = @intFromFloat(@ceil(est));
     if (req_max) |m| frames = @min(frames, m);
     return @min(frames, MAX_FRAMES);
+}
+
+/// Speakable-character units: 1 per ASCII char, 3 per non-ASCII. CJK speech
+/// runs ~2.5–3× longer per character and tokenizes denser, so time and
+/// budget math uses this instead of raw character counts.
+fn speakUnits(s: []const u8) usize {
+    var units: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        units += if (n == 1) @as(usize, 1) else 3;
+        i += @min(n, s.len - i);
+    }
+    return units;
+}
+
+/// Frames a segment will likely speak, with 15 % speech-rate margin.
+fn needFrames(units: usize) u32 {
+    const f: f64 = @ceil(@as(f64, @floatFromInt(units)) / CHARS_PER_SEC * FRAME_RATE * 1.15);
+    return if (f >= 1e9) std.math.maxInt(u32) else @intFromFloat(f);
+}
+
+/// Whether a segment's exact prompt tokens plus its estimated speech frames
+/// (plus per-request prompt overhead) fit the KV window and frame cap with
+/// margin. Used to pack sentences into turn-sized segments.
+fn segmentFits(overhead: usize, toks: usize, units: usize) bool {
+    const need = needFrames(units);
+    return overhead + toks + need + 16 <= MAX_SEQ and need <= MAX_FRAMES;
+}
+
+/// Sentence pieces above this unit count (one giant unpunctuated run) are
+/// hard-split so even that stays inside the window.
+const MAX_SENT_UNITS: usize = 1400;
+
+fn isSentenceTerm(r: u21) bool {
+    return r == '.' or r == '!' or r == '?' or r == 0x3002 or r == 0xFF01 or r == 0xFF1F;
+}
+
+/// Split text into speakable sentence slices: Latin terminators (.!?) close
+/// at the following whitespace run (longform.py's `(?<=[.!?])\s+`), CJK
+/// terminators close at the character. Sentences are trimmed; runs over
+/// MAX_SENT_UNITS are hard-split (see appendSentence). Borrows `text`.
+fn splitSentences(allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const step = @min(n, text.len - i);
+        const r: u21 = if (step == 1) text[i] else (std.unicode.utf8Decode(text[i..][0..step]) catch 0xFFFF);
+        if (isSentenceTerm(r)) {
+            var end = i + step;
+            if (r < 0x80) { // latin terminators split at the following whitespace run
+                var j = end;
+                while (j < text.len and std.ascii.isWhitespace(text[j])) j += 1;
+                if (j > end) end = j;
+            }
+            try appendSentence(allocator, std.mem.trim(u8, text[start..end], " \t\r\n"), out);
+            start = end;
+            i = end;
+            continue;
+        }
+        i += step;
+    }
+    try appendSentence(allocator, std.mem.trim(u8, text[start..], " \t\r\n"), out);
+}
+
+/// Append a trimmed sentence, hard-splitting at whitespace (else at a UTF-8
+/// boundary) when it exceeds MAX_SENT_UNITS. All emitted slices borrow `s`.
+fn appendSentence(allocator: std.mem.Allocator, s: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var rest = s;
+    var rem = speakUnits(rest);
+    while (rem > MAX_SENT_UNITS) {
+        var units: usize = 0;
+        var cut: usize = 0;
+        var ws_cut: usize = 0;
+        var ws_units: usize = 0;
+        var i: usize = 0;
+        while (i < rest.len) {
+            const n = std.unicode.utf8ByteSequenceLength(rest[i]) catch 1;
+            const step = @min(n, rest.len - i);
+            if (step == 1 and std.ascii.isWhitespace(rest[i])) {
+                ws_cut = i + step;
+                ws_units = units;
+            }
+            units += if (step == 1) @as(usize, 1) else 3;
+            i += step;
+            if (units >= MAX_SENT_UNITS) break;
+        }
+        cut = i;
+        if (ws_cut > 0 and ws_cut < cut and ws_units > MAX_SENT_UNITS / 2) {
+            cut = ws_cut;
+            units = ws_units;
+        }
+        var piece = rest[0..cut];
+        while (piece.len > 0 and (piece[piece.len - 1] & 0xC0) == 0x80) piece = piece[0 .. piece.len - 1];
+        if (piece.len > 0) try out.append(allocator, piece);
+        rest = std.mem.trim(u8, rest[cut..], " \t\r\n");
+        rem = speakUnits(rest);
+    }
+    if (rest.len > 0) try out.append(allocator, rest);
+}
+
+/// Join sentence slices with single spaces (longform.py's `" ".join`).
+fn joinSentences(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    var total: usize = 0;
+    for (parts) |p| total += p.len + 1;
+    if (total == 0) return allocator.alloc(u8, 0);
+    const buf = try allocator.alloc(u8, total - 1);
+    var i: usize = 0;
+    for (parts, 0..) |p, k| {
+        @memcpy(buf[i .. i + p.len], p);
+        i += p.len;
+        if (k + 1 < parts.len) {
+            buf[i] = ' ';
+            i += 1;
+        }
+    }
+    return buf;
 }
 
 // ───────────────────────────── rng + host sampler ────────────────────────────
@@ -1216,14 +1335,12 @@ pub const Engine = struct {
                 try self.enc(&seg2, ins);
                 try seg2.append(allocator, INS_EOS_ID);
             }
-            try self.enc(&seg2, req.text);
         } else {
             if (req.instruction) |ins| {
                 try seg1.append(allocator, INS_BOS_ID);
                 try self.enc(&seg1, ins);
                 try seg1.append(allocator, INS_EOS_ID);
             }
-            try self.enc(&seg1, req.text);
         }
 
         var ref_frames: std.ArrayList([]u32) = .empty;
@@ -1252,95 +1369,59 @@ pub const Engine = struct {
             for (fr) |f| try ref_frames.append(allocator, f);
         }
 
-        var ids: std.ArrayList(u32) = .empty; // meta prompt; audio slots = placeholder ids
-        defer ids.deinit(allocator);
-        try ids.appendSlice(allocator, seg1.items);
-        if (clone) {
-            for (0..ref_frames.items.len) |_| try ids.append(allocator, AUDIO_TOKEN_ID);
-            try ids.append(allocator, AUDIO_EOS_ID);
-            try ids.appendSlice(allocator, seg2.items);
+        // Long-form chunking (port of longform.py): when the text cannot fit
+        // the 2048-position window in one turn, split it at sentence
+        // boundaries into segments that each fit (exact tokenizer counts +
+        // estimated speech frames + prompt overhead) and synthesize one turn
+        // per segment, appending frames to a single stitched stream. The
+        // codec decode at the tail stays one causal pass over all frames, so
+        // buffered WAVs and prefix-exact stream chunks are unaffected by the
+        // stitching; prosody restarts per segment (fresh speaker/text prompt),
+        // same as the reference longform tool.
+        const trimmed = std.mem.trim(u8, req.text, " \t\r\n");
+        if (trimmed.len == 0) return error.EmptyText;
+
+        var seg_texts: std.ArrayList([]const u8) = .empty; // owned; all freed at scope exit
+        defer {
+            for (seg_texts.items) |s| allocator.free(s);
+            seg_texts.deinit(allocator);
+        }
+        const overhead = seg1.items.len +
+            (if (clone) seg2.items.len + ref_frames.items.len + 1 else 0);
+        var whole_toks: std.ArrayList(u32) = .empty;
+        defer whole_toks.deinit(allocator);
+        try self.enc(&whole_toks, trimmed);
+        if (segmentFits(overhead, whole_toks.items.len, speakUnits(trimmed))) {
+            try seg_texts.append(allocator, try allocator.dupe(u8, trimmed));
+        } else {
+            var sentences: std.ArrayList([]const u8) = .empty;
+            defer sentences.deinit(allocator);
+            try splitSentences(allocator, trimmed, &sentences);
+            var pack: std.ArrayList(u32) = .empty;
+            defer pack.deinit(allocator);
+            var p_start: usize = 0;
+            var p_toks: usize = 0;
+            var p_units: usize = 0;
+            for (sentences.items, 0..) |sent, si| {
+                pack.clearRetainingCapacity();
+                try self.enc(&pack, sent);
+                const s_units = speakUnits(sent);
+                if (si > p_start and !segmentFits(overhead, p_toks + pack.items.len, p_units + s_units)) {
+                    try seg_texts.append(allocator, try joinSentences(allocator, sentences.items[p_start..si]));
+                    p_start = si;
+                    p_toks = 0;
+                    p_units = 0;
+                }
+                p_toks += pack.items.len;
+                p_units += s_units;
+            }
+            try seg_texts.append(allocator, try joinSentences(allocator, sentences.items[p_start..]));
         }
 
-        const text_len = ids.items.len;
-        if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
-        const est_text = req.text.len; // chars: the budget formula is chars/CHARS_PER_SEC, not token counts
-        var frames_cap = estimateFrames(est_text, req.max_frames);
-        // Spend the whole remaining 2048-position window, not just the
-        // estimate's MAX_FRAMES clamp: long text gets every frame it can
-        // (≤ ~120 s) instead of truncating at 60 s or erroring outright.
-        if (text_len < MAX_SEQ and frames_cap > MAX_SEQ - text_len)
-            frames_cap = @intCast(MAX_SEQ - text_len);
-        const total = text_len + frames_cap;
-        if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
-
-        // TE conditioning → backbone-width stream rows.
-        var cond = allocator.alloc(f32, @max(seg1.items.len, seg2.items.len) * TE_HIDDEN) catch return error.OutOfMemory;
-        defer allocator.free(cond);
-        var stream = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
-        defer allocator.free(stream);
-        @memset(stream, 0);
-        {
-            const wt = allocator.alloc(f32, TE_HIDDEN * B_HIDDEN) catch return error.OutOfMemory;
-            defer allocator.free(wt);
-            try evalHost(g_stream, self.te_proj, wt);
-            const emb_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
-            defer allocator.free(emb_row);
-            var row: usize = 0;
-            try teCond(allocator, g_stream, &self.te, seg1.items, cond[0 .. seg1.items.len * TE_HIDDEN]);
-            for (0..seg1.items.len) |t| {
-                const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
-                for (0..B_HIDDEN) |o| {
-                    var acc: f32 = 0;
-                    var i: usize = 0;
-                    while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
-                    stream[row * B_HIDDEN + o] = acc;
-                }
-                row += 1;
-            }
-            if (clone) {
-                for (ref_frames.items) |f| {
-                    frameEmbed(self.audio_table, B_HIDDEN, f, emb_row);
-                    @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
-                    row += 1;
-                }
-                var zframe: [NUM_CODEBOOKS]u32 = undefined;
-                @memset(&zframe, 0);
-                frameEmbed(self.audio_table, B_HIDDEN, &zframe, emb_row);
-                @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
-                row += 1;
-                try teCond(allocator, g_stream, &self.te, seg2.items, cond[0 .. seg2.items.len * TE_HIDDEN]);
-                for (0..seg2.items.len) |t| {
-                    const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
-                    for (0..B_HIDDEN) |o| {
-                        var acc: f32 = 0;
-                        var i: usize = 0;
-                        while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
-                        stream[row * B_HIDDEN + o] = acc;
-                    }
-                    row += 1;
-                }
-            }
-        }
-
-        if (std.c.getenv("BREEZE_DUMP") != null) {
-            log.err("[breeze-dump] ids={any}\n", .{ids.items});
-            var row: usize = 0;
-            while (row < text_len) : (row += 1) {
-                var buf: [32768]u8 = undefined;
-                var pos: usize = 0;
-                const r = stream[row * B_HIDDEN ..][0..B_HIDDEN];
-                for (r, 0..) |v, i| {
-                    if (i > 0) buf[pos] = ',';
-                    pos += 1;
-                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                    pos += sres.len;
-                }
-                log.err("[breeze-dump] row={d} {s}\n", .{ row, buf[0..pos] });
-            }
-        }
-
-        var frames: std.ArrayList([NUM_CODEBOOKS]u32) = .empty;
+        var frames: std.ArrayList([NUM_CODEBOOKS]u32) = .empty; // stitched across segments
         errdefer frames.deinit(allocator);
+        var hist: std.ArrayList(u32) = .empty; // repetition-penalty history, spans segments
+        defer hist.deinit(allocator);
 
         const h_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(h_row);
@@ -1350,108 +1431,209 @@ pub const Engine = struct {
         defer allocator.free(emb_row);
         const logits = allocator.alloc(f32, CB_LM) catch return error.OutOfMemory;
         defer allocator.free(logits);
-        var hist: std.ArrayList(u32) = .empty;
-        defer hist.deinit(allocator);
         var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
-
-        for (&self.bkv) |*e| {
-            if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
-            if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
-            e.k.ctx = null;
-            e.v.ctx = null;
-        }
-        var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
-        defer allocator.free(span);
         const span_mode = std.c.getenv("BREEZE_SPAN") != null;
-        var frame_i: usize = 0;
-        while (frame_i < frames_cap) : (frame_i += 1) {
-            if (st) |spec| {
-                if (spec.cancel) |cb| {
-                    if (spec.cancel_user) |u| {
-                        if (cb(u)) return error.Cancelled;
+
+        var seg_i: usize = 0;
+        while (seg_i < seg_texts.items.len) : (seg_i += 1) {
+            const seg_text = seg_texts.items[seg_i];
+
+            var toks: std.ArrayList(u32) = .empty;
+            defer toks.deinit(allocator);
+            try self.enc(&toks, seg_text);
+
+            var s1: std.ArrayList(u32) = .empty; // TE text segments for this turn
+            defer s1.deinit(allocator);
+            var s2: std.ArrayList(u32) = .empty;
+            defer s2.deinit(allocator);
+            var ids: std.ArrayList(u32) = .empty; // meta prompt; audio slots = placeholder ids
+            defer ids.deinit(allocator);
+            try s1.appendSlice(allocator, seg1.items);
+            if (clone) {
+                try s2.appendSlice(allocator, seg2.items);
+                try s2.appendSlice(allocator, toks.items); // clone: text rides in seg2
+                try ids.appendSlice(allocator, s1.items);
+                for (0..ref_frames.items.len) |_| try ids.append(allocator, AUDIO_TOKEN_ID);
+                try ids.append(allocator, AUDIO_EOS_ID);
+                try ids.appendSlice(allocator, s2.items);
+            } else {
+                try s1.appendSlice(allocator, toks.items); // plain: text rides in seg1
+                try ids.appendSlice(allocator, s1.items);
+            }
+
+            const text_len = ids.items.len;
+            if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
+            var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames);
+            // The packer keeps segments window-safe; this clamp is the safety
+            // net so even a model that never emits EOS stays in the span.
+            if (text_len < MAX_SEQ and frames_cap > MAX_SEQ - text_len)
+                frames_cap = @intCast(MAX_SEQ - text_len);
+            const total = text_len + frames_cap;
+            if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
+
+            // TE conditioning → backbone-width stream rows.
+            var cond = allocator.alloc(f32, @max(s1.items.len, s2.items.len) * TE_HIDDEN) catch return error.OutOfMemory;
+            defer allocator.free(cond);
+            var stream = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
+            defer allocator.free(stream);
+            @memset(stream, 0);
+            {
+                const wt = allocator.alloc(f32, TE_HIDDEN * B_HIDDEN) catch return error.OutOfMemory;
+                defer allocator.free(wt);
+                try evalHost(g_stream, self.te_proj, wt);
+                var row: usize = 0;
+                try teCond(allocator, g_stream, &self.te, s1.items, cond[0 .. s1.items.len * TE_HIDDEN]);
+                for (0..s1.items.len) |t| {
+                    const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
+                    for (0..B_HIDDEN) |o| {
+                        var acc: f32 = 0;
+                        var i: usize = 0;
+                        while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
+                        stream[row * B_HIDDEN + o] = acc;
+                    }
+                    row += 1;
+                }
+                if (clone) {
+                    for (ref_frames.items) |f| {
+                        frameEmbed(self.audio_table, B_HIDDEN, f, emb_row);
+                        @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                        row += 1;
+                    }
+                    var zframe: [NUM_CODEBOOKS]u32 = undefined;
+                    @memset(&zframe, 0);
+                    frameEmbed(self.audio_table, B_HIDDEN, &zframe, emb_row);
+                    @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                    row += 1;
+                    try teCond(allocator, g_stream, &self.te, s2.items, cond[0 .. s2.items.len * TE_HIDDEN]);
+                    for (0..s2.items.len) |t| {
+                        const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
+                        for (0..B_HIDDEN) |o| {
+                            var acc: f32 = 0;
+                            var i: usize = 0;
+                            while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
+                            stream[row * B_HIDDEN + o] = acc;
+                        }
+                        row += 1;
                     }
                 }
             }
-            if (span_mode or frame_i == 0) {
-                const L = text_len + frame_i;
-                @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
-                try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, if (frame_i == 0 and !span_mode) self.bkv[0 .. B_LAYERS] else null, h_row);
-                if (!span_mode) self.bkv_len = text_len;
-            } else {
-                try qwenStep(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, stream[(text_len + frame_i - 1) * B_HIDDEN ..][0..B_HIDDEN], B_HIDDEN, @intCast(self.bkv_len), self.bkv[0 .. B_LAYERS], h_row);
-                self.bkv_len += 1;
-            }
-            headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
-            var frame: [NUM_CODEBOOKS]u32 = undefined;
-            const dbg_depth = std.c.getenv("BREEZE_DEPTH") != null;
-            const greedy = std.c.getenv("BREEZE_GREEDY") != null;
-            const first_tok = sampleToken(&rng, logits, if (greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = if (std.c.getenv("BREEZE_NOREP") != null) &[_]u32{} else hist.items, .rep = 1.1 });
-            frame[0] = if (dbg_depth and frame_i == 0) @as(u32, 1221) else @intCast(first_tok);
-            if (greedy) log.err("[breeze-dump] F{d} {d}\n", .{ frame_i, frame[0] });
-            if (std.c.getenv("BREEZE_DUMP") != null and frame_i == 0) {
-                var buf: [65536]u8 = undefined;
-                var pos: usize = 0;
-                for (logits[0..CB_LM], 0..) |v, i| {
-                    if (i > 0) buf[pos] = ',';
-                    pos += 1;
-                    const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                    pos += sres.len;
-                }
-                log.err("[breeze-dump] lm0 {s}\n", .{buf[0..pos]});
-            }
-            if (frame[0] == CB_EOS) break;
 
-            // depth span: [backbone_hidden_proj, emb(cb0), emb(cb1), ...]
-            try projHostCached(allocator, g_stream, self.d_inp, h_row, B_HIDDEN, D_HIDDEN, h_proj[0..D_HIDDEN]);
-            @memcpy(depth_span[0..D_HIDDEN], h_proj);
-            if (dbg_depth) log.err("[breeze-dump] HPROJ {any}\nHR {any}\n", .{ h_proj[0..12], h_row[0..12] });
-            var dl: usize = 1;
-            var cb: usize = 1;
-            while (cb < NUM_CODEBOOKS) : (cb += 1) {
-                const code = frame[cb - 1];
-                tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
-                if (dbg_depth and cb == 1) log.err("[breeze-dump] FEROW {any}\n", .{emb_row[0..12]});
-                if (std.c.getenv("BREEZE_ROW2") != null and cb == 3) log.err("[breeze-dump] ROW3 {any}\n", .{emb_row[0..12]});
-                try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
-                dl += 1;
-                const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
-                defer allocator.free(d_last);
-                try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, (if (std.c.getenv("BREEZE_DROPE") != null and std.c.getenv("BREEZE_DROPE").?[0] == 104) self.d_freqs else null_arr), null, d_last);
-                headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
-                if (dbg_depth) {
-                    var buf: [16384]u8 = undefined;
+            if (std.c.getenv("BREEZE_DUMP") != null) {
+                log.err("[breeze-dump] ids={any}\n", .{ids.items});
+                var row: usize = 0;
+                while (row < text_len) : (row += 1) {
+                    var buf: [32768]u8 = undefined;
                     var pos: usize = 0;
-                    for (logits[0..12], 0..) |v, i| {
+                    const r = stream[row * B_HIDDEN ..][0..B_HIDDEN];
+                    for (r, 0..) |v, i| {
                         if (i > 0) buf[pos] = ',';
                         pos += 1;
                         const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
                         pos += sres.len;
                     }
-                    log.err("[breeze-dump] H{d} {s}\n", .{ cb, buf[0..pos] });
+                    log.err("[breeze-dump] row={d} {s}\n", .{ row, buf[0..pos] });
                 }
-                frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth or greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
-                if (dbg_depth) log.err("[breeze-dump] CODE {d} {d}\n", .{ cb, frame[cb] });
             }
 
-            if (dbg_depth and frame_i == 0) break;
-            if (frame_i % 4 == 3) { _ = mlx.mlx_clear_cache(); }
-            try hist.append(allocator, frame[0]);
-            // frame embed row into the stream
-            frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
-            @memcpy(stream[(text_len + frame_i) * B_HIDDEN ..][0..B_HIDDEN], emb_row);
-            try frames.append(allocator, frame);
-            if (st) |spec| {
-                const n = frames.items.len;
-                const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
-                if (n % k == 0) {
-                    // Prefix-exact under the causal codec decoder: this
-                    // decode's tail equals the final decode's same region.
-                    const dec = try self.codec.decode(frames.items);
-                    defer allocator.free(dec);
-                    const dec_total = @min(dec.len, n * self.samples_per_frame);
-                    const from = @min(dec_total, (n - k) * self.samples_per_frame);
-                    spec.emit(spec.emit_user, dec[from..dec_total]);
+            for (&self.bkv) |*e| {
+                if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
+                if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
+                e.k.ctx = null;
+                e.v.ctx = null;
+            }
+            var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
+            defer allocator.free(span);
+
+            var frame_i: usize = 0;
+            while (frame_i < frames_cap) : (frame_i += 1) {
+                if (st) |spec| {
+                    if (spec.cancel) |cb| {
+                        if (spec.cancel_user) |u| {
+                            if (cb(u)) return error.Cancelled;
+                        }
+                    }
+                }
+                if (span_mode or frame_i == 0) {
+                    const L = text_len + frame_i;
+                    @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
+                    try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, if (frame_i == 0 and !span_mode) self.bkv[0 .. B_LAYERS] else null, h_row);
+                    if (!span_mode) self.bkv_len = text_len;
+                } else {
+                    try qwenStep(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, stream[(text_len + frame_i - 1) * B_HIDDEN ..][0..B_HIDDEN], B_HIDDEN, @intCast(self.bkv_len), self.bkv[0 .. B_LAYERS], h_row);
+                    self.bkv_len += 1;
+                }
+                headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
+                var frame: [NUM_CODEBOOKS]u32 = undefined;
+                const dbg_depth = std.c.getenv("BREEZE_DEPTH") != null;
+                const greedy = std.c.getenv("BREEZE_GREEDY") != null;
+                const first_tok = sampleToken(&rng, logits, if (greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = if (std.c.getenv("BREEZE_NOREP") != null) &[_]u32{} else hist.items, .rep = 1.1 });
+                frame[0] = if (dbg_depth and frame_i == 0) @as(u32, 1221) else @intCast(first_tok);
+                if (greedy) log.err("[breeze-dump] F{d} {d}\n", .{ frame_i, frame[0] });
+                if (std.c.getenv("BREEZE_DUMP") != null and frame_i == 0) {
+                    var buf: [65536]u8 = undefined;
+                    var pos: usize = 0;
+                    for (logits[0..CB_LM], 0..) |v, i| {
+                        if (i > 0) buf[pos] = ',';
+                        pos += 1;
+                        const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                        pos += sres.len;
+                    }
+                    log.err("[breeze-dump] lm0 {s}\n", .{buf[0..pos]});
+                }
+                if (frame[0] == CB_EOS) break;
+
+                // depth span: [backbone_hidden_proj, emb(cb0), emb(cb1), ...]
+                try projHostCached(allocator, g_stream, self.d_inp, h_row, B_HIDDEN, D_HIDDEN, h_proj[0..D_HIDDEN]);
+                @memcpy(depth_span[0..D_HIDDEN], h_proj);
+                if (dbg_depth) log.err("[breeze-dump] HPROJ {any}\nHR {any}\n", .{ h_proj[0..12], h_row[0..12] });
+                var dl: usize = 1;
+                var cb: usize = 1;
+                while (cb < NUM_CODEBOOKS) : (cb += 1) {
+                    const code = frame[cb - 1];
+                    tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
+                    if (dbg_depth and cb == 1) log.err("[breeze-dump] FEROW {any}\n", .{emb_row[0..12]});
+                    if (std.c.getenv("BREEZE_ROW2") != null and cb == 3) log.err("[breeze-dump] ROW3 {any}\n", .{emb_row[0..12]});
+                    try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
+                    dl += 1;
+                    const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
+                    defer allocator.free(d_last);
+                    try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, (if (std.c.getenv("BREEZE_DROPE") != null and std.c.getenv("BREEZE_DROPE").?[0] == 104) self.d_freqs else null_arr), null, d_last);
+                    headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
+                    if (dbg_depth) {
+                        var buf: [16384]u8 = undefined;
+                        var pos: usize = 0;
+                        for (logits[0..12], 0..) |v, i| {
+                            if (i > 0) buf[pos] = ',';
+                            pos += 1;
+                            const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+                            pos += sres.len;
+                        }
+                        log.err("[breeze-dump] H{d} {s}\n", .{ cb, buf[0..pos] });
+                    }
+                    frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth or greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
+                    if (dbg_depth) log.err("[breeze-dump] CODE {d} {d}\n", .{ cb, frame[cb] });
+                }
+
+                if (dbg_depth and frame_i == 0) break;
+                if (frame_i % 4 == 3) { _ = mlx.mlx_clear_cache(); }
+                try hist.append(allocator, frame[0]);
+                // frame embed row into the stream
+                frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
+                @memcpy(stream[(text_len + frame_i) * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                try frames.append(allocator, frame);
+                if (st) |spec| {
+                    const n = frames.items.len;
+                    const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
+                    if (n % k == 0) {
+                        // Prefix-exact under the causal codec decoder: this
+                        // decode's tail equals the final decode's same region.
+                        const dec = try self.codec.decode(frames.items);
+                        defer allocator.free(dec);
+                        const dec_total = @min(dec.len, n * self.samples_per_frame);
+                        const from = @min(dec_total, (n - k) * self.samples_per_frame);
+                        spec.emit(spec.emit_user, dec[from..dec_total]);
+                    }
                 }
             }
         }
@@ -1576,6 +1758,48 @@ test "estimateFrames clamp" {
     try std.testing.expect(a <= MAX_FRAMES);
     const b = estimateFrames(300, 50);
     try std.testing.expectEqual(@as(u32, 50), @min(b, 50));
+}
+
+test "splitSentences latin, cjk, hard split" {
+    var out: std.ArrayList([]const u8) = .empty;
+    const al = std.testing.allocator;
+    defer out.deinit(al);
+    try splitSentences(al, "Hello there. How are you?   Fine! trailing tail", &out);
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+    try std.testing.expectEqualStrings("Hello there.", out.items[0]);
+    try std.testing.expectEqualStrings("How are you?", out.items[1]);
+    try std.testing.expectEqualStrings("Fine!", out.items[2]);
+    try std.testing.expectEqualStrings("trailing tail", out.items[3]);
+
+    out.clearRetainingCapacity();
+    try splitSentences(al, "今天天气不错。我们出去走走！", &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("今天天气不错。", out.items[0]);
+    try std.testing.expectEqualStrings("我们出去走走！", out.items[1]);
+
+    // unpunctuated run over MAX_SENT_UNITS hard-splits at word breaks
+    out.clearRetainingCapacity();
+    const big = comptime blk: {
+        @setEvalBranchQuota(20000);
+        var s: []const u8 = "";
+        for (0..400) |_| s = s ++ "word ";
+        break :blk s;
+    };
+    try splitSentences(al, big, &out);
+    try std.testing.expect(out.items.len >= 2);
+    for (out.items) |s| {
+        try std.testing.expect(s.len > 0);
+        try std.testing.expect(speakUnits(s) <= MAX_SENT_UNITS + 3);
+    }
+}
+
+test "segmentFits window + cap" {
+    // ~73 s passage (1178 ascii chars, ~300 tok) fits one turn
+    try std.testing.expect(segmentFits(4, 300, 1178));
+    // > MAX_FRAMES of speech on its own must not fit
+    try std.testing.expect(!segmentFits(4, 400, 2500));
+    // token span exhaustion must not fit
+    try std.testing.expect(!segmentFits(4, 2045, 1));
 }
 
 test "sampler deterministic + temp0 argmax" {
