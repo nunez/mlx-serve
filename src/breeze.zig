@@ -1255,13 +1255,11 @@ pub const Engine = struct {
             for (0..ref_frames.items.len) |_| try ids.append(allocator, AUDIO_TOKEN_ID);
             try ids.append(allocator, AUDIO_EOS_ID);
             try ids.appendSlice(allocator, seg2.items);
-        } else {
-            try ids.appendSlice(allocator, seg1.items);
         }
 
         const text_len = ids.items.len;
         if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
-        const est_text = if (clone) seg2.items.len else text_len;
+        const est_text = req.text.len; // chars: the budget formula is chars/CHARS_PER_SEC, not token counts
         const frames_cap = estimateFrames(est_text, req.max_frames);
         const total = text_len + frames_cap;
         if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
