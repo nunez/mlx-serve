@@ -345,6 +345,15 @@ jobs:
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
+          # The mlx-serve agent skill (AgentSkills.sourceDir) and the opencode2
+          # plugin (AgentBudget.opencode2PluginSourceDir). Mirrors app/build.sh.
+          mkdir -p "$CONTENTS/Resources/agent-skills" "$CONTENTS/Resources/opencode2-mlx-serve"
+          cp -R skills/mlx-serve "$CONTENTS/Resources/agent-skills/"
+          for f in lib/opencode2-mlx-serve/{LICENSE,package.json,tui.tsx} lib/opencode2-mlx-serve/*.ts; do
+            case "$f" in *.test.ts) continue ;; esac
+            cp "$f" "$CONTENTS/Resources/opencode2-mlx-serve/"
+          done
+
           # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
           # must be embedded explicitly (Xcode normally does this for us).
           SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_PATH/SwaTex_SwaTexRender.bundle"
@@ -609,3 +618,35 @@ jobs:
           [ -n "$id" ] || { echo "linux.yml is still running for $GITHUB_SHA after two hours; re-run this job when it finishes." >&2; exit 1; }
           gh run download "$id" --pattern 'mlx-serve-linux-*-cuda13' --dir linux
           gh release upload "$TAG" linux/*/mlx-serve-linux-*-cuda13.tar.gz --clobber
+
+  # The Windows zip is the one windows.yml already built for this commit (it runs
+  # on every push to main): downloaded and attached, never rebuilt. Unsigned, and
+  # untested on a GPU: the runner has none.
+  windows-assets:
+    needs: build
+    if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Attach the Windows build of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # Waits out a run still building, for up to two hours.
+          for _ in $(seq 120); do
+            runs=$(gh run list --workflow windows.yml --commit "$GITHUB_SHA" --json databaseId,status,conclusion)
+            id=$(jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty' <<<"$runs")
+            [ -n "$id" ] && break
+            if ! jq -e 'any(.[]; .status != "completed")' <<<"$runs" >/dev/null; then
+              echo "No successful windows.yml run for $GITHUB_SHA. Run 'gh workflow run windows.yml --ref $TAG', then re-run this job." >&2
+              exit 1
+            fi
+            sleep 60
+          done
+          [ -n "$id" ] || { echo "windows.yml is still running for $GITHUB_SHA after two hours; re-run this job when it finishes." >&2; exit 1; }
+          gh run download "$id" --pattern 'mlx-serve-windows-*-cuda13' --dir windows
+          gh release upload "$TAG" windows/*/mlx-serve-windows-*.zip --clobber

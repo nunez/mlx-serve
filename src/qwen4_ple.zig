@@ -1,16 +1,33 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 
 pub const EmbeddedSpec = struct { rows: u64, dim: u32, shards: u32, layer_index: u32 = 1 };
 pub const EmbeddedInfo = struct { payload_bytes: u64 };
 const prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.";
-const layer_prefix = "language_model.model.layers.";
-const shard_marker = ".ple.ple_embedding.ngram_embedding.shards.";
-const scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale";
+/// oMLX's affine shards and NVIDIA ModelOpt's NVFP4 shards (e2m1 codes, e4m3 scale per 16).
+pub const Format = enum { affine, nvfp4 };
+const Spelling = struct { layer_prefix: []const u8, shard_marker: []const u8, scale_marker: []const u8, fmt: Format };
+const spellings = [_]Spelling{
+    .{ .layer_prefix = "language_model.model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shards.", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale", .fmt = .affine },
+    .{ .layer_prefix = "model.language_model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shard_", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale_2", .fmt = .nvfp4 },
+};
 const Part = enum(u2) { weight, scales, biases };
 
-const Key = struct { layer: u32, shard: u32, part: Part };
+const Key = struct { layer: u32, shard: u32, part: Part, fmt: Format };
 
 fn parseKey(name: []const u8) ?Key {
+    for (spellings) |sp| if (parseKeyAs(name, sp)) |k| return k;
+    return null;
+}
+
+fn isScaleName(name: []const u8) ?Format {
+    for (spellings) |sp| if (std.mem.startsWith(u8, name, sp.layer_prefix) and std.mem.endsWith(u8, name, sp.scale_marker)) return sp.fmt;
+    return null;
+}
+
+fn parseKeyAs(name: []const u8, sp: Spelling) ?Key {
+    const layer_prefix = sp.layer_prefix;
+    const shard_marker = sp.shard_marker;
     if (!std.mem.startsWith(u8, name, layer_prefix)) return null;
     const tail = name[layer_prefix.len..];
     const marker = std.mem.indexOf(u8, tail, shard_marker) orelse return null;
@@ -20,12 +37,34 @@ fn parseKey(name: []const u8) ?Key {
     const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
     if (dot == 0 or (dot > 1 and rest[0] == '0')) return null;
     const shard = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
-    const part: Part = if (std.mem.eql(u8, rest[dot + 1 ..], "weight")) .weight else if (std.mem.eql(u8, rest[dot + 1 ..], "scales")) .scales else if (std.mem.eql(u8, rest[dot + 1 ..], "biases")) .biases else return null;
-    return .{ .layer = layer, .shard = shard, .part = part };
+    const leaf = rest[dot + 1 ..];
+    const part: Part = if (std.mem.eql(u8, leaf, "weight")) .weight else if (std.mem.eql(u8, leaf, if (sp.fmt == .nvfp4) "weight_scale" else "scales")) .scales else if (sp.fmt == .affine and std.mem.eql(u8, leaf, "biases")) .biases else return null;
+    return .{ .layer = layer, .shard = shard, .part = part, .fmt = sp.fmt };
 }
 
 pub fn embeddedTensorName(name: []const u8) bool {
-    return parseKey(name) != null or (std.mem.startsWith(u8, name, layer_prefix) and std.mem.endsWith(u8, name, scale_marker));
+    return parseKey(name) != null or isScaleName(name) != null;
+}
+
+/// Bytes of one scale (bf16 affine, e4m3 nvfp4) and the parts each row has.
+pub fn scaleBytes(fmt: Format) usize {
+    return if (fmt == .nvfp4) 1 else 2;
+}
+
+pub fn partCount(fmt: Format) usize {
+    return if (fmt == .nvfp4) 2 else 3;
+}
+
+/// The width `wcols` u32 words pack `dim` values at: any affine width `mx.quantize` writes
+/// (the table's dim is known, so the words alone decide it), NVFP4 always 4.
+fn packedBits(form: Format, wcols: u32, dim: u32) ?u32 {
+    const total = @as(u64, wcols) * 32;
+    if (dim == 0 or total % dim != 0) return null;
+    return switch (total / dim) {
+        4 => 4,
+        2, 3, 5, 6, 8 => |b| if (form == .affine) @intCast(b) else null,
+        else => null,
+    };
 }
 
 pub fn regionsOverlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) bool {
@@ -91,7 +130,7 @@ const Shard = struct {
 };
 
 const File = struct {
-    fd: std.c.fd_t,
+    fd: c_int,
     map: []align(std.heap.page_size_min) const u8,
     obj: std.json.ObjectMap,
     data_off: usize,
@@ -103,7 +142,7 @@ pub const RowParts = struct {
     biases: []const u8,
 };
 
-pub const Region = struct { fd: std.c.fd_t, off: u64, len: u64 };
+pub const Region = struct { fd: c_int, off: u64, len: u64 };
 
 pub const EmbeddedTable = struct {
     arena: std.heap.ArenaAllocator,
@@ -119,11 +158,12 @@ pub const EmbeddedTable = struct {
     /// The pack's global `weight_scale`: oMLX stores the table unscaled and
     /// multiplies every gathered row by it (1.0 when absent).
     scale: f32 = 1.0,
+    fmt: Format = .affine,
 
     pub fn close(self: *EmbeddedTable) void {
         for (self.files) |f| {
-            std.posix.munmap(f.map);
-            _ = std.c.close(f.fd);
+            if (!(comptime @import("builtin").os.tag == .windows)) std.posix.munmap(f.map); // never mapped on Windows
+            crt.close(f.fd);
         }
         self.arena.deinit();
     }
@@ -143,24 +183,25 @@ pub const EmbeddedTable = struct {
         const where = self.locate(row);
         const p = where.shard.parts;
         const wlen: usize = self.wcols * 4;
-        const slen: usize = self.scols * 2;
+        const slen: usize = self.scols * scaleBytes(self.fmt);
         return .{
             .weight = self.files[p[0].file].map[p[0].off + where.local * wlen ..][0..wlen],
             .scales = self.files[p[1].file].map[p[1].off + where.local * slen ..][0..slen],
-            .biases = self.files[p[2].file].map[p[2].off + where.local * slen ..][0..slen],
+            .biases = if (self.fmt == .nvfp4) &.{} else self.files[p[2].file].map[p[2].off + where.local * slen ..][0..slen],
         };
     }
 
     /// The `i`-th byte range a gather reads (each shard's three parts), null past the last.
     pub fn region(self: *const EmbeddedTable, i: usize) ?Region {
-        if (i >= self.shards.len * 3) return null;
-        const t = self.shards[i / 3].parts[i % 3];
+        const n = partCount(self.fmt);
+        if (i >= self.shards.len * n) return null;
+        const t = self.shards[i / n].parts[i % n];
         return .{ .fd = self.files[t.file].fd, .off = t.off, .len = t.len };
     }
 
     /// Bytes of the contiguous `weight | scales | biases` layout `repackInto` writes.
     pub fn repackedLen(self: *const EmbeddedTable) u64 {
-        return self.rows * (@as(u64, self.wcols) * 4 + @as(u64, self.scols) * 4);
+        return self.rows * (@as(u64, self.wcols) * 4 + @as(u64, self.scols) * scaleBytes(self.fmt) * (partCount(self.fmt) - 1));
     }
 
     /// Copy every shard into `dst` as one `weight | scales | biases` table by global row, the
@@ -168,10 +209,10 @@ pub const EmbeddedTable = struct {
     pub fn repackInto(self: *const EmbeddedTable, dst: []u8) !void {
         if (dst.len < self.repackedLen()) return error.EmbeddedPleRepackShort;
         const wl: u64 = @as(u64, self.wcols) * 4;
-        const sl: u64 = @as(u64, self.scols) * 2;
+        const sl: u64 = @as(u64, self.scols) * scaleBytes(self.fmt);
         const base = [3]u64{ 0, self.rows * wl, self.rows * (wl + sl) };
         const row_len = [3]u64{ wl, sl, sl };
-        for (self.shards) |shard| for (shard.parts, 0..) |t, p| {
+        for (self.shards) |shard| for (shard.parts[0..partCount(self.fmt)], 0..) |t, p| {
             const fd = self.files[t.file].fd;
             const out = dst[@intCast(base[p] + shard.first * row_len[p])..][0..t.len];
             // F_NOCACHE is Darwin-only; Linux reads through the page cache.
@@ -183,7 +224,7 @@ pub const EmbeddedTable = struct {
             var done: usize = 0;
             while (done < out.len) {
                 const want = @min(out.len - done, 1 << 30);
-                const got = std.c.pread(fd, out[done..].ptr, want, @intCast(t.off + done));
+                const got = crt.pread(fd, out[done..].ptr, want, @intCast(t.off + done));
                 if (got <= 0) return error.EmbeddedPleRead;
                 done += @intCast(got);
             }
@@ -195,12 +236,13 @@ pub const EmbeddedTable = struct {
         const t = where.shard.parts[part];
         if (dst.len != t.len / t.rows) return false;
         const off = t.off + where.local * dst.len;
-        return std.c.pread(self.files[t.file].fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+        return crt.pread(self.files[t.file].fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 };
 
+/// A shard the index names: a relative path, a subdirectory allowed (NVIDIA's `tensors/`).
 fn validFileName(name: []const u8) bool {
-    return name.len > 0 and std.mem.endsWith(u8, name, ".safetensors") and std.mem.indexOfAny(u8, name, "/\\") == null and !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..");
+    return name.len > 0 and std.mem.endsWith(u8, name, ".safetensors") and name[0] != '/' and std.mem.indexOfScalar(u8, name, '\\') == null and std.mem.indexOf(u8, name, "..") == null;
 }
 
 fn openFile(a: std.mem.Allocator, model_dir: []const u8, name: []const u8) !File {
@@ -209,16 +251,16 @@ fn openFile(a: std.mem.Allocator, model_dir: []const u8, name: []const u8) !File
     const full = std.fmt.bufPrint(&path, "{s}/{s}", .{ model_dir, name }) catch return error.NameTooLong;
     if (full.len >= path.len) return error.NameTooLong;
     path[full.len] = 0;
-    const fd = std.c.open(path[0..full.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(path[0..full.len :0]);
     if (fd < 0) return error.FileNotFound;
-    errdefer _ = std.c.close(fd);
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+    errdefer crt.close(fd);
+    const end = crt.seekEnd(fd);
     if (end < 8) return error.EmbeddedPleHeader;
     const size: usize = @intCast(end);
     const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
     errdefer std.posix.munmap(map);
     const hlen = std.mem.readInt(u64, map[0..8], .little);
-    if (hlen == 0 or hlen > 4 * 1024 * 1024 or hlen > size - 8) return error.EmbeddedPleHeader;
+    if (hlen == 0 or hlen > 64 * 1024 * 1024 or hlen > size - 8) return error.EmbeddedPleHeader;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, map[8 .. 8 + @as(usize, @intCast(hlen))], .{}) catch return error.EmbeddedPleHeader;
     if (parsed != .object) return error.EmbeddedPleHeader;
     return .{ .fd = fd, .map = map, .obj = parsed.object, .data_off = 8 + @as(usize, @intCast(hlen)) };
@@ -235,6 +277,7 @@ fn tensor(file: File, file_id: usize, name: []const u8, dtype: []const u8, elem:
 }
 
 pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTable {
+    if (comptime @import("builtin").os.tag == .windows) return null; // pread/mmap gather is POSIX-only
     if (expected.rows == 0 or expected.dim == 0 or expected.shards == 0 or expected.shards > 1024) return error.EmbeddedPleSpec;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     errdefer arena.deinit();
@@ -242,26 +285,35 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     const io = std.Io.Threaded.global_single_threaded.io();
     var dir = try std.Io.Dir.cwd().openDir(io, model_dir, .{});
     defer dir.close(io);
-    const index = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
+    const index = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 * 1024 * 1024)) catch return null;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index, .{}) catch return error.EmbeddedPleIndex;
     if (parsed != .object) return error.EmbeddedPleIndex;
     const weights = parsed.object.get("weight_map") orelse return error.EmbeddedPleIndex;
     if (weights != .object) return error.EmbeddedPleIndex;
     const candidates = try a.alloc(Candidate, expected.shards);
     for (candidates) |*c| c.* = .{};
-    const scale_name = try std.fmt.allocPrint(a, "{s}{d}{s}", .{ layer_prefix, expected.layer_index, scale_marker });
+    var fmt: ?Format = null;
+    var scale_name: []const u8 = "";
     var scale_file: ?[]const u8 = null;
     var found: usize = 0;
     var it = weights.object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (std.mem.startsWith(u8, name, layer_prefix) and std.mem.endsWith(u8, name, scale_marker)) {
-            if (!std.mem.eql(u8, name, scale_name) or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
+        if (isScaleName(name)) |sf| {
+            if (fmt != null and fmt.? != sf) return error.EmbeddedPleIndex;
+            fmt = sf;
+            const sp = spellings[@backingInt(sf)];
+            if (!std.mem.eql(u8, name, try std.fmt.allocPrint(a, "{s}{d}{s}", .{ sp.layer_prefix, expected.layer_index, sp.scale_marker })) or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
+            scale_name = name;
             scale_file = entry.value_ptr.string;
             continue;
         }
-        if (!std.mem.startsWith(u8, name, layer_prefix) or std.mem.indexOf(u8, name, shard_marker) == null) continue;
-        const key = parseKey(name) orelse return error.EmbeddedPleIndex;
+        const key = parseKey(name) orelse {
+            for (spellings) |sp| if (std.mem.startsWith(u8, name, sp.layer_prefix) and std.mem.indexOf(u8, name, sp.shard_marker) != null) return error.EmbeddedPleIndex;
+            continue;
+        };
+        if (fmt != null and fmt.? != key.fmt) return error.EmbeddedPleIndex;
+        fmt = key.fmt;
         if (key.layer != expected.layer_index or key.shard >= expected.shards or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
         const part = @backingInt(key.part);
         const c = &candidates[key.shard];
@@ -274,11 +326,13 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         arena.deinit();
         return null;
     }
-    if (found != @as(usize, expected.shards) * 3) return error.EmbeddedPleMissing;
+    const form = fmt.?;
+    const nparts = partCount(form);
+    if (found != @as(usize, expected.shards) * nparts) return error.EmbeddedPleMissing;
     var files: std.ArrayList(File) = .empty;
-    errdefer for (files.items) |f| {
-        std.posix.munmap(f.map);
-        _ = std.c.close(f.fd);
+    errdefer for (files.items) |file| {
+        std.posix.munmap(file.map);
+        crt.close(file.fd);
     };
     var file_ids: std.StringHashMapUnmanaged(usize) = .empty;
     const shards = try a.alloc(Shard, expected.shards);
@@ -289,7 +343,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     var group_size: u32 = 0;
     for (candidates, 0..) |c, i| {
         var parts: [3]Tensor = undefined;
-        for (0..3) |p| {
+        for (0..nparts) |p| {
             const name = c.names[p] orelse return error.EmbeddedPleMissing;
             const file_name = c.files[p] orelse return error.EmbeddedPleMissing;
             const id = if (file_ids.get(file_name)) |existing| existing else blk: {
@@ -299,14 +353,23 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
                 try file_ids.put(a, file_name, next);
                 break :blk next;
             };
-            parts[p] = try tensor(files.items[id], id, name, if (p == 0) "U32" else "BF16", if (p == 0) 4 else 2);
+            parts[p] = if (form == .nvfp4)
+                try tensor(files.items[id], id, name, if (p == 0) "U8" else "F8_E4M3", 1)
+            else
+                try tensor(files.items[id], id, name, if (p == 0) "U32" else "BF16", if (p == 0) 4 else 2);
             payload = std.math.add(u64, payload, parts[p].len) catch return error.EmbeddedPleRegion;
         }
-        if (parts[0].rows != parts[1].rows or parts[0].rows != parts[2].rows or parts[1].cols != parts[2].cols) return error.EmbeddedPleRegion;
-        if (@as(u64, parts[0].cols) * 8 != expected.dim or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
+        if (form == .nvfp4) {
+            if (parts[0].cols % 4 != 0) return error.EmbeddedPleGeometry;
+            parts[0].cols /= 4;
+            parts[2] = .{ .file = parts[0].file, .off = parts[0].off, .len = 0, .rows = parts[0].rows, .cols = 0 };
+        }
+        if (parts[0].rows != parts[1].rows or parts[0].rows != parts[2].rows or (form == .affine and parts[1].cols != parts[2].cols)) return error.EmbeddedPleRegion;
+        if (packedBits(form, parts[0].cols, expected.dim) == null or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
         const gs = expected.dim / parts[1].cols;
-        if (gs == 0 or gs > 1024 or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
-        for (parts, 0..) |p, x| for (parts[0..x]) |q| {
+        // The NVFP4 readers (CPU dequant, GPU gather) are written for 16-value groups only.
+        if (gs == 0 or gs > 1024 or (form == .nvfp4 and gs != 16) or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
+        for (parts[0..nparts], 0..) |p, x| for (parts[0..x]) |q| {
             if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
         shards[i] = .{ .first = first, .rows = parts[0].rows, .parts = parts };
@@ -316,8 +379,8 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         group_size = gs;
     }
     if (first != expected.rows) return error.EmbeddedPleGeometry;
-    for (shards, 0..) |shard, i| for (shard.parts) |p| {
-        for (shards[0..i]) |prior| for (prior.parts) |q| {
+    for (shards, 0..) |shard, i| for (shard.parts[0..nparts]) |p| {
+        for (shards[0..i]) |prior| for (prior.parts[0..nparts]) |q| {
             if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
     };
@@ -331,21 +394,20 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
             break :blk next;
         };
         const file = files.items[id];
-        const region = headerRegion(file.obj, scale_name, "BF16", 2, file.map.len, file.data_off, .scalar) catch |err| return switch (err) {
+        const region = headerRegion(file.obj, scale_name, if (form == .nvfp4) "F32" else "BF16", if (form == .nvfp4) 4 else 2, file.map.len, file.data_off, .scalar) catch |err| return switch (err) {
             error.TensorHeader => error.EmbeddedPleHeader,
             error.TensorDtype => error.EmbeddedPleDtype,
             error.TensorRegion, error.TensorTruncated => error.EmbeddedPleRegion,
         };
-        for (shards) |shard| for (shard.parts) |part| {
+        for (shards) |shard| for (shard.parts[0..nparts]) |part| {
             if (part.file == id and regionsOverlap(region.start, region.end, part.off - file.data_off, part.off + part.len - file.data_off)) return error.EmbeddedPleOverlap;
         };
         const off = file.data_off + @as(usize, @intCast(region.start));
-        const bits: u32 = std.mem.readInt(u16, file.map[off..][0..2], .little);
-        scale = @bitCast(bits << 16);
+        scale = if (form == .nvfp4) @bitCast(std.mem.readInt(u32, file.map[off..][0..4], .little)) else @bitCast(@as(u32, std.mem.readInt(u16, file.map[off..][0..2], .little)) << 16);
         if (!std.math.isFinite(scale) or scale <= 0) return error.EmbeddedPleWeightScale;
         payload = std.math.add(u64, payload, region.end - region.start) catch return error.EmbeddedPleRegion;
     }
-    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = 4, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload, .scale = scale };
+    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = packedBits(form, wcols, expected.dim).?, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload, .scale = scale, .fmt = form };
 }
 
 pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedInfo {
@@ -386,6 +448,56 @@ pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
     @memset(data_b[2..18], 0x22);
     try writeSafetensors(td, "a.safetensors", header_a, data_a[0..if (@backingInt(variant) >= @backingInt(FixtureVariant.scale_unit)) 102 else 100]);
     try writeSafetensors(td, "b.safetensors", header_b, &data_b);
+}
+
+/// One affine shard of two rows at dim 32, group 32, packed at `bits`: row 0 mixed codes (values
+/// straddle words at 3/5/6 bits), row 1 all ones, scale 1.0, bias 0.
+pub fn writeAffineFixture(td: *std.testing.TmpDir, bits: u32) !void {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ prefix ++ "0.weight\":\"a.safetensors\",\"" ++ prefix ++ "0.scales\":\"a.safetensors\",\"" ++ prefix ++ "0.biases\":\"a.safetensors\"}}" });
+    const wbytes = 2 * bits * 4;
+    const header = try std.fmt.allocPrint(a, "{{\"{s}0.weight\":{{\"dtype\":\"U32\",\"shape\":[2,{d}],\"data_offsets\":[0,{d}]}}," ++
+        "\"{s}0.scales\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}," ++
+        "\"{s}0.biases\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}}}", .{ prefix, bits, wbytes, prefix, wbytes, wbytes + 4, prefix, wbytes + 4, wbytes + 8 });
+    defer a.free(header);
+    const data = try a.alloc(u8, wbytes + 8);
+    defer a.free(data);
+    for (data[0 .. wbytes / 2], 0..) |*b, i| b.* = @truncate(i *% 0x9d +% 0x35);
+    @memset(data[wbytes / 2 .. wbytes], 0xff);
+    @memset(data[wbytes..], 0);
+    for (0..2) |r| std.mem.writeInt(u16, data[wbytes + r * 2 ..][0..2], 0x3f80, .little);
+    try writeSafetensors(td, "a.safetensors", header, data);
+}
+
+/// A ModelOpt NVFP4 table under `tensors/`: rows 0-1 in shard 0, row 2 in shard 1, dim 32. Row r's
+/// codes are all `r + 1`, its two e4m3 group scales 1.0 and 2.0, the global scale 0.5.
+pub fn writeNvfp4Fixture(td: *std.testing.TmpDir) !void {
+    return writeNvfp4FixtureGroups(td, false);
+}
+
+/// `wide`: one scale per 32-value row, i.e. a group of 32 the NVFP4 readers cannot take.
+pub fn writeNvfp4FixtureGroups(td: *std.testing.TmpDir, comptime wide: bool) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const p = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ p ++ "shard_0.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_0.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight\":\"tensors/a.safetensors\",\"" ++ p ++ "shard_1.weight_scale\":\"tensors/a.safetensors\",\"" ++ p ++ "weight_scale_2\":\"tensors/a.safetensors\"}}" });
+    const header = "{\"" ++ p ++ "shard_0.weight\":{\"dtype\":\"U8\",\"shape\":[2,16],\"data_offsets\":[0,32]}," ++
+        "\"" ++ p ++ "shard_0.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[2,1],\"data_offsets\":[32,34]" else "shape\":[2,2],\"data_offsets\":[32,36]") ++ "}," ++
+        "\"" ++ p ++ "shard_1.weight\":{\"dtype\":\"U8\",\"shape\":[1,16],\"data_offsets\":[36,52]}," ++
+        "\"" ++ p ++ "shard_1.weight_scale\":{\"dtype\":\"F8_E4M3\",\"" ++ (if (wide) "shape\":[1,1],\"data_offsets\":[52,53]" else "shape\":[1,2],\"data_offsets\":[52,54]") ++ "}," ++
+        "\"" ++ p ++ "weight_scale_2\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[56,60]}}";
+    var data: [60]u8 = @splat(0);
+    for (0..3) |r| {
+        const w_off: usize = if (r < 2) r * 16 else 36;
+        const s_off: usize = if (r < 2) 32 + r * 2 else 52;
+        const c: u8 = @intCast(r + 1);
+        @memset(data[w_off..][0..16], c | c << 4);
+        data[s_off] = 0x38;
+        data[s_off + 1] = 0x40;
+    }
+    std.mem.writeInt(u32, data[56..60], @bitCast(@as(f32, 0.5)), .little);
+    try td.dir.createDirPath(io, "tensors");
+    try writeSafetensors(td, "tensors/a.safetensors", header, &data);
 }
 
 fn writeSafetensors(td: *std.testing.TmpDir, name: []const u8, header: []const u8, data: []const u8) !void {

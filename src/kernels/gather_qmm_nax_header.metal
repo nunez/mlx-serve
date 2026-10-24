@@ -184,8 +184,9 @@ struct AffineQ {
   }
 };
 
-// MXFP4: e2m1 nibbles under an e8m0 scale per 32, no biases (the bias pointer
-// is a dummy). Decoded as MLX's fp4_e2m1 / fp8_e8m0 do; s * v is exact in fp32.
+// FP4: e2m1 nibbles under a byte scale per GS, no biases (the bias pointer is a
+// dummy): e8m0 per 32 (MXFP4) or e4m3 per 16 (NVFP4). Decoded as MLX's fp4_e2m1 /
+// fp8_e8m0 / fp8_e4m3 do; s * v is exact in fp32.
 template <typename T, int GS>
 struct Fp4Q {
   using WT = T;
@@ -203,6 +204,11 @@ struct Fp4Q {
   }
   METAL_FUNC P params(const int g) const thread {
     const uint b = scales[g];
+    if constexpr (GS == 16) {
+      const uint v = b & 0x7Fu;
+      const ushort u = ushort((v << 7) | (((v + 1u) >> 7) << 14) | ((b & 0x80u) << 8));
+      return P{float(as_type<half>(u)) * 256.0f};
+    }
     return P{as_type<float>(b == 0u ? 0x400000u : (b << 23))};
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
@@ -232,6 +238,7 @@ struct TileLoader {
   STEEL_CONST int kWPG = kGV * kBits / 32;
   STEEL_CONST int kBKP = G::kBK + 16 / sizeof(WT);
   static_assert(kWords * 32 == kVPT * kBits, "whole words per thread");
+  static_assert(kBits >= 4 || kVPT % 32 == 0, "2/3-bit values come in 32-value units");
   static_assert(kWPG >= 1 && kNG * kWPG == kWords, "group split");
 
   const device uint32_t* src;
@@ -285,11 +292,16 @@ struct TileLoader {
     }
   }
 
+  // The first value packed in word i: 2 and 3 bits are read in 32-value units of kBits words.
+  METAL_FUNC static int word_col(const short i) {
+    return kBits < 4 ? (i / kBits) * 32 : i * kPer;
+  }
+
   METAL_FUNC void fetch_tail(const int kb, const int k_valid) thread {
     const device uint32_t* ptr = src + kb * (G::kBK * kBits / 32);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
-      if (col + i * kPer < k_valid) {
+      if (col + word_col(i) < k_valid) {
         raw[i] = ptr[i];
       }
     }
@@ -304,6 +316,30 @@ struct TileLoader {
   METAL_FUNC void store_words(threadgroup WT* Ws, const int k_valid) const
       thread {
     threadgroup WT* dst = Ws + row * kBKP + col;
+    if constexpr (kBits < 4) {
+      // mlx packs value i at bit i * kBits: 3-bit values straddle words.
+      STEEL_PRAGMA_UNROLL
+      for (short u = 0; u < kVPT / 32; u++) {
+        if (col + u * 32 < k_valid) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 32; j += 4) {
+            vec<WT, 4> v;
+            STEEL_PRAGMA_UNROLL
+            for (short t = 0; t < 4; t++) {
+              const short bit = (j + t) * kBits;
+              const short wi = u * kBits + (bit >> 5), sh = bit & 31;
+              uint32_t q = raw[wi] >> sh;
+              if (sh + kBits > 32) {
+                q |= raw[wi + 1] << (32 - sh);
+              }
+              v[t] = Q::dq(p[(u * 32) / kGV], q & kMask);
+            }
+            *(threadgroup vec<WT, 4>*)(dst + u * 32 + j) = v;
+          }
+        }
+      }
+      return;
+    }
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kWords; i++) {
       if (col + i * kPer < k_valid) {

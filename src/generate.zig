@@ -39,7 +39,13 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
+const lilicorr_mod = @import("lilicorr.zig");
 const DflashModel = dflash_mod.DflashModel;
+
+fn embedTrunk(ctx: *const anyopaque, ids: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const xfm: *const transformer_mod.Transformer = @ptrCast(@alignCast(ctx));
+    return xfm.rawEmbedding(ids);
+}
 const gdn_decode = @import("gdn_decode.zig");
 const KVCache = transformer_mod.KVCache;
 
@@ -57,6 +63,10 @@ pub const WIDE_PREFILL_CHUNK: usize = 16384;
 /// without this flag the default 8192 is indistinguishable from a request.
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
+
+/// The widest chunk this machine runs without `--prefill-chunk` (`server.autoPrefillChunkCap`),
+/// set once by main.zig. Every auto width obeys it, the per-request and adaptive rungs included.
+pub var machine_prefill_chunk_cap: usize = std.math.maxInt(usize);
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
 pub fn explicitPrefillChunkU32() u32 {
@@ -242,10 +252,12 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
     const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
-    const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
+    const base: usize = if (prefill_chunk_explicit)
         launch
+    else if (pinned_chunk == 0)
+        @min(launch, machine_prefill_chunk_cap)
     else
-        @min(launch, pinned_chunk);
+        @min(launch, pinned_chunk, machine_prefill_chunk_cap);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -274,6 +286,37 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), env);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
+test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
+    const saved_cap = machine_prefill_chunk_cap;
+    const saved_explicit = prefill_chunk_explicit;
+    const saved_override = prefill_chunk_override;
+    defer {
+        machine_prefill_chunk_cap = saved_cap;
+        prefill_chunk_explicit = saved_explicit;
+        prefill_chunk_override = saved_override;
+    }
+    machine_prefill_chunk_cap = 2048;
+    prefill_chunk_explicit = false;
+    prefill_chunk_override = WIDE_PREFILL_CHUNK;
+    // A per-request rung (8192) and an unpinned adaptive cap (0) both stop at the machine's cap.
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 0));
+    prefill_chunk_explicit = true;
+    prefill_chunk_override = 8192;
+    try std.testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
+}
+
+/// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
+fn laneMode(lane: []const u8) []const u8 {
+    return lane[0 .. std.mem.indexOfScalar(u8, lane, ' ') orelse lane.len];
+}
+
+test "laneMode: the spec-stats mode is the first word of the lane name" {
+    try std.testing.expectEqualStrings("dspark", laneMode("dspark typical 0.3"));
+    try std.testing.expectEqualStrings("mtp", laneMode("mtp typical 0.5 depth 2"));
+    try std.testing.expectEqualStrings("serial", laneMode("serial"));
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -913,6 +956,8 @@ pub const SamplingParams = struct {
     min_p: ?f32 = null,
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
+    /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
+    frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
@@ -948,7 +993,7 @@ pub const SamplingParams = struct {
     /// Penalties read the realized history, so they keep a request off the
     /// pipelined fast path, spec verify and batched decode.
     pub fn penalized(self: SamplingParams) bool {
-        return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0;
+        return self.repeat_penalty != 1.0 or self.presence_penalty != 0.0 or self.frequency_penalty != 0.0;
     }
 
     /// A grammar or a penalty reshapes the logits spec verify compares against.
@@ -1000,12 +1045,16 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// `MLX_SERVE_SUPPRESS_RESERVED=0`. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
+/// `MLX_SERVE_SUPPRESS_RESERVED=0`: reserved specials and padding rows sample like any other id.
+pub fn suppressionDisabled() bool {
+    const v = std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED") orelse return false;
+    return v[0] == '0';
+}
+
 pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
-    if (std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED")) |v| {
-        if (v[0] == '0') {
-            log.info("[suppress] reserved-token suppression disabled by env\n", .{});
-            return;
-        }
+    if (suppressionDisabled()) {
+        log.info("[suppress] reserved-token suppression disabled by env\n", .{});
+        return;
     }
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
@@ -1223,17 +1272,29 @@ pub fn nextChunkEnd(
     ssm_cp_offset: usize,
     // Is the per-chunk adaptive width live for this prefill? Only then does the merge bound scale.
     adaptive_width: bool,
+    // Does this arch get the dense low anchors? Same gate as the checkpoint-retention
+    // `ssm_low_anchors` (`longCtxGated`, #794). A non-gated arch keeps its previous
+    // stride-boundary chunking byte-for-byte: a coarsened stride must not buy
+    // extra MoE chunks (each one re-streams the expert weights).
+    dense_low_grid: bool,
 ) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
         const abs_pos = pos + ssm_cp_offset;
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
-        if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            // A stride boundary lands inside this chunk — end exactly on it
-            // (never tail-merge past it; the boundary IS the snapshot point).
-            return next_boundary_abs - ssm_cp_offset;
-        }
+        // A stride boundary lands inside this chunk — end exactly on it
+        // (never tail-merge past it; the boundary IS the snapshot point).
+        var cut_abs: usize = if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) next_boundary_abs else 0;
+        // A dense low anchor inside the chunk cuts there too: a snapshot may only
+        // stamp an evaluated position, and an anchor earlier than the stride
+        // boundary must win the cut or a wide chunk jumps over it. 0 for a
+        // non-gated arch, and whenever stride <= 8192 — there the grid already
+        // has this spacing and fine-stride chunking stays byte-identical.
+        const low_anchor = if (dense_low_grid) ssmLowAnchorEnd(pos, end, ssm_cp_offset, ssm_cp_stride) else @as(usize, 0);
+        if (low_anchor > pos and low_anchor < end and (cut_abs == 0 or low_anchor + ssm_cp_offset < cut_abs))
+            cut_abs = low_anchor + ssm_cp_offset;
+        if (cut_abs != 0) return cut_abs - ssm_cp_offset;
     }
     if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
@@ -1279,6 +1340,39 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     if (!want_ssm_cp) return 0;
     if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return if (restored) prefix_len else 0;
     return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
+/// through the first 65536, whatever stride the request coarsened to (#794): a
+/// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
+/// inside the low band. At stride <= 8192 the grid already has this spacing, so
+/// every path below is a no-op there. Every other arch passes `dense_low_grid`
+/// false and keeps its previous grid.
+pub const SSM_GRID_LOW_DENSE_STRIDE: usize = 8192;
+pub const SSM_GRID_LOW_DENSE_TOP: usize = 65_536;
+
+/// PURE: must the chunk loop snapshot a chunk that ends exactly at absolute
+/// position `abs_end`? The stride multiples, plus the dense low anchors when
+/// `dense_low_grid`. A snapshot may only stamp a position the chunk actually
+/// evaluated, so the anchors are realised by cutting the chunk at them in
+/// `nextChunkEnd` — never by stamping a future state at an earlier position.
+pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
+    if (stride == 0) return false;
+    if (abs_end % stride == 0) return true;
+    return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
+}
+
+/// PURE: end the chunk at the first dense low anchor strictly inside
+/// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
+/// returns). 0 when there is none or the stride is already dense — chunk
+/// boundaries stay byte-identical at stride <= 8192.
+pub fn ssmLowAnchorEnd(pos: usize, end: usize, offset: usize, stride: usize) usize {
+    if (stride <= SSM_GRID_LOW_DENSE_STRIDE) return 0;
+    const abs_pos = pos + offset;
+    const abs_end = end + offset;
+    const a: usize = (abs_pos / SSM_GRID_LOW_DENSE_STRIDE + 1) * SSM_GRID_LOW_DENSE_STRIDE;
+    if (a > SSM_GRID_LOW_DENSE_TOP or a <= abs_pos or a >= abs_end) return 0;
+    return a - offset;
 }
 
 /// Effective SSM-checkpoint stride for a model, given the base (configured)
@@ -1377,11 +1471,12 @@ pub fn prefillChunkCount(
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
     adaptive_width: bool,
+    dense_low_grid: bool,
 ) usize {
     var pos: usize = 0;
     var n: usize = 0;
     while (pos < prefix_len) {
-        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
         pos = end;
         n += 1;
     }
@@ -1429,6 +1524,27 @@ test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 399, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 400, 400));
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
+}
+
+/// Drafts a DSpark copy round takes from a context match, or 0 for the stage draft. The stage block
+/// already lands most drafts on repeated text, so only a quoted span (a long agreement) whose copy
+/// is longer than the block is worth the wider verify.
+pub fn dsparkCopyLen(found: ?mtp_lookup.Match, remaining: u32, block: usize) usize {
+    const f = found orelse return 0;
+    if (f.suffix < mtp_lookup.STRONG_SUFFIX) return 0;
+    const n = @min(f.draft.len, remaining);
+    return if (n > block) n else 0;
+}
+
+test "dsparkCopyLen copies only a long agreement that outruns the stage block" {
+    const draft: [15]u32 = @splat(0);
+    const strong = mtp_lookup.STRONG_SUFFIX;
+    try std.testing.expectEqual(@as(usize, 15), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(null, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = &draft, .suffix = strong - 1 }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = draft[0..5], .suffix = strong }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 7), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 7, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 5, 5));
 }
 
 test "every speculative decoder caps accepted drafts before commit" {
@@ -1623,6 +1739,15 @@ pub const Generator = struct {
     dspark_stochastic: bool = false,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
+    /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
+    dspark_copies: u64 = 0,
+    dspark_copy_drafted: u64 = 0,
+    dspark_copy_accepted: u64 = 0,
+    /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks
+    /// when drafting does not pay); null = every round verifies the whole block.
+    dspark_pol: ?DflashPol = null,
+    dspark_stats: dflash_policy.PositionStats = .{},
+    dspark_plain: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
     // External drafter model (cross-attends into target's KV). When
@@ -2137,9 +2262,24 @@ pub const Generator = struct {
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
+            if (self.xfm.mlx_stream_ext) |m| {
+                // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
+                const lane = mlx_stream.laneName(m);
+                log.info(
+                    "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} plugin=mlx-stream lane=\"{s}\"\n",
+                    .{ laneMode(lane), self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, lane },
+                );
+                var lane_buf: [512]u8 = undefined;
+                if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
+                return;
+            }
             log.info(
-                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
-                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
+                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d}\n",
+                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted },
+            );
+            if (self.dspark_pol) |pol| log.info(
+                "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
+                .{ self.dspark_plain, pol.drafting.skipped, pol.drafting.probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
             );
             return;
         }
@@ -2435,6 +2575,11 @@ pub const Generator = struct {
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
+        /// Protect the first N positions (the lowest grid points) when thinning
+        /// the capture list to its cap: they are the only restore anchor for a
+        /// request that forked below a coarse grid's first multiple (#794).
+        /// 0 = the plain thinning (upstream behaviour, byte-identical).
+        ssm_low_anchors: usize = 0,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -2471,10 +2616,7 @@ pub const Generator = struct {
         cancelled_checkpoint_sink: ?*CancelledCheckpointSink = null,
         /// Per-token logprobs count for this request (0 = disabled). Callers
         /// that set `Generator.logprobs_n` after init must ALSO pass it here:
-        /// init's split-prefill final-token forward is a single-row dispatch,
-        /// and the certified lm_head prune may only engage when the request
-        /// consumes nothing but the argmax — a logprobs request reads the
-        /// full logit row, which the pruned head does not produce.
+        /// init's split-prefill final-token forward reads it for the first token.
         logprobs_n: u32 = 0,
         /// `/v1/completions` echo: every prompt token after the first gets its
         /// `logprobs_n`-wide entry here. The prompt must be forwarded whole (no restore).
@@ -2554,8 +2696,7 @@ pub const Generator = struct {
     /// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
     /// gating.
     pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
-        const clean = sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
+        const clean = !sampling.penalized() and
             sampling.constraint == null and
             logprobs_n == 0;
         if (!clean) return .off;
@@ -2585,6 +2726,11 @@ pub const Generator = struct {
         return on;
     }
 
+    /// `MLX_SERVE_DSV4_DSPARK_POLICY=0` verifies the whole block every stage round (the A/B arm of `dspark_pol`).
+    fn dsparkPolicyEnabled() bool {
+        return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_POLICY")) |v| v[0] != '0' else true;
+    }
+
     pub fn initWithOptions(
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -2608,7 +2754,7 @@ pub const Generator = struct {
         // Spec drafts and verify rows share the serial sampler's keys (and
         // mlx-stream's lane draws from the seed), so an unseeded sampled
         // request gets its own random seed.
-        if ((sampling.keyed or xfm.dsv41_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+        if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
             var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
             sampling.seed = prng.random().int(u64);
         }
@@ -2624,7 +2770,7 @@ pub const Generator = struct {
         var options = options_in;
         var dspark_active = false;
         var dspark_stochastic = false;
-        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.dsv41_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
             // checkpoint ships stages and the request is CLEAN (no
@@ -2637,7 +2783,7 @@ pub const Generator = struct {
             // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
-            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
+            const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
             const dspark_env_off = !dsparkEnabled();
             const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
                 DsparkArm.off
@@ -2651,7 +2797,7 @@ pub const Generator = struct {
                 .min_p = sampling.min_p,
                 .seed = sampling.seed orelse 0,
             };
-            const lane_arms = if (xfm.dsv41_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
+            const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
             if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
                 dspark_active = true;
                 dspark_stochastic = arm == .stochastic;
@@ -2678,18 +2824,6 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
-
-        // Certified lm_head prune gate: the pruned projection proves the
-        // ARGMAX, not the tail distribution, so it may engage only when this
-        // request consumes nothing else — greedy (or top-1) sampling with no
-        // logit-modifying penalties, no per-token logprobs and no grammar
-        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
-        // no request gets slower, some get faster.
-        ctx.argmax_only = (sampling.temperature < 0.01 or sampling.top_k == 1) and
-            sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            options.logprobs_n == 0;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -2796,6 +2930,10 @@ pub const Generator = struct {
         // length so the snapshots stamp positions valid in the full original
         // sequence, not relative offsets inside the tail-only prefill.
         const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
+        // Gate for the dense low grid (#794): the same predicate as the
+        // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
+        // coarsened stride's own boundary chunking — the grid adds it no chunks.
+        const dense_low_grid: bool = xfm.config.longCtxGated();
 
         // Qwen native MTP: build the head's committed-history KV cache during
         // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -2861,7 +2999,7 @@ pub const Generator = struct {
         var dfl_cl: transformer_mod.CaptureLayers = undefined;
         if (dflash_active) {
             dfl_out_buf = try allocator.alloc(mlx.mlx_array, options.dflash.?.config.target_layer_ids.len);
-            dfl_cl = .{ .ids = options.dflash.?.config.target_layer_ids, .out = dfl_out_buf };
+            dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
         }
 
         // Start of the final (logits) forward's token span. Without SSM
@@ -2984,7 +3122,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3131,7 +3269,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3152,7 +3290,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3269,7 +3412,12 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            transformer_mod.ssmCheckpointDropIndexLowAnchored(
+                                ssm_checkpoints.items,
+                                cp_thin,
+                                null,
+                                options.ssm_low_anchors,
+                            ),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3472,6 +3620,9 @@ pub const Generator = struct {
             return gen;
         }
 
+        if (dspark_active) if (xfm.dsv41) |m41| {
+            m41.ds_want_conf = dsparkPolicyEnabled();
+        };
         // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
         // pre-forward the sampled token. The first nextDrafter / nextPld /
         // nextMtp call needs the cache at exactly prompt_len (last prompt
@@ -3526,6 +3677,7 @@ pub const Generator = struct {
                 .pld_enabled = pld_active,
                 .dspark_enabled = dspark_active,
                 .dspark_stochastic = dspark_stochastic,
+                .dspark_pol = if (dspark_active and xfm.dsv41 != null and dsparkPolicyEnabled()) .{} else null,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
@@ -3998,7 +4150,7 @@ pub const Generator = struct {
         if (self.sampling.penalized() and self.generated_ids.items.len > 0) {
             var pen = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(pen);
-            if (applyRepeatPenalty(&pen, logits, self.generated_ids.items, self.sampling.repeat_penalty, self.sampling.presence_penalty, self.xfm.s)) |_| {
+            if (applyPenalties(&pen, logits, self.generated_ids.items, self.sampling, self.xfm.s)) |_| {
                 return sampleTokenLazy(pen, self.sampling, self.xfm.s);
             } else |err| log.warn("[sampling] repeat penalty failed ({s}); this draw is unpenalized\n", .{@errorName(err)});
         }
@@ -4188,14 +4340,65 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
+        if (self.dspark_pol) |*pol| {
+            if (!pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
+            pol.plain_watch = null;
+            if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
+                .drained => |tok| return try mtpSerialOneToken(allocator, tok),
+                .stopped => return null,
+                .already_clean, .stay_disabled => return error.PipelineHalfState,
+            };
+        }
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        if (self.xfm.dsv41_ext) |m| {
+        if (self.xfm.mlx_stream_ext) |m| {
             const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
             const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
             return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
         }
-        if (self.xfm.dsv41) |mdl| return self.dsparkStep(allocator, dsv41_mod, mdl);
+        if (self.xfm.dsv41) |mdl| {
+            if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
+            if (self.dspark_pol != null) return self.dsparkPolicyStep(allocator, mdl);
+            return self.dsparkStep(allocator, dsv41_mod, mdl);
+        }
         return self.dsparkStep(allocator, dsv4_mod, self.xfm.dsv4.?);
+    }
+
+    var dspark_copy_off_cache: ?bool = null;
+    /// `MLX_SERVE_DSV4_DSPARK_COPY=0` drafts only from the stages (the A/B arm for copied continuations).
+    fn dsparkCopyOff() bool {
+        if (dspark_copy_off_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_DSV4_DSPARK_COPY");
+        const off = raw != null and raw.?[0] == '0';
+        dspark_copy_off_cache = off;
+        return off;
+    }
+
+    /// A DSpark round whose drafts are the context's own continuation after `t1` (an echo, an edit):
+    /// no stage forward, and up to `VERIFY_MAX_DRAFTS` drafts where the block holds `ds_block`.
+    /// Null when the context holds no copy worth verifying.
+    fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
+        if (dsparkCopyOff()) return null;
+        const t1 = self.next_token_id;
+        const idx = try self.mtpLookupIndex(allocator);
+        const found = idx.matchBest(t1, dsv41_mod.VERIFY_MAX_DRAFTS);
+        const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+        if (n == 0) return null;
+        const ids = try allocator.alloc(u32, n + 1);
+        ids[0] = t1;
+        @memcpy(ids[1..], found.?.draft[0..n]);
+        var copy: dsv41_mod.DsparkDraft = .{ .ids = ids, .len = n, .logits = &.{}, .confidence = &.{} };
+        defer copy.deinit(allocator);
+        const st = &mdl.dec_state.?;
+        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy)
+        else
+            try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
+        self.dspark_copies += 1;
+        self.dspark_copy_drafted += n;
+        self.dspark_copy_accepted += round.accepted;
+        return self.commitDsparkRound(allocator, round, st.n);
     }
 
     /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
@@ -4208,10 +4411,59 @@ pub const Generator = struct {
             self.max_tokens,
         );
         const round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap)
+            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null)
         else
             try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
         return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
+    }
+
+    /// A round the drafting backoff skipped: one tick of the serial pipeline. Consecutive ticks time the plain step.
+    fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        const tok = (try self.next(allocator)) orelse return null;
+        self.dspark_plain += 1;
+        const pol = &self.dspark_pol.?;
+        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
+        return try mtpSerialOneToken(allocator, tok);
+    }
+
+    /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
+    /// for (none = the trunk token alone), and teach the calibration and the drafting backoff what it bought.
+    fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
+        const watch = io_util.Stopwatch.init(self.timer.io);
+        const pol = &self.dspark_pol.?;
+        const st = &mdl.dec_state.?;
+        const t1 = self.next_token_id;
+        var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
+        defer d.deinit(allocator);
+        d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
+        else
+            try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+        for (d.confidence[0..d.len], 0..) |c, k| {
+            if (k > round.accepted) break;
+            pol.calib.observe(sigmoid(c), k < round.accepted);
+        }
+        self.dspark_stats.record(@intCast(d.len), round.accepted);
+        const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
+        pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
+        return self.commitDsparkRound(allocator, round, st.n);
+    }
+
+    fn sigmoid(x: f32) f32 {
+        return 1 / (1 + @exp(-x));
+    }
+
+    /// Drafts a DSpark round verifies: the prefix whose calibrated acceptance (the confidence head's logits through
+    /// `calib`) buys the most tokens per ms of verify, on the verify ladder scaled to this request's plain step.
+    pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.Calibration, plain_ms: f32) usize {
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        const n = @min(conf_logits.len, p.len);
+        for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
+        const costs = dflash_policy.priorCosts(plain_ms);
+        return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
     }
 
     /// A draft round's bookkeeping; the module stands at `position`.
@@ -4250,9 +4502,10 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32) !mod.DsparkRound {
+    /// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too).
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft) !mod.DsparkRound {
         const s = self.xfm.s;
-        var pending = try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
+        var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
         const b: u32 = @intCast(pending.b);
 
@@ -4686,9 +4939,9 @@ pub const Generator = struct {
                 if (!full_accept) {
                     const onehot = try pldOneHotRow(draft[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const lazy = self.sampleLazy(correction_logits);
@@ -4855,6 +5108,15 @@ pub const Generator = struct {
     ///      cache lands at exactly `+j+1`. Sample correction from the
     ///      *original* verify_logits[j] (the model's prediction at the
     ///      rejected position).
+    /// The sampling for a verify round's correction token (the bonus or the residual
+    /// draw after `accepted` drafts): keyed at that token's output position, so a
+    /// seeded request replays under every drafter and no two positions share a key.
+    fn correctionDraw(self: *const Generator, accepted: u32) SamplingParams {
+        var sp = self.sampling;
+        sp.draw = self.generated_ids.items.len + accepted + 2;
+        return sp;
+    }
+
     pub fn nextDrafter(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.drafter != null);
@@ -5154,9 +5416,9 @@ pub const Generator = struct {
                 if (accepted < m) {
                     const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 // Greedy: reuse the bulk-read argmax row. Already eval'd in
@@ -5416,7 +5678,10 @@ pub const Generator = struct {
         // drawn with the verify row's key, rows kept only while they match.
         const serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
         const stochastic = self.sampling.temperature > 0.01 and !serial;
-        if (m_draft == 0) return try self.dflashPlainRound(allocator, t1, serial, stochastic);
+        // Prefix snapshots keep assistant K/V without the LiLiCorr anchor.
+        // A plain round supplies a fresh committed row for the next draft.
+        if (m_draft == 0 or (model.lilicorr != null and dctx.anchor.ctx == null))
+            return try self.dflashPlainRound(allocator, t1, serial, stochastic);
         if (self.dflash_pol != null) if (try self.dflashCopyRound(allocator, t1, anchor_pos, kv_step_snap, serial, stochastic, tracing, &ph, dflash_kv_watch)) |res| return res;
         // DFlash2 path selector: when the sidecar ships one, drafts come from
         // the pairwise-scored path trace instead of per-position argmax /
@@ -5453,7 +5718,12 @@ pub const Generator = struct {
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
         // ALL rows starting at the anchor — so DSpark needs only m noise rows
         // for the same m drafts and the same verify width.
-        const noise_rows: u32 = if (model.config.anchor_row_drafts) m_draft else m_draft + 1;
+        const noise_rows: u32 = if (model.lilicorr != null)
+            model.config.block_size
+        else if (model.config.anchor_row_drafts)
+            m_draft
+        else
+            m_draft + 1;
         const noise_ids = try allocator.alloc(i32, noise_rows);
         defer allocator.free(noise_ids);
         noise_ids[0] = @intCast(t1);
@@ -5474,6 +5744,49 @@ pub const Generator = struct {
         }
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
         defer _ = mlx.mlx_array_free(draft_logits_all);
+
+        if (model.lilicorr) |*hd| {
+            const slots: u32 = model.config.block_size - 1;
+            if (m > slots) m = slots;
+            var slot_logits = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(slot_logits);
+            const vocab = mlx.getShape(draft_logits_all)[2];
+            const start = [_]c_int{ 0, 1, 0 };
+            const stop = [_]c_int{ 1, 1 + @as(c_int, @intCast(slots)), vocab };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&slot_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
+            const ids = try hd.draft(allocator, .{ .ctx = xfm, .call = embedTrunk }, dctx.anchor, blk_hidden, slot_logits, m);
+            defer allocator.free(ids);
+            const ids_i32 = try allocator.alloc(i32, m);
+            defer allocator.free(ids_i32);
+            for (ids, ids_i32) |v, *dst| dst.* = @intCast(v);
+            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
+            const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(host_arr);
+            var lili_ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(lili_ids);
+            try mlx.check(mlx.mlx_array_set(&lili_ids, host_arr));
+            if (tracing) {
+                try mlx.check(mlx.mlx_array_eval(lili_ids));
+                self.dflash_trace.add(.head, ph.read());
+                ph.reset();
+            }
+            return try self.dflashVerify(allocator, .{
+                .t1 = t1,
+                .m = m,
+                .m_draft = m_draft,
+                .anchor_pos = anchor_pos,
+                .kv_step_snap = kv_step_snap,
+                .serial = serial,
+                .stochastic = stochastic,
+                .tracing = tracing,
+                .ph = &ph,
+                .watch = dflash_kv_watch,
+                .draft_ids = lili_ids,
+                .sel_path = null,
+                .draft_q = .{ .ctx = null },
+            });
+        }
 
         // Slice the m draft rows: DFlash drops the anchor row (1..bs-1),
         // DSpark reads every row (0..m) — the anchor row IS draft 0.
@@ -5709,7 +6022,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         // Per-position SSM capture on a GDN trunk so partial accept can roll
@@ -5845,9 +6158,9 @@ pub const Generator = struct {
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
-                    break :blk try sampleResidual(probs, q_row, s);
+                    break :blk try sampleResidual(probs, q_row, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const argmax_data = try verify_argmax.ids(1 + m);
@@ -6051,7 +6364,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
         const forward = xfm.forwardWith(&self.ctx, t1_arr);
@@ -6071,7 +6384,7 @@ pub const Generator = struct {
                 const probs = try probsAtLastPos(logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
                 try mlx.check(mlx.mlx_async_eval(eval_vec));
-                break :blk try sampleFromProbs(probs, s);
+                break :blk try sampleFromProbs(probs, self.correctionDraw(0), s);
             }
             picked = if (serial) try self.verifySerialSamples(logits, 1) else try verifyArgmax(logits, self.sampling.suppress_mask, s);
             _ = mlx.mlx_vector_array_append_value(eval_vec, picked.lazy());
@@ -6121,7 +6434,7 @@ pub const Generator = struct {
             allocator.free(caps);
         }
         for (caps) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = caps };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = caps };
         self.ctx.capture_layers = &cl;
         defer self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false; // one row never rolls back
@@ -6369,7 +6682,7 @@ pub const Generator = struct {
             allocator.free(cap_out);
         }
         for (cap_out) |*a| a.* = mlx.mlx_array_new();
-        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.captureIds(), .out = cap_out };
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
@@ -13252,20 +13565,21 @@ fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     return v;
 }
 
-/// Sample one token from probability distribution `probs` (shape `[B, V]`).
+/// Sample one token from probability distribution `probs` (shape `[B, V]`) with
+/// the request's key (`seedKey`: a seeded request replays, `draw` = the position).
 /// Returns a u32 token id (caller can append directly).
-fn sampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleFromProbs(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     // mlx_random_categorical takes logits and applies softmax. Feed log(probs)
     // so the categorical's softmax recovers the original distribution.
     var log_probs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(log_probs);
     try mlx.check(mlx.mlx_log(&log_probs, probs, s));
 
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
     var sampled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sampled);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, null_key, s));
+    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, key, s));
     try mlx.check(mlx.mlx_array_eval(sampled));
     var v: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&v, sampled));
@@ -13539,7 +13853,7 @@ fn lazyOneHotRow(id: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_ar
 /// renormalized. Used on stochastic-verify reject so the corrected token
 /// preserves the target distribution (per Leviathan et al. speculative
 /// decoding paper).
-fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     var diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(diff);
     try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
@@ -13550,7 +13864,7 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
     defer _ = mlx.mlx_array_free(residual);
     try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
 
-    return sampleFromProbs(residual, s);
+    return sampleFromProbs(residual, sampling, s);
 }
 
 /// Lazy categorical sample from an already-filtered probability row
@@ -14989,11 +15303,10 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         _ = mlx.mlx_array_free(penalized);
     };
 
-    const needs_penalty = (sampling.repeat_penalty != 1.0 or sampling.presence_penalty != 0.0);
-    if (needs_penalty) {
+    if (sampling.penalized()) {
         if (generated_ids) |ids| {
             if (ids.len > 0) {
-                try applyRepeatPenalty(&penalized, current, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+                try applyPenalties(&penalized, current, ids, sampling, s);
                 current = penalized;
                 penalized_owned = true;
             }
@@ -15566,102 +15879,64 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bou
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
-/// Apply repeat penalty to already-generated tokens.
-/// Uses pure MLX GPU ops — no CPU readback, preserves lazy evaluation graph.
-fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
+/// Penalties over the tokens generated so far: `repeat_penalty` divides a positive logit and
+/// multiplies a negative one; `presence_penalty` is subtracted once per seen id and
+/// `frequency_penalty` once per occurrence (OpenAI's definition).
+fn applyPenalties(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, sampling: SamplingParams, s: mlx.mlx_stream) !void {
     const shape = mlx.getShape(logits);
     const vocab_size: usize = @intCast(shape[shape.len - 1]);
-
-    // Collect unique token ids
-    var seen_set = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
-    defer seen_set.deinit();
-    for (generated_ids) |id| {
-        if (id < vocab_size) {
-            seen_set.put(id, {}) catch continue;
-        }
-    }
-
-    if (seen_set.count() == 0) return;
-
-    // Build boolean mask: true at positions of seen tokens
-    const mask_data = try std.heap.page_allocator.alloc(u8, vocab_size);
-    defer std.heap.page_allocator.free(mask_data);
-    @memset(mask_data, 0);
-
-    var it = seen_set.keyIterator();
-    while (it.next()) |id_ptr| {
-        mask_data[id_ptr.*] = 1;
-    }
-
     const arr_shape = [_]c_int{ 1, @intCast(vocab_size) };
-    const mask_arr = mlx.mlx_array_new_data(mask_data.ptr, &arr_shape, 2, .bool_);
-    defer _ = mlx.mlx_array_free(mask_arr);
 
-    var current = logits;
-
-    // Repeat penalty: multiply seen tokens by 1/penalty (positive) or penalty (negative)
-    // This is equivalent to: where(mask & logits > 0, logits / penalty, where(mask, logits * penalty, logits))
-    // Simplified: where(mask, where(logits > 0, logits / penalty, logits * penalty), logits)
-    var penalized = mlx.mlx_array_new();
-    var penalized_owned = false;
-    defer if (penalized_owned) {
-        _ = mlx.mlx_array_free(penalized);
+    // Occurrences per id; reused below for what each id loses.
+    const table = try std.heap.page_allocator.alloc(f32, vocab_size);
+    defer std.heap.page_allocator.free(table);
+    @memset(table, 0);
+    for (generated_ids) |id| if (id < vocab_size) {
+        table[id] += 1;
     };
 
-    if (repeat_penalty != 1.0) {
-        const rp = mlx.mlx_array_new_float(repeat_penalty);
+    var current = logits;
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    if (sampling.repeat_penalty != 1.0) {
+        const counts = mlx.mlx_array_new_data(table.ptr, &arr_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(counts);
+        const rp = mlx.mlx_array_new_float(sampling.repeat_penalty);
         defer _ = mlx.mlx_array_free(rp);
-        const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
+        const inv_rp = mlx.mlx_array_new_float(1.0 / sampling.repeat_penalty);
         defer _ = mlx.mlx_array_free(inv_rp);
         const zero = mlx.mlx_array_new_float(0.0);
         defer _ = mlx.mlx_array_free(zero);
 
-        // positive_mask = logits > 0
-        var positive_mask = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(positive_mask);
-        try mlx.check(mlx.mlx_greater(&positive_mask, current, zero, s));
-
-        // penalized_positive = logits * (1/penalty)
+        var seen = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(seen);
+        try mlx.check(mlx.mlx_greater(&seen, counts, zero, s));
+        var positive = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(positive);
+        try mlx.check(mlx.mlx_greater(&positive, logits, zero, s));
         var pen_pos = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pen_pos);
-        try mlx.check(mlx.mlx_multiply(&pen_pos, current, inv_rp, s));
-
-        // penalized_negative = logits * penalty
+        try mlx.check(mlx.mlx_multiply(&pen_pos, logits, inv_rp, s));
         var pen_neg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pen_neg);
-        try mlx.check(mlx.mlx_multiply(&pen_neg, current, rp, s));
-
-        // sign_selected = where(positive, logits/penalty, logits*penalty)
+        try mlx.check(mlx.mlx_multiply(&pen_neg, logits, rp, s));
         var sign_selected = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sign_selected);
-        try mlx.check(mlx.mlx_where(&sign_selected, positive_mask, pen_pos, pen_neg, s));
-
-        // result = where(mask, sign_selected, logits)
-        try mlx.check(mlx.mlx_where(&penalized, mask_arr, sign_selected, current, s));
-        current = penalized;
-        penalized_owned = true;
+        try mlx.check(mlx.mlx_where(&sign_selected, positive, pen_pos, pen_neg, s));
+        try mlx.check(mlx.mlx_where(&scaled, seen, sign_selected, logits, s));
+        current = scaled;
     }
 
-    // Presence penalty: subtract from seen tokens
-    if (presence_penalty != 0.0) {
-        const pp = mlx.mlx_array_new_float(presence_penalty);
-        defer _ = mlx.mlx_array_free(pp);
-
-        // Cast mask to float for arithmetic
-        var mask_float = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mask_float);
-        try mlx.check(mlx.mlx_astype(&mask_float, mask_arr, .float16, s));
-
-        // subtract = mask * presence_penalty
-        var subtract = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(subtract);
-        try mlx.check(mlx.mlx_multiply(&subtract, mask_float, pp, s));
-
-        // result = current - subtract
-        try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
-    } else {
+    if (sampling.presence_penalty == 0.0 and sampling.frequency_penalty == 0.0) {
         try mlx.check(mlx.mlx_copy(res, current, s));
+        return;
     }
+    for (table) |*v| if (v.* > 0) {
+        v.* = sampling.presence_penalty + sampling.frequency_penalty * v.*;
+    };
+    const subtract = mlx.mlx_array_new_data(table.ptr, &arr_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(subtract);
+    try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
 }
 
 /// Greedy argmax over the last axis.
@@ -15704,6 +15979,20 @@ test "SamplingParams custom values" {
     try testing.expectApproxEqAbs(@as(f32, 0.9), params.top_p, 0.001);
     try testing.expectEqual(@as(u32, 40), params.top_k);
     try testing.expectEqual(@as(u64, 42), params.seed.?);
+}
+
+test "frequency_penalty subtracts per occurrence, presence_penalty once, and neither scales a logit" {
+    const s = mlx.gpuStream();
+    var data = [_]f32{ 2, 2, 2, 2, 2, -2, 2, 2 };
+    const logits = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 8 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try applyPenalties(&out, logits, &.{ 3, 3, 5 }, .{ .frequency_penalty = 0.5, .presence_penalty = 0.25 }, s);
+    try mlx.check(mlx.mlx_array_eval(out));
+    const got = mlx.mlx_array_data_float32(out).?[0..8];
+    try testing.expectEqualSlices(f32, &.{ 2, 2, 2, 0.75, 2, -2.75, 2, 2 }, got);
+    try testing.expect((SamplingParams{ .frequency_penalty = 0.5 }).penalized());
 }
 
 test "specDecodeUnsupported: release-enforced guard for spec + constraint/logprobs (issue #97)" {
@@ -15810,7 +16099,7 @@ test "argmax with negative values" {
     try testing.expectEqual(@as(u32, 3), result); // index 3 has value -0.5 (highest)
 }
 
-test "applyRepeatPenalty reduces seen token logits" {
+test "applyPenalties reduces seen token logits" {
     const s = mlx.gpuStream();
     // logits: [1.0, 2.0, 3.0, 4.0, 5.0]
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
@@ -15823,7 +16112,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -15839,7 +16128,7 @@ test "applyRepeatPenalty reduces seen token logits" {
     try testing.expectApproxEqAbs(@as(f32, 5.0), res_data[4], 0.01);
 }
 
-test "applyRepeatPenalty with negative logits" {
+test "applyPenalties with negative logits" {
     const s = mlx.gpuStream();
     // Mix of positive and negative logits
     const data = [_]f32{ -2.0, 3.0, -1.0, 4.0 };
@@ -15852,7 +16141,7 @@ test "applyRepeatPenalty with negative logits" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -15866,7 +16155,7 @@ test "applyRepeatPenalty with negative logits" {
     try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty presence penalty" {
+test "applyPenalties presence penalty" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const shape = [_]c_int{ 1, 4 };
@@ -15877,7 +16166,7 @@ test "applyRepeatPenalty presence penalty" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 1.0, 0.5, s);
+    try applyPenalties(&res, logits, &generated, .{ .presence_penalty = 0.5 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -15891,7 +16180,7 @@ test "applyRepeatPenalty presence penalty" {
     try testing.expectApproxEqAbs(@as(f32, 4.0), res_data[3], 0.01);
 }
 
-test "applyRepeatPenalty combined penalties" {
+test "applyPenalties combined penalties" {
     const s = mlx.gpuStream();
     const data = [_]f32{ 2.0, -1.0, 3.0 };
     const shape = [_]c_int{ 1, 3 };
@@ -15902,7 +16191,7 @@ test "applyRepeatPenalty combined penalties" {
     var res = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(res);
 
-    try applyRepeatPenalty(&res, logits, &generated, 2.0, 1.0, s);
+    try applyPenalties(&res, logits, &generated, .{ .repeat_penalty = 2.0, .presence_penalty = 1.0 }, s);
     try mlx.check(mlx.mlx_array_eval(res));
 
     const res_data = mlx.mlx_array_data_float32(res).?;
@@ -16808,7 +17097,7 @@ fn walkChunkEnds(
     var n: usize = 0;
     while (pos < prefix_len and n < out.len) {
         const w = widths[@min(n, widths.len - 1)];
-        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true);
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true, false);
         out[n] = end;
         n += 1;
         pos = end;
@@ -16902,8 +17191,8 @@ test "tailMergeMax: the tail a chunk may absorb scales with the width" {
         try t.expect(tailMergeMax(w) * 8 <= w);
     }
 
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
@@ -16919,15 +17208,15 @@ test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
     try t.expectEqual(tailMergeMaxFor(4096, false), tailMergeMaxFor(4096, true));
     try t.expectEqual(tailMergeMaxFor(8192, false), tailMergeMaxFor(8192, true));
 
-    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true, false));
 
-    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
-    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false, false));
+    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true, false));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
@@ -16936,39 +17225,142 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
     // Without checkpoint alignment, remainders under the merge floor extend
     // the current chunk instead.
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false, false));
     // A substantial remainder stays its own chunk.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false, false));
     // Mid-prompt chunks are untouched.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false, false));
     // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
     // 1-token trailing chunk existed only to lay a snapshot one token before
     // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
     // INSIDE the chunk still wins over merging (next case).
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false));
-    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false, false));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false, false));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false, false));
     // Tail merge: one token past a chunk boundary is still ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false));
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false, false));
     // Mechanically, a raw fine stride still splits an 851-token prefill into 4
     // chunks (851 spans boundaries 256/512/768) — which is why
     // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
     // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
     // fixed overhead everywhere) taxed cold prefill 17-25%.
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false, false));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false, false));
+}
+
+test "the gated dense low grid anchors the first 65536 under a coarse stride" {
+    // Gated on `longCtxGated` (#794): the capture predicate is stride multiples
+    // plus the 8192 anchors under the dense low top, so a deep entry's grid
+    // always answers a restore point for a fork inside the low band.
+    try testing.expect(ssmCapturePos(32_768, 8_192, true));
+    try testing.expect(ssmCapturePos(32_768, 24_576, true));
+    try testing.expect(ssmCapturePos(32_768, 32_768, true)); // stride multiple — same point as before
+    try testing.expect(ssmCapturePos(32_768, 65_536, true)); // the top itself still counts
+    try testing.expect(!ssmCapturePos(32_768, 40_959, true));
+    try testing.expect(!ssmCapturePos(32_768, 73_728, true)); // the high band keeps the coarse spacing
+    try testing.expect(!ssmCapturePos(0, 8_192, false)); // checkpointing off stays off
+    // A stride at or under 8192 (v8's dense grid) captures EXACTLY what it always
+    // did: the dense rule adds no point to a grid that already has this spacing.
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var x: usize = 0;
+        while (x <= 70_000) : (x += 1_023) {
+            try testing.expectEqual(x % fine == 0, ssmCapturePos(fine, x, true));
+        }
+    }
+    // Chunking drives the grid: a cold 40k prefill at width 4096 under stride
+    // 32768 (the production boot's coarsening) now snapshots exactly the four low
+    // points — driven through `nextChunkEnd`, the same fn the real prefill loop
+    // runs. (A prompt ending within the tail-merge floor of a multiple merges
+    // that boundary into the always-on end-of-prompt snapshot instead — the
+    // end snapshot at `prefix_len - 30` covers every fork the swallowed point
+    // could have served.)
+    var grid: [64]u32 = undefined;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (true) {
+        const end = nextChunkEnd(pos, 40_000, 4_096, true, 32_768, 0, false, true);
+        if (ssmCapturePos(32_768, end, true)) {
+            grid[n] = @intCast(end);
+            n += 1;
+        }
+        pos = end;
+        if (pos >= 40_000) break;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(u32, 8_192), grid[0]);
+    try testing.expectEqual(@as(u32, 16_384), grid[1]);
+    try testing.expectEqual(@as(u32, 24_576), grid[2]);
+    try testing.expectEqual(@as(u32, 32_768), grid[3]);
+    // The coarse-stride prefill chunks EXACTLY like the v8 fine grid for this
+    // prompt: same boundaries, so the dense anchors cost zero extra chunks.
+    try testing.expectEqual(
+        prefillChunkCount(40_000, 4_096, true, 8_192, 0, false, true),
+        prefillChunkCount(40_000, 4_096, true, 32_768, 0, false, true),
+    );
+    // A chunk WIDER than the anchor spacing gets cut at the anchor (the snapshot
+    // may only stamp evaluated positions): a 32k-wide chunk from 6k ends at 8192.
+    try testing.expectEqual(@as(usize, 8_192), nextChunkEnd(6_000, 40_000, 32_768, true, 32_768, 0, false, true));
+    try testing.expectEqual(@as(usize, 16_384), nextChunkEnd(8_192, 40_000, 32_768, true, 32_768, 0, false, true));
+    // Inside the dense band the FIRST anchor wins the cut, ahead of any later
+    // stride boundary: a 32k-wide chunk from 40k ends at 40960, not 65536.
+    try testing.expectEqual(@as(usize, 40_960), nextChunkEnd(40_000, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Past the top the cut stops and the high band keeps the coarse stride alone.
+    try testing.expectEqual(@as(usize, 98_304), nextChunkEnd(65_536, 100_000, 32_768, true, 32_768, 0, false, true));
+    // Fine strides never get an extra cut: the helper answers 0 at every stride
+    // the dense rule is inactive for, whatever the chunk geometry.
+    for ([_]usize{ 0, 256, 512, 1024, 2048, 4096, 8192 }) |fine| {
+        var p: usize = 1_234;
+        while (p < 70_000) : (p += 3_037) {
+            try testing.expectEqual(@as(usize, 0), ssmLowAnchorEnd(p, p + 4_096, 61, fine));
+        }
+    }
+}
+
+test "the dense low grid is gated: a non-gated arch at width 16384 keeps main's chunk count" {
+    // Same gate as the retention `ssm_low_anchors`: a non-gated hybrid whose
+    // stride coarsened to 16384 keeps its stride-boundary chunking — a warm
+    // restore landing off the 8192 grid must not get its chunks cut at every
+    // multiple below 65536 (each extra MoE chunk re-streams the experts).
+    // `main`'s chunk loop, re-derived here: cut at a stride boundary inside
+    // the chunk, else absorb a tail under `TAIL_MERGE_MAX`.
+    const t = testing;
+    const stride = effectiveSsmCheckpointStride(2048, 16_384);
+    try t.expectEqual(@as(usize, 16_384), stride);
+    const offset = 4_096; // off the anchor grid: a warm restore mid-sequence
+    const prefix_len: usize = 100_000 - offset;
+    var main_chunks: usize = 0;
+    var pos: usize = 0;
+    while (pos < prefix_len) {
+        var end: usize = @min(pos + stride, prefix_len);
+        const abs_pos: usize = pos + offset;
+        const abs_end: usize = end + offset;
+        const nb: usize = ((abs_pos / stride) + 1) * stride;
+        if (nb > abs_pos and nb < abs_end) end = nb - offset;
+        if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) end = prefix_len;
+        main_chunks += 1;
+        pos = end;
+    }
+    // Ungated: the count is main's, at fixed and adaptive width alike.
+    try t.expect(main_chunks > 0);
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, false, false));
+    try t.expectEqual(main_chunks, prefillChunkCount(prefix_len, stride, true, stride, offset, true, false));
+    // Gated (the long-context line): the anchor cuts are paid — the first
+    // wide chunk is cut at abs 8192, and the anchor point captures.
+    try t.expectEqual(@as(usize, 4_096), nextChunkEnd(0, prefix_len, stride, true, stride, offset, false, true));
+    try t.expect(!ssmCapturePos(stride, 8_192, false));
+    try t.expect(ssmCapturePos(stride, 8_192, true));
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
@@ -17179,10 +17571,10 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
     // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
     // on dense hybrids — the llm_context_benchmarks small-prompt regression).
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
 test "vision prefill checkpoints SSM state only when it chunks like text" {
@@ -17200,14 +17592,14 @@ test "vision prefill checkpoints SSM state only when it chunks like text" {
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
         prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 
     const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
     try testing.expect(text_checkpoints);
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false, false),
     );
 }
 
@@ -20049,7 +20441,6 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     }
 }
 
-
 test "nextDraw: each stochastic DSpark round takes a fresh draw of the request's seed" {
     var gen: Generator = undefined;
     gen.sampling = .{ .temperature = 0.6, .seed = 7, .draw = 5 };
@@ -20525,6 +20916,60 @@ test "logprobs publish through the one-token delay, never straight from sampleTo
         }
     }
     try testing.expect(seen >= 1);
+}
+
+test "lilicorr missing restored anchor takes a plain round and recovers it" {
+    if (mlx.noGpuBackend()) return;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var trunk_tmp = testing.tmpDir(.{});
+    defer trunk_tmp.cleanup();
+    var asst_tmp = testing.tmpDir(.{});
+    defer asst_tmp.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_len = try trunk_tmp.dir.realPath(io, &trunk_buf);
+    const trunk_path = trunk_buf[0..trunk_len];
+    var asst_buf: [512]u8 = undefined;
+    const asst_len = try asst_tmp.dir.realPath(io, &asst_buf);
+    const asst_path = asst_buf[0..asst_len];
+    try dflash_mod.TinyFix.writeTrunk(io, trunk_tmp.dir, trunk_path, s);
+    try dflash_mod.TinyFix.writeAssistant(io, asst_tmp.dir, asst_path, s);
+    var cfg = try model_mod.parseConfig(io, a, trunk_path);
+    var weights = try model_mod.loadWeights(io, a, trunk_path);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&cfg, &weights);
+    var xfm = try Transformer.init(io, a, cfg, &weights);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, a, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5 };
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, 8, .{ .temperature = 0 }, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(a);
+    // A restored context has its K/V but no LiLiCorr anchor row.
+    try asst_tmp.dir.writeFile(io, .{ .sub_path = "fixture.safetensors", .data = @embedFile("fixtures/lilicorr_fp32.safetensors") });
+    const path = try std.fmt.allocPrint(a, "{s}/fixture.safetensors", .{asst_path});
+    defer a.free(path);
+    var fx = try model_mod.loadWeightsSingleFile(a, path);
+    defer fx.deinit();
+    dm.lilicorr = try lilicorr_mod.load(a, &fx, s, .{ .top_k = 3, .hidden = 8, .trunk = 12, .heads = 2, .slots = 3, .layers = 2, .factor = 6, .vector_eps = 0.0001, .logit_scale = 8, .rms_eps = 1e-6 });
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx == null);
+    const pending = gen.next_token_id;
+    const step = (try gen.nextDflash(a)).?;
+    defer a.free(step.tokens);
+    try testing.expectEqualSlices(u32, &[_]u32{pending}, step.tokens);
+    try testing.expectEqual(@as(u32, 0), step.accepted_tokens);
+    try testing.expectEqual(@as(u32, 1), gen.dflash_plain);
+    try testing.expect(!gen.spec_disabled_runtime);
+    try gen.dflashFlushPending(a);
+    try testing.expect(gen.dflash_ctx.?.anchor.ctx != null);
+    try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
 }
 
 test "dflash: nextDflash greedy equals serial decode, invariants exact each round" {
@@ -21773,6 +22218,30 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
     }.f;
     try testing.expectEqual(@as(?u32, 136), run(false)); // the arm-once schedule
     try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
+}
+
+test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone, a doubt mid-block cuts there" {
+    const G = Generator;
+    var calib = dflash_policy.Calibration{};
+    try testing.expectEqual(@as(usize, 5), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 0, 0, 0, 0, 0 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 2), G.dsparkVerifyDrafts(&.{ 9, 9, -4, 9, 9 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{}, &calib, 17.6));
+    // A head that keeps claiming certainty the trunk rejects stops buying rows.
+    for (0..40) |_| calib.observe(G.sigmoid(9), false);
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+}
+
+test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
+    // A round that commits few tokens for its cost loses to the plain step (costs in ms).
+    var prose = dflash_policy.Drafting{};
+    try testing.expect(prose.shouldDraft());
+    prose.record(3.2 * 17.6, 66);
+    try testing.expect(!prose.shouldDraft());
+    var echo = dflash_policy.Drafting{};
+    try testing.expect(echo.shouldDraft());
+    echo.record(5.5 * 17.6, 70);
+    try testing.expect(echo.shouldDraft());
 }
 
 test "mtpSerialProbeEarned: a sidecar head probes only after a run of low-acceptance rounds" {
@@ -23222,6 +23691,37 @@ test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows"
     }
 }
 
+test "a seeded correction draw replays: same seed and position, same token; positions differ" {
+    // Bar: the bonus/residual draw of a verify round is keyed like every other draw.
+    const s = mlx.gpuStream();
+    const v: c_int = 64;
+    var vals: [64]f32 = undefined;
+    var sum: f32 = 0;
+    for (&vals, 0..) |*x, i| {
+        x.* = 1.0 / @as(f32, @floatFromInt(i + 1));
+        sum += x.*;
+    }
+    for (&vals) |*x| x.* /= sum;
+    const shape = [_]c_int{ 1, v };
+    const probs = mlx.mlx_array_new_data(&vals, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const onehot = try pldOneHotRow(0, v, s);
+    defer _ = mlx.mlx_array_free(onehot);
+
+    var distinct = false;
+    var prev: ?u32 = null;
+    for (0..16) |d| {
+        const sp: SamplingParams = .{ .seed = 11, .draw = d };
+        const a = try sampleFromProbs(probs, sp, s);
+        try testing.expectEqual(a, try sampleFromProbs(probs, sp, s));
+        try testing.expectEqual(try sampleResidual(probs, onehot, sp, s), try sampleResidual(probs, onehot, sp, s));
+        try testing.expect(try sampleResidual(probs, onehot, sp, s) != 0); // the rejected draft is never redrawn
+        if (prev) |q| distinct = distinct or q != a;
+        prev = a;
+    }
+    try testing.expect(distinct);
+}
+
 test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -23539,6 +24039,7 @@ test "repeat penalty shapes every sampling path, not only the logprobs one" {
 }
 
 test "keyed sampling draws the softmax distribution" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
     var logv: [4]f32 = undefined;

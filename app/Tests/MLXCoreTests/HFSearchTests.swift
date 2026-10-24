@@ -732,6 +732,15 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertNil(m.incompatibleReason)
     }
 
+    func testNemotronVariantTagsAreSupportedArchitectures() {
+        for type in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = mlx(id: "org/Nemotron-MLX-4bit",
+                            tags: ["mlx", "safetensors", type, "image-text-to-text"])
+            XCTAssertTrue(model.isSupportedArchitecture, "\(type) must be recognized in search")
+            XCTAssertNil(model.incompatibleReason)
+        }
+    }
+
     func testGlm5NextIsSupportedButOtherGlmIsNot() {
         // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
         for type in ["glm5_next", "glm5_next_text"] {
@@ -739,7 +748,7 @@ final class HFModelQuantGateTests: XCTestCase {
             XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
                               tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
         }
-        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are other architectures we do not serve.
+        // GLM-5 (glm_moe_dsa) loads only from an mlx-stream pack, so the search does not offer it; GLM-4 MoE is not served.
         XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
         XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
     }
@@ -764,7 +773,7 @@ final class HFModelQuantGateTests: XCTestCase {
                            "bonsai", "text-generation", "conversational"])
         XCTAssertTrue(m.isSupportedArchitecture)
         XCTAssertNil(m.incompatibleReason)
-        for type in supportedModelTypes {
+        for type in supportedModelTypes.subtracting(streamOnlyModelTypes) {
             XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
                           "a repo tagged with served model_type \"\(type)\" reads as unsupported")
         }

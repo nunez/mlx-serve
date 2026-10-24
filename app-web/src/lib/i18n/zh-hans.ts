@@ -115,6 +115,12 @@ const ZH: Record<string, string> = {
   "10 seconds to 10 minutes. The new track will have the same length.":
     "10 秒到 10 分钟。新音轨将保持相同时长。",
   "1024 × 1024 (square)": "1024 × 1024（方形）",
+  "1248 × 1248 (square, 1.5 MP)": "1248 × 1248（方形，150 万像素）",
+  "1456 × 1456 (square, 2 MP)": "1456 × 1456（方形，200 万像素）",
+  "1360 × 768 (landscape 16:9)": "1360 × 768（横版 16:9）",
+  "768 × 1360 (portrait 9:16)": "768 × 1360（竖版 9:16）",
+  "1936 × 1088 (landscape 16:9, 2 MP)": "1936 × 1088（横版 16:9，200 万像素）",
+  "1088 × 1936 (portrait 9:16, 2 MP)": "1088 × 1936（竖版 9:16，200 万像素）",
   "1024 × 1024 (square) · ~6s": "1024 × 1024（方形）· 约 6 秒",
   "1024 × 1536 (portrait 2:3)": "1024 × 1536（竖版 2:3）",
   "105 — mid-tempo pop": "105 —— 中速流行",
@@ -509,6 +515,8 @@ const ZH: Record<string, string> = {
   "Follow the system setting, or force light/dark for this app only.":
     "跟随系统设置，或仅为本应用强制浅色/深色。",
   Frames: "帧数",
+  "Each model loading now: phase, done of total and seconds left":
+    "正在加载的每个模型：阶段、已完成/总数与剩余秒数",
   "Free a model's memory now": "立即释放某个模型占用的内存",
   French: "法语",
   "From a depth map": "从深度图生成",

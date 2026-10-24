@@ -65,6 +65,8 @@ class AppState: ObservableObject {
                         // Register-by-path failed (unsupported arch, partial
                         // download) or the load 503'd (memory) — a full
                         // restart with only the new model is the net.
+                        // A later switch, or a remote pick since, owns the server now.
+                        guard self.modelSwitchGeneration == generation, mgr.lanChatModelId == nil else { return }
                         print("[AppState] hot-switch failed (\(error)) — falling back to restart")
                         mgr.stop()
                         mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
@@ -255,6 +257,8 @@ class AppState: ObservableObject {
     @Published var documentIndexes: [UUID: DocumentIndex] = [:]
     let testServer = TestServer()
     lazy var imageGen = ImageGenService()
+    /// `mlx-serve worker` while Settings ▸ Cluster makes this Mac a worker.
+    let clusterWorker = ClusterWorker()
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
     lazy var musicGen: MusicGenService = {
@@ -294,6 +298,7 @@ class AppState: ObservableObject {
     @Published var serverOptions: ServerOptions {
         didSet {
             serverOptions.save()
+            clusterWorker.reconcile(serverOptions)
             // Reconcile the Telegram bridge whenever options change (cheap no-op
             // unless the bot token / enabled flag actually moved).
             telegramBridge.reconcile()
@@ -554,6 +559,8 @@ class AppState: ObservableObject {
     /// Runs unattended scheduled/on-demand agent tasks (the "claw" spine). Lazily
     /// created so it only spins up the first time the Tasks window is opened.
     lazy var taskScheduler = TaskScheduler(appState: self)
+    /// Asks to join a Mac on the network that waits for a Thunderbolt pair.
+    let pairInvites = PairInvites()
 
     /// The persistent, window-independent voice assistant. Owned here (not in a
     /// view) so it survives chat-window open/close and runs from the menu-bar
@@ -605,6 +612,7 @@ class AppState: ObservableObject {
         self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
             .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
+        clusterWorker.reconcile(opts)
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -636,6 +644,7 @@ class AppState: ObservableObject {
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self
         taskScheduler.start()
+        if Bundle.main.bundleURL.pathExtension == "app" { pairInvites.start(appState: self) }
         if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {
             testServer.start(appState: self)
         }
@@ -752,7 +761,7 @@ class AppState: ObservableObject {
     /// LAN), else headless over the models root. Launch passes its plan's choice.
     func ensureServerForLan(modelPath: String? = nil) {
         guard server.status != .running, server.status != .starting else { return }
-        let path = modelPath ?? selectedModelPath
+        let path = modelPath ?? server.localChatLoadPath(selectedPath: selectedModelPath) ?? ""
         if !path.isEmpty {
             server.start(modelPath: path, options: serverOptions)
         } else {
@@ -766,8 +775,7 @@ class AppState: ObservableObject {
     func startServer(loadingSelection: Bool) {
         guard server.status != .running, server.status != .starting else { return }
         server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
-        guard loadingSelection, !selectedModelPath.isEmpty else { return }
-        let path = selectedModelPath
+        guard loadingSelection, let path = server.localChatLoadPath(selectedPath: selectedModelPath) else { return }
         let mgr = server
         modelSwitchGeneration += 1
         let generation = modelSwitchGeneration

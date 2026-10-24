@@ -114,10 +114,52 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sdpa-head-dim-256-512.patch"
   fi
   echo "== patch mlx: CUDA quantized matmul reads the weights once for all rows and batches"
-  if grep -q 'can_use_qmv && (M \* B == 1)' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
+  if grep -q 'fold the batches into rows' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
     echo "   qmm: already applied"
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
+  fi
+  echo "== patch mlx: CUDA sorted expert gather (upstream #4554)"
+  if grep -q 'gather_qmm_rhs_sm80' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
+    echo "   gather qmm rhs: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-gather-qmm-rhs.patch"
+  fi
+  echo "== patch mlx: CUDA mat-vec rows kernel (GB10 default, MLX_CUDA_QMV_MAX_ROWS)"
+  if grep -q 'qmv_rows_kernel' "$MLX_SOURCE/mlx/backend/cuda/quantized/qmm/qmv.cu"; then
+    echo "   qmv rows: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmv-rows.patch"
+  fi
+  echo "== patch mlx: CUDA decode mat-vecs read 16 bytes per load, top-k gathers take them"
+  if [[ -f "$MLX_SOURCE/mlx/backend/cuda/gemms/row_dot.cuh" ]]; then
+    echo "   decode mat-vec: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-row-dot-matvec.patch"
+  fi
+  echo "== patch mlx: CUDA sorted expert gather schedules CTAs per expert"
+  if grep -q 'qmm_sm80_expert_kernel' "$MLX_SOURCE/mlx/backend/cuda/device/qmm_sm80.cuh"; then
+    echo "   per-expert gather: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sorted-gather-experts.patch"
+  fi
+  echo "== patch mlx: CUDA graphs switch at runtime (mlx_cuda_set_graphs)"
+  if grep -q 'mlx_cuda_set_graphs' "$MLX_SOURCE/mlx/backend/cuda/device.cpp"; then
+    echo "   graphs switch: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-graphs-switch.patch"
+  fi
+  echo "== patch mlx: CUDA sorted expert mat-vec loads each expert once per run of rows"
+  if grep -q 'row_dot_sorted_kernel' "$MLX_SOURCE/mlx/backend/cuda/gemms/row_dot.cuh"; then
+    echo "   sorted mat-vec: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sorted-gather-matvec.patch"
+  fi
+  echo "== patch mlx: CUDA custom kernels go to the disk kernel cache too"
+  if grep -q 'hashes the generated source' "$MLX_SOURCE/mlx/backend/cuda/custom_kernel.cpp"; then
+    echo "   custom-kernel disk cache: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-custom-kernel-disk-cache.patch"
   fi
 fi
 

@@ -63,6 +63,11 @@ enum SettingsReset {
                 f("lanSharedModels") { $0.lanSharedModels = $1.lanSharedModels },
                 f("lanDiscoverEnabled") { $0.lanDiscoverEnabled = $1.lanDiscoverEnabled },
                 f("lanName") { $0.lanName = $1.lanName },
+                f("clusterRole") { $0.clusterRole = $1.clusterRole },
+                f("clusterMode") { $0.clusterMode = $1.clusterMode },
+                f("clusterModelPath") { $0.clusterModelPath = $1.clusterModelPath },
+                f("clusterDevice") { $0.clusterDevice = $1.clusterDevice },
+                f("clusterCoordinator") { $0.clusterCoordinator = $1.clusterCoordinator },
             ]
 
         case .specDecode:
@@ -105,6 +110,8 @@ enum SettingsReset {
                 f("aneImage") { $0.aneImage = $1.aneImage },
                 f("aneVideo") { $0.aneVideo = $1.aneVideo },
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
+                f("w8a8") { $0.w8a8 = $1.w8a8 },
+                f("aneSlots") { $0.aneSlots = $1.aneSlots },
             ]
 
         case .engines:

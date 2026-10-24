@@ -26,6 +26,19 @@ pub fn nowMsMonotonic(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .boot).toMilliseconds();
 }
 
+/// `nowMsMonotonic` in microseconds.
+pub fn nowUsMonotonic(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .boot).toMicroseconds();
+}
+
+/// `nowMsMonotonic` as a value, for code that takes its clock as a parameter so a test can step it.
+pub const MonotonicClock = struct {
+    io: std.Io,
+    pub fn nowMs(self: MonotonicClock) i64 {
+        return nowMsMonotonic(self.io);
+    }
+};
+
 /// Drop-in replacement for `std.time.Timer` — uses the `boot` clock, which
 /// counts wall-time across pmset sleep (vs `.awake`, which stops during
 /// suspend). Important for long-running stopwatches that span a lid close.

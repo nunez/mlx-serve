@@ -1,5 +1,7 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
+const mlx = @import("mlx.zig");
 const is_macos = builtin.os.tag == .macos;
 
 // ── macOS Mach externs ──
@@ -125,11 +127,12 @@ pub fn getAppMemFootprintMb() u32 {
 }
 
 /// Bytes the OS will grant a new wiring: free (less speculative — free_count
-/// already contains them and `external` carries them back) plus file-backed,
-/// capped by the RAM outside wired + compressor. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+/// already contains them and `external` carries them back) plus file-backed plus
+/// purgeable (anonymous caches macOS drops before it compresses anything), capped
+/// by the RAM outside wired + compressor. 0 on a failed query.
+fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
     if (total_mem == 0) return 0;
-    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages;
+    const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
     const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
     return @min(reclaimable *| page, outside);
 }
@@ -145,8 +148,37 @@ pub fn getProcAvailableMemBytes() u64 {
     return @intCast(os_proc_available_memory());
 }
 
-/// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
+/// Where weights live in device memory (`mlx.weightsInDeviceMemory`: CUDA on Windows, WSL) the
+/// GPU's memory is what every gate bills, as unified memory is on a Mac; elsewhere the host's.
+pub fn memoryPool(device_weights: bool, device: u64, host: u64) u64 {
+    return if (device_weights) device else host;
+}
+
 pub fn getTotalMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.maxRecommendedWorkingSet(), hostTotalMemBytes());
+}
+
+pub fn getAvailableMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
+}
+
+/// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
+pub fn memoryPressureLevel() u32 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    var level: c_int = 0;
+    var len: usize = @sizeOf(c_int);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", @ptrCast(&level), &len, null, 0) != 0) return 0;
+    return if (level > 0) @intCast(level) else 0;
+}
+
+/// Warning or worse: the OS is already compressing and swapping to make room.
+pub fn underMemoryPressure(level: u32) bool {
+    return level >= 2;
+}
+
+/// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
+fn hostTotalMemBytes() u64 {
+    if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullTotalPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemTotal:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -154,7 +186,28 @@ pub fn getTotalMemBytes() u64 {
     return total_mem;
 }
 
-pub fn getAvailableMemBytes() u64 {
+/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
+/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
+/// 14 MB free) with every request admitted.
+/// `device_pool`: the memory is a GPU's own (`mlx.weightsInDeviceMemory`), whose free reading
+/// already counts every process, so no OS share is held back.
+pub fn osReserveBytes(total_ram: u64, device_pool: bool) u64 {
+    if (os_reserve_override) |v| return v;
+    if (device_pool) return 0;
+    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
+}
+
+/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
+pub var os_reserve_override: ?u64 = null;
+
+pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
+    if (n > 64) return error.InvalidOsReserve;
+    return @as(u64, n) << 30;
+}
+
+fn hostAvailableMemBytes() u64 {
+    if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -167,7 +220,27 @@ pub fn getAvailableMemBytes() u64 {
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, page);
+    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
+}
+
+const MemoryStatusEx = extern struct {
+    dwLength: u32 = @sizeOf(MemoryStatusEx),
+    dwMemoryLoad: u32 = 0,
+    ullTotalPhys: u64 = 0,
+    ullAvailPhys: u64 = 0,
+    ullTotalPageFile: u64 = 0,
+    ullAvailPageFile: u64 = 0,
+    ullTotalVirtual: u64 = 0,
+    ullAvailVirtual: u64 = 0,
+    ullAvailExtendedVirtual: u64 = 0,
+};
+extern "kernel32" fn GlobalMemoryStatusEx(status: *MemoryStatusEx) callconv(.winapi) i32;
+
+/// Zeroed (callers' "unknown") when the call fails.
+fn windowsMemStatus() MemoryStatusEx {
+    var s: MemoryStatusEx = .{};
+    if (GlobalMemoryStatusEx(&s) == 0) return .{};
+    return s;
 }
 
 /// One `/proc/meminfo` field in KiB ("MemTotal:", "MemAvailable:", …).
@@ -205,12 +278,31 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(pbuf[0..path.len :0].ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(pbuf[0..path.len :0].ptr);
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const n = std.c.read(fd, buf.ptr, buf.len);
+    defer crt.close(fd);
+    const n = crt.read(fd, buf);
     if (n <= 0) return null;
     return @intCast(n);
+}
+
+test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
+    try std.testing.expectEqual(20 * GB, memoryPool(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
+}
+
+test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB; none of a GPU's own memory" {
+    const gb: u64 = 1 << 30;
+    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb, false));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb, false));
+    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb, false));
+    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb, false));
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, true)); // free VRAM already counts every process
+    os_reserve_override = try parseOsReserveGib("0");
+    defer os_reserve_override = null;
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, false));
+    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
 }
 
 test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {
@@ -220,22 +312,26 @@ test "computeAvailableBytes sums the reclaimable classes, capped by wired headro
 
     // free_count already contains speculative, and speculative pages are
     // file-backed inside external — the sum carries them once.
-    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 83 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 32 * GB), computeAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, 26 * ppg, 0, 83 * ppg, ppg, page));
 
     // The cap: wired + compressor bound the figure, however the wired pages
     // are counted elsewhere.
-    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 9 * ppg, ppg, page));
+    try std.testing.expectEqual(@as(u64, 6 * GB), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 9 * ppg, ppg, page));
 
     // #45 OOM guard, in new units: a resident 7 GB model lives in the anonymous
     // set, NOT in wired — it consumed the free/external pages (16 GB box: 9 GB
     // anon + 3 wired + 1 comp), so only 3 GB of reclaimable classes remain.
-    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 3 * ppg, 1 * ppg, page));
+    try std.testing.expectEqual(@as(u64, 3 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 0, 3 * ppg, 1 * ppg, page));
 
     // Saturating: disagreeing counters never underflow; a failed query (total 0)
     // or a box with no headroom (wired + compressor ≥ total) reports 0.
-    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 1, 1, page));
-    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 16 * ppg, 0, page));
+    try std.testing.expectEqual(@as(u64, 4 * GB), computeAvailableBytes(16 * GB, ppg, 5 * ppg, 4 * ppg, 0, 0, 0, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, 1, 0, 1, 1, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(16 * GB, 6 * ppg, 0, 6 * ppg, 0, 16 * ppg, 0, page));
+
+    // Purgeable pages are anonymous caches the OS discards before compressing
+    // anything: a laptop's browsers park gigabytes there (#932).
+    try std.testing.expectEqual(@as(u64, 7 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 4 * ppg, 3 * ppg, 1 * ppg, page));
 }
 
 pub fn getSysMemPct() u32 {
@@ -381,4 +477,17 @@ test "gpuCoreCount reads the GPU's core count" {
     const n = gpuCoreCount();
     if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
     try std.testing.expect(n >= 7 and n <= 256);
+}
+
+test "underMemoryPressure: warning and critical stop a bulk allocation, normal and unreadable do not" {
+    try std.testing.expect(!underMemoryPressure(0));
+    try std.testing.expect(!underMemoryPressure(1));
+    try std.testing.expect(underMemoryPressure(2));
+    try std.testing.expect(underMemoryPressure(4));
+}
+
+test "memoryPressureLevel reads the kernel's level on macOS" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const level = memoryPressureLevel();
+    try std.testing.expect(level == 1 or level == 2 or level == 4);
 }

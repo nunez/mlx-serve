@@ -51,6 +51,7 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.requestTimeout, 300)         // main.zig timeout
         XCTAssertEqual(d.noVision, false)             // main.zig no_vision
         XCTAssertEqual(d.maxConcurrent, 1)            // server.zig max_concurrent
+        XCTAssertEqual(d.aneSlots, 1)                 // main.zig ane_slots
         XCTAssertEqual(d.kvQuant, .off)               // server.zig kv-quant
         XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
@@ -517,6 +518,7 @@ extension ServerOptionsTests {
         o.pldDraftLen = 7
         o.pldKeyLen = 4
         o.maxConcurrent = 4
+        o.aneSlots = 3
         o.kvQuant = .int8
         o.hotPrefixCacheEnabled = false
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
@@ -1046,6 +1048,13 @@ extension ServerOptionsTests {
         XCTAssertNil(empty.decodeAttnQuantChoice)
     }
 
+    func testAneSlotsAreEmittedOnlyAboveOne() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs().contains("--ane-slots"))
+        opts.aneSlots = 2
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--ane-slots", value: "2"))
+    }
+
     /// The registry's residency cap was reachable only from a hand-launched
     /// server: the app emitted no `--max-resident-mem` and has no extra-args
     /// passthrough, so every GUI launch ran the auto cap (80% of the wired
@@ -1075,6 +1084,8 @@ extension ServerOptionsTests {
         }
         // Unknown RAM must still produce a usable ladder, not just [Auto].
         XCTAssertGreaterThan(ServerOptions.residentMemPresets(physicalMemoryBytes: 0).count, 1)
+        // A 256 GB Mac holding a 208 GB model needs a step that refuses a second model beside it.
+        XCTAssertTrue(ServerOptions.residentMemPresets(physicalMemoryBytes: 256 * Self.GiB).contains(224))
     }
 
     /// Bar: the flag reaches the server when set, and 0 emits nothing (0 is

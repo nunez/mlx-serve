@@ -10,11 +10,6 @@ function apiPrefix(pathname: string) {
 }
 const pageServer = (location: Pick<Location, 'origin' | 'pathname'>) =>
   location.origin + apiPrefix(location.pathname);
-/**
- * The `?api_key=` the page was opened with: the server accepts it for the page, the console sends it on.
- */
-const pageApiKey = (search: string) =>
-  new URL(search || "", "http://page").searchParams.get("api_key") || undefined;
 const shellQuote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 function curlExample(base: string, models: Model[]) {
   const model =
@@ -224,6 +219,13 @@ const apiReference = [
     ),
   },
   {
+    method: "GET",
+    path: "/v1/load-progress",
+    description: N(
+      "Each model loading now: phase, done of total and seconds left",
+    ),
+  },
+  {
     method: "POST",
     path: "/v1/unload-model",
     description: N("Free a model's memory now"),
@@ -283,4 +285,4 @@ const apiReference = [
   },
 ];
 
-export { apiPrefix, pageServer, pageApiKey, curlExample, launchAgents, launchCommand, apiReference };
+export { apiPrefix, pageServer, curlExample, launchAgents, launchCommand, apiReference };

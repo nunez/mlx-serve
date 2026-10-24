@@ -5,6 +5,7 @@
 //! bytes for a directory about to be removed. POSIX syscalls: this runs off the main thread.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const log = @import("log.zig");
 
 /// One staged file; both buffers are owned by the queue once `submit` accepts them.
@@ -204,6 +205,27 @@ pub const Writer = struct {
         }
     }
 
+    /// `drain` bounded by `timeout`; true once everything staged has landed. Lifts a pause first,
+    /// or a paused writer would hold the caller to the timeout for nothing.
+    pub fn drainUntil(self: *Writer, timeout: std.Io.Timeout) bool {
+        const deadline = timeout.toDeadline(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.paused = false;
+        self.work.broadcast(self.io);
+        while (self.running and (self.queue.items.len > 0 or self.inflight_bytes > 0)) {
+            self.done.waitTimeout(self.io, &self.mutex, deadline) catch return false;
+        }
+        return true;
+    }
+
+    /// Bytes queued and not yet picked up by the writer thread (the in-flight file excluded).
+    pub fn queuedBytes(self: *Writer) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.pending_bytes;
+    }
+
     /// Epoch fence: staged bytes for `path_prefix` (null = everything) are discarded rather than
     /// written, and anything in flight is waited out, so the caller can remove the directory.
     pub fn fence(self: *Writer, path_prefix: ?[]const u8) void {
@@ -389,12 +411,12 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     tmp_buf[path.len + 4] = 0;
     const tmp: [:0]const u8 = tmp_buf[0 .. path.len + 4 :0];
 
-    const fd = std.c.open(tmp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(tmp.ptr, true);
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
+        const n = crt.write(fd, bytes[off..]);
         if (n < 0) {
             const e = std.c._errno().*;
             if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
@@ -409,7 +431,7 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     @memcpy(final_buf[0..path.len], path);
     final_buf[path.len] = 0;
     const final: [:0]const u8 = final_buf[0..path.len :0];
-    if (std.c.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
+    if (crt.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
 }
 
 // ── Tests ──
@@ -513,4 +535,26 @@ test "kv_disk_writer: a PAUSED writer deinits without blocking" {
     w.deinit();
     try testing.expect(w.thread == null);
     w.deinit();
+}
+
+test "kv_disk_writer: drainUntil lifts a pause and reports the queue landed" {
+    // The shutdown flush drains under a deadline; a paused writer must not eat it.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+
+    var w = Writer.init(testing.allocator, std.testing.io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/held.bin", .{root});
+    const bytes = try testing.allocator.alloc(u8, 4096);
+    @memset(bytes, 5);
+    w.submit(path, bytes);
+
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .boot } };
+    try testing.expect(w.drainUntil(timeout));
+    try testing.expectEqual(@as(u64, 1), w.filesWritten());
+    _ = try tmp.dir.statFile(std.testing.io, "held.bin", .{});
 }

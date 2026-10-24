@@ -11,10 +11,42 @@ struct LoraAdapter: Codable, Equatable, Identifiable {
     /// Absolute path to a `.safetensors` adapter. Empty rows (mid-edit, e.g.
     /// right after tapping "+") are dropped before the request is sent.
     var path: String = ""
-    /// Strength multiplier on top of the file's own alpha/rank scale.
+    /// Strength multiplier on top of the file's own alpha/rank scale. Negative
+    /// values reverse the effect and only slider-style LoRAs want them, so the
+    /// row keeps a 0 floor until `allowsNegative` is switched on.
     var scale: Double = 1.0
+    var allowsNegative: Bool = false
 
-    private enum CodingKeys: String, CodingKey { case path, scale }
+    private enum CodingKeys: String, CodingKey { case path, scale, allowsNegative }
+}
+
+extension LoraAdapter {
+    /// `allowsNegative` is absent from older blobs; a saved negative scale implies it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        scale = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1.0
+        allowsNegative = try c.decodeIfPresent(Bool.self, forKey: .allowsNegative) ?? (scale < 0)
+    }
+}
+
+/// What the LoRA picker offers for a strength. The server takes any finite
+/// number; the slider only has to be usable, so it widens to fit the value.
+enum LoraScale {
+    /// Far past any published slider adapter (±20); only keeps a typo from overflowing bf16.
+    static let limit = 100.0
+
+    static func clamped(_ value: Double, allowsNegative: Bool) -> Double {
+        value.isNaN ? 0 : min(limit, max(allowsNegative ? -limit : 0, value))
+    }
+
+    /// Slider half-range: ±2 until a value outside it is entered, then the next multiple of 10.
+    static func sliderBound(for value: Double) -> Double {
+        let m = abs(value)
+        return m <= 2 ? 2 : min(limit, (m / 10).rounded(.up) * 10)
+    }
+
+    static func sliderStep(bound: Double) -> Double { bound <= 2 ? 0.05 : 0.5 }
 }
 
 /// Keys for the pre-multi-LoRA single `loraPath`/`loraScale` fields, kept
@@ -588,6 +620,13 @@ struct Model3DGenSettings: Codable, Equatable {
     var turntable: Bool = true
     /// P2 paint stage (full PBR texture). Off until validated end to end.
     var texture: Bool = false
+    /// TRELLIS.2: cascade resolution, faces kept, texture side.
+    var trellisResolution: Int = 1024
+    var decimationTarget: Int = 300_000
+    var textureSize: Int = 2048
+    var finish: Model3DFinish = .model
+    /// The face counts the pane offers; a stored value that is none of them snaps to the nearest.
+    static let faceOptions = [100_000, 300_000, 600_000, 1_000_000, 2_000_000]
     /// The draft: the pane unmounts on navigation, so the photo and the
     /// disclosure state live here or are lost on the way to Chat and back.
     var photoPath: String? = nil
@@ -629,6 +668,12 @@ extension Model3DGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .trellisResolution) { trellisResolution = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .decimationTarget) {
+            decimationTarget = Self.faceOptions.min { abs($0 - v) < abs($1 - v) } ?? v
+        }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .textureSize) { textureSize = v }
+        if let v = try c.decodeIfPresent(Model3DFinish.self, forKey: .finish) { finish = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .photoPath) { photoPath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }

@@ -41,6 +41,80 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: video atoms come only from media parts and preserve text" {
+    const clips = [_]chat.VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
+    for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
+        for ([_]?[]const u8{ null, "<img>" }) |video_atom| {
+            const config = chat.ChatConfig{
+                .chat_template = "",
+                .bos_token = null,
+                .eos_token = null,
+                .add_bos_token = false,
+                .allocator = testing.allocator,
+                .video_placeholder = video_atom,
+            };
+            const text = "HTML <video> is text; tool results may also contain <video>.";
+            const messages = [_]chat.Message{.{ .role = role, .content = text, .videos = &clips }};
+            const json = try chat.serializeMessagesJsonFor(testing.allocator, &messages, .null_literal, &config);
+            defer testing.allocator.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+            defer parsed.deinit();
+            const parts = parsed.value.array.items[0].object.get("content").?.array.items;
+            try testing.expectEqual(@as(usize, 2), parts.len);
+            const media = parts[0].object;
+            if (video_atom) |atom| {
+                try testing.expectEqualStrings("text", media.get("type").?.string);
+                try testing.expectEqualStrings(atom, media.get("text").?.string);
+            } else try testing.expectEqualStrings("video", media.get("type").?.string);
+            try testing.expectEqualStrings(text, parts[1].object.get("text").?.string);
+        }
+    }
+}
+
+test "format corpus: native RADIO capabilities agree before and after load" {
+    const model = @import("model.zig");
+    const discovery = @import("model_discovery.zig");
+    const cases = [_]struct { source: []const u8, radio: bool, final_norm: bool = false }{
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_omni.json"), .radio = true, .final_norm = true },
+        .{ .source = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\",\"hidden_size\":4096,\"max_position_embeddings\":262144,\"layers_block_type\":[\"mamba\",\"moe\",\"attention\"]}}", .radio = true },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", .radio = false },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", .radio = false },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"other\"}}", .radio = false },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(case.radio, discovery.hasRadioVision(parsed.value.object));
+        var config = try model.parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expectEqual(case.radio, config.radio_vision);
+        try testing.expectEqual(case.radio, config.has_vision);
+        try testing.expectEqual(case.final_norm, config.radio_final_layernorm);
+        const stub = discovery.parseStubMeta(testing.allocator, case.source, true);
+        try testing.expectEqual(case.radio, stub.has_vision);
+        try testing.expectEqual(case.radio, stub.has_video);
+        if (case.radio) {
+            try testing.expectEqual(config.hidden_size, stub.hidden_size);
+            try testing.expectEqual(config.num_hidden_layers, stub.num_hidden_layers);
+            try testing.expectEqual(config.max_position_embeddings, stub.max_position_embeddings);
+        }
+    }
+}
+
+test "format corpus: Nemotron SSM bounds reject nonnumeric sentinel values" {
+    const model = @import("model.zig");
+    for ([_][]const u8{ "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni" }) |model_type| {
+        for ([_][]const u8{ "\"NaN\"", "\"-Infinity\"", "{\"__float__\":\"-Infinity\"}", "{\"__float__\":\"NaN\"}", "{}", "true" }) |bound| {
+            const source = if (std.mem.eql(u8, model_type, "nemotron_h_omni"))
+                try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"nemotron_h_omni\",\"llm_config\":{{\"model_type\":\"nemotron_h_puzzle\",\"time_step_limit\":[0,{s}]}}}}", .{bound})
+            else
+                try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"{s}\",\"time_step_limit\":[0,{s}]}}", .{ model_type, bound });
+            defer testing.allocator.free(source);
+            try testing.expectError(error.InvalidConfigField, model.parseConfigFromJson(testing.allocator, source));
+        }
+    }
+}
+
 test "format corpus: late system notes never vanish or rewrite supported history" {
     const templates = [_]struct { source: []const u8, in_place: bool }{
         .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
@@ -247,6 +321,17 @@ const corpus = [_]Expect{
         .name = "thinking-off prose passes through verbatim",
         .raw = "17 × 23 = 391.",
         .content_exact = "17 × 23 = 391.",
+    },
+    .{
+        // LIVE 2026-10-19 (Qwen3.8-27B 4bit, MTP, temp 1.0, agent turn beside media jobs, m4max):
+        // the `<` of `<function=` was sampled as the `<|im_start|>` special, the JSON shapes
+        // failed and the agent got an empty `stop`. One mangled delimiter, name and args intact.
+        .family = "qwen",
+        .name = "function-tag call whose opener `<` came out as a special token",
+        .raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/game.js\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "src/game.js",
     },
     .{
         // Raw JSON tool call with no wrapper tags (Qwen emits this when the
@@ -1166,6 +1251,59 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
+    // ── Recursive Flint ─────────────────────────────────────────────────
+    // GLM's bare-opener pairs with NO newlines, straight after the preamble. The
+    // model opens its own `<think>`; its thinking is buffered apart, so these are
+    // the answer side as captured live (RecursiveSI/flint-int4, temp 0).
+    .{
+        .family = "flint",
+        .name = "preamble then a call, pairs with no newlines, string→bool coercion",
+        .raw = "I'll get the current weather in Tokyo for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "flint",
+        .name = "two calls back to back keep their own arguments",
+        .raw = "I'll get the current weather for both cities for you.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Berlin</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_count = 2,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .last_tool_arg_value = "Berlin",
+    },
+    .{
+        .family = "flint",
+        .name = "a call that repeats its pairs at the same values still parses once",
+        .raw = "I'll think through this briefly: the task is simple \u{2014} create a Python file that prints \"hello world\". The standard implementation is just a single `print` statement.\n\n" ++
+            "Now I'll write the file using the write tool.<tool_call>write<arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value><arg_key>path</arg_key><arg_value>hello.py</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>print(\"hello world\")\n</arg_value></tool_call>\n",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 1,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "hello.py",
+    },
+    .{
+        // Claude Code on Flint: a doubled key opener reached the client as the key `<arg_key>file_path`.
+        .family = "flint",
+        .name = "a doubled <arg_key> opener keeps the key",
+        .raw = "<tool_call>write<arg_key><arg_key>path</arg_key><arg_value>snake.html</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value><canvas></canvas></arg_value></tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "snake.html",
+    },
     // ── K2-Horizon (IFM) ────────────────────────────────────────────────
     // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
     // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
@@ -1653,6 +1791,47 @@ const corpus = [_]Expect{
         .content_contains = "atem:function_calls block",
     },
 
+    // ── Anthropic-style `<function_calls><invoke>` in place of the model's own dialect (#928) ──
+    .{
+        // LIVE shape (qwen4_exp, pi session): the whole call arrived as content with finish stop.
+        .family = "qwen4_exp",
+        .name = "Anthropic invoke markup after thinking is a call",
+        .raw = "List the folder first.</think>\n\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x/wiki && ls -la && wc -l *.md | tail -1</parameter>\n</invoke>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "cd /x/wiki && ls -la && wc -l *.md | tail -1",
+        .reasoning_contains = "List the folder",
+    },
+    .{
+        // Not the model's dialect, so an undeclared name is a data block, not a call.
+        .family = "qwen4_exp",
+        .name = "Anthropic invoke naming an undeclared tool is not a call",
+        .raw = "<function_calls>\n<invoke name=\"teleport\">\n<parameter name=\"to\">mars</parameter>\n</invoke>\n</function_calls>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen4_exp",
+        .name = "prose naming the invoke tag is not a call",
+        .raw = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+        .content_contains = "<invoke name=\"bash\"> tags",
+    },
+    .{
+        // The native call wins: invoke markup inside its parameter value is payload.
+        .family = "qwen3_5",
+        .name = "invoke markup inside a Hermes parameter value is payload",
+        .raw = "<tool_call>\n<function=bash>\n<parameter=command>\necho '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'\n</parameter>\n</function>\n</tool_call>",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'",
+    },
+
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
     .{
         .family = "minicpm5",
@@ -1958,6 +2137,11 @@ test "format corpus: recorded model outputs across families" {
                 };
                 defer parsed.deinit();
                 if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+                // An argument KEY never carries a dialect tag or a line break: a doubled
+                // `<arg_key>` opener reached Claude Code as the key `<arg_key>file_path`.
+                if (parsed.value == .object) for (parsed.value.object.keys()) |k| {
+                    if (k.len == 0 or std.mem.indexOfAny(u8, k, "\n\r<>") != null) try fail(entry, "argument KEY is empty or carries a line break or markup", k);
+                };
 
                 // Universal declared-type invariant: every argument whose type
                 // the tool declares must actually carry that JSON type. This is
@@ -2393,7 +2577,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:",
+        "<｜DSML｜",
+        "<function",  "<invoke",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2778,5 +2964,24 @@ test "format corpus: constrained JSON marker strings are data on every protocol"
             try output.appendSlice(testing.allocator, delivery.content.items);
         }
         try testing.expectEqualStrings(json, output.items);
+    }
+}
+
+test "format corpus: native LiLiCorr configs preserve borrowed and own output heads" {
+    const dflash = @import("dflash.zig");
+    const cases = [_]struct { source: []const u8, own_head: bool, captures: []const u32 }{
+        .{ .source = @embedFile("fixtures/lilicorr_config.json"), .own_head = false, .captures = &.{ 0, 17, 34, 50, 67, 84 } },
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_drafter.json"), .own_head = true, .captures = &.{ 0, 21, 42, 63, 84 } },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expect(dflash.isDflashConfigJson(parsed.value.object));
+        var config = try dflash.parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expect(config.lilicorr);
+        try testing.expectEqual(case.own_head, config.has_own_lm_head);
+        if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
+        try testing.expectEqualSlices(u32, case.captures, config.captureIds());
     }
 }

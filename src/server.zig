@@ -1,4 +1,6 @@
 const std = @import("std");
+const crt = @import("crt.zig");
+const win_io = @import("win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
@@ -20,6 +22,8 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
+const radio_vision = @import("radio_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
 const mrope_mod = @import("mrope.zig");
@@ -30,11 +34,11 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (@import("build_options").ds4_engine) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const transcription_mod = @import("transcription.zig");
 const forced_align_mod = @import("forced_align.zig");
@@ -407,9 +411,7 @@ pub const Conn = struct {
     fn awaitReadable(c: *Conn, ms: i64) bool {
         if (c.reader().bufferedLen() > 0) return true;
         if (ms <= 0) return false;
-        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
-        return n > 0;
+        return socketReadable(c.stream.socket.handle, @intCast(@min(ms, std.math.maxInt(i32)))) catch true;
     }
 
     /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
@@ -423,6 +425,7 @@ pub const Conn = struct {
     pub fn close(c: *Conn) void {
         c.flush() catch {};
         if (c.length_framed) return c.stream.close(c.io);
+        if (comptime builtin.os.tag == .windows) return c.closeAfterPeerWindows();
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
         const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
@@ -454,7 +457,23 @@ pub const Conn = struct {
     /// never hit stream-idle timeouts; tiny traffic cost.
     pub const STREAM_KEEPALIVE_MS: i64 = 5000;
 
+    /// `close`'s peer-hangup wait over AFD readiness (Windows sockets take no poll(2)).
+    fn closeAfterPeerWindows(c: *Conn) void {
+        const h = c.stream.socket.handle;
+        c.stream.shutdown(c.io, .send) catch {};
+        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
+            const ev = win_io.poll(h, win_io.RECEIVE | win_io.GONE, 500) catch break;
+            if (ev & win_io.GONE != 0) break;
+            // A byte from a pipelining client is dropped.
+            if (ev != 0) _ = c.reader().discard(.limited(256)) catch break;
+        }
+        c.stream.close(c.io);
+    }
+
     pub fn peerClosed(c: *Conn) bool {
+        if (comptime builtin.os.tag == .windows)
+            return (win_io.poll(c.stream.socket.handle, win_io.GONE, 0) catch return false) != 0;
         const fd = c.stream.socket.handle;
         var fds = [_]std.posix.pollfd{.{
             .fd = fd,
@@ -605,7 +624,7 @@ pub const ServerConfig = struct {
     default_max_tokens: u32 = 0,
 };
 
-const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32 };
+const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32, repeat_penalty: f32, presence_penalty: f32, frequency_penalty: f32 };
 
 /// Sampling for one request: a forced generation-defaults rule > request body > rule >
 /// CLI launch flag > model generation_config.json > hardcoded fallback. An explicit request
@@ -618,6 +637,7 @@ fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, c
         .min_p = gen.resolveOpt(f32, .min_p, parseJsonFloatOpt(root, "min_p", 0.0, 1.0), config.gen_min_p),
         .repeat_penalty = requestRepeatPenalty(root, gen),
         .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
+        .frequency_penalty = gen.resolve(f32, .frequency_penalty, parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0), 0.0),
     };
 }
 
@@ -648,10 +668,10 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
-/// MTP verify rounds cost more than they save without the Metal verify
-/// kernels: plain decode is faster on CUDA and Vulkan unless `--mtp` asks for it.
-pub fn mtpAllowedByDefault(mtp_forced: bool) bool {
-    return mtp_forced or mlx.metalKernelsAvailable();
+/// Where an MTP head drafts without `--mtp`. CUDA's multi-row matmuls make a verify round pay;
+/// Vulkan has none and decodes plain.
+pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
+    return mtp_forced or metal or cuda;
 }
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
@@ -834,6 +854,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/images/edits",
     "/v1/images/generations",
     "/v1/load-model",
+    "/v1/load-progress",
     "/v1/messages",
     "/v1/models",
     "/v1/models/rescan",
@@ -853,16 +874,17 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
-pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
+pub const max_request_bytes: usize = max_media_request_bytes;
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
 pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
-/// reference images approach 500 MB (issue #151) — while no JSON chat body
-/// has any business near 64 MB.
+/// reference images approach 500 MB (issue #151) — and a vision agent's chat
+/// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
@@ -938,15 +960,24 @@ fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 /// A non-empty query parameter, percent-decoded into `buf`.
 fn queryDecoded(buf: []u8, raw_path: []const u8, name: []const u8) ?[]const u8 {
     const q = raw_path[(std.mem.indexOfScalar(u8, raw_path, '?') orelse return null) + 1 ..];
-    var it = std.mem.splitScalar(u8, q, '&');
-    while (it.next()) |kv| {
+    return percentDecoded(buf, pairValue(q, '&', name) orelse return null);
+}
+
+/// The raw value of `name=` in a `sep`-separated list: a query string, a form body, a Cookie header.
+fn pairValue(list: []const u8, sep: u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, list, sep);
+    while (it.next()) |raw| {
+        const kv = std.mem.trim(u8, raw, " ");
         if (kv.len <= name.len + 1 or !std.mem.startsWith(u8, kv, name) or kv[name.len] != '=') continue;
-        const v = kv[name.len + 1 ..];
-        if (v.len > buf.len) return null;
-        @memcpy(buf[0..v.len], v);
-        return std.Uri.percentDecodeInPlace(buf[0..v.len]);
+        return kv[name.len + 1 ..];
     }
     return null;
+}
+
+fn percentDecoded(buf: []u8, v: []const u8) ?[]const u8 {
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return std.Uri.percentDecodeInPlace(buf[0..v.len]);
 }
 
 pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]const u8 {
@@ -1035,6 +1066,10 @@ pub fn clearResolvedPrefixCacheMem() void {
 /// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
 /// value). The Swift app exposes this as a Settings toggle, default off.
 pub var prefix_cache_disk_bytes: u64 = 0;
+
+/// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
+/// for at most this long after the signal. 0 turns it off.
+pub var shutdown_persist_secs: u32 = 45;
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
@@ -1311,7 +1346,8 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
 /// tracked. `forced` is allocated; the caller frees it after generation.
 fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
     const ft = forced_tool orelse return null;
-    if (lm.transformer == null) return null;
+    // Armed on the Neural Engine too, so `aneServes` refuses the request by name.
+    if (lm.transformer == null and lm.ane == null) return null;
     const cc = lm.chat_config orelse return null;
     const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
     defer allocator.free(text);
@@ -1715,16 +1751,16 @@ fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []const u8
     path_buf[path.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(path_z, false);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
 
     const tools = tools_json orelse "";
     var hdr: [96]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "\n===MLX_RAW_DUMP tools={d} raw={d}===\n", .{ tools.len, text.len }) catch return;
-    _ = std.c.write(fd, h.ptr, h.len);
-    if (tools.len > 0) _ = std.c.write(fd, tools.ptr, tools.len);
-    if (text.len > 0) _ = std.c.write(fd, text.ptr, text.len);
+    _ = crt.write(fd, h);
+    if (tools.len > 0) _ = crt.write(fd, tools);
+    if (text.len > 0) _ = crt.write(fd, text);
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -1807,10 +1843,21 @@ fn deinitGlobalResponseStore() void {
 /// the socket already bound, so clearing it after bind is enough.
 fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
     if (comptime builtin.os.tag == .linux) return listenExclusiveLinux(addr);
+    // Windows' SO_REUSEADDR lets another socket bind over a live listener, so it stays off. std.Io binds
+    // inside listen, so SO_EXCLUSIVEADDRUSE cannot be set first: a process that sets SO_REUSEADDR can still share the port.
+    if (comptime builtin.os.tag == .windows) return addr.listen(io, .{});
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
     try std.posix.setsockopt(server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 0)));
     return server;
+}
+
+/// Whether `handle` turns readable (a connection to accept, bytes, or EOF) within `timeout_ms`.
+fn socketReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) !bool {
+    if (comptime builtin.os.tag == .windows)
+        return try win_io.poll(handle, win_io.RECEIVE | win_io.ACCEPT | win_io.GONE, timeout_ms) != 0;
+    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    return try std.posix.poll(&fds, timeout_ms) > 0;
 }
 
 /// Linux joins a socket to its SO_REUSEPORT group at bind, so clearing the flag afterwards still
@@ -1858,6 +1905,72 @@ fn listenExclusiveLinux(addr: std.Io.net.IpAddress) !std.Io.net.Server {
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
 /// defaults, reasoning budget). It's copied into the module-level
 /// `server_config` before the listen loop starts.
+/// Dotted-decimal IPv4 (`0.0.0.0` and anything unparsable read as zeros).
+fn parseIp4(host: []const u8) [4]u8 {
+    var out: [4]u8 = .{ 0, 0, 0, 0 };
+    if (std.mem.eql(u8, host, "0.0.0.0")) return out;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var idx: usize = 0;
+    while (parts.next()) |part| {
+        if (idx >= 4) break;
+        out[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
+        idx += 1;
+    }
+    return out;
+}
+
+/// Answers on the bound socket while the startup load runs, before the accept loop takes it:
+/// `/health` is 503 `loading` (clients keep waiting), a loopback client reads `/v1/load-progress`,
+/// anything else is 503. One connection at a time; nothing here touches the scheduler.
+const StartupResponder = struct {
+    server: *std.Io.net.Server,
+    registry: *ModelRegistry,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *StartupResponder) void {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+    }
+
+    fn stop(self: *StartupResponder) void {
+        self.done.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn run(self: *StartupResponder) void {
+        while (!self.done.load(.acquire)) {
+            const ready = socketReadable(self.server.socket.handle, 100) catch continue;
+            // Once done, a waiting connection is the accept loop's.
+            if (!ready or self.done.load(.acquire)) continue;
+            const accepted = self.server.accept(self.io) catch continue;
+            var conn: Conn = undefined;
+            Conn.init(&conn, accepted, self.io);
+            defer conn.close();
+            self.answer(&conn) catch {};
+        }
+    }
+
+    fn answer(self: *StartupResponder, conn: *Conn) !void {
+        const raw = (try readRequest(self.allocator, conn)) orelse return;
+        defer self.allocator.free(raw.buf);
+        const line_end = std.mem.indexOf(u8, raw.buf[0..raw.len], "\r\n") orelse return;
+        var words = std.mem.splitScalar(u8, raw.buf[0..line_end], ' ');
+        _ = words.next();
+        const raw_path = words.next() orelse return;
+        const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
+        if (std.mem.eql(u8, path, "/health")) return sendResponse(conn, "503 Service Unavailable", "application/json", "{\"status\":\"loading\"}");
+        if (std.mem.eql(u8, path, "/v1/load-progress") and peerIsLoopback(conn)) {
+            const body = try loadProgressBody(self.allocator, self.io, self.registry);
+            defer self.allocator.free(body);
+            return sendResponse(conn, "200 OK", "application/json", body);
+        }
+        return sendErrorResponse(self.allocator, conn, "503 Service Unavailable", "loading", "The model is still loading", 503);
+    }
+};
+
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1881,6 +1994,18 @@ pub fn serve(
     //    Transformer/vision/drafter load, JIT compile, and warmup before
     //    `Scheduler.init` returns. From this point on, mlx ops are bound
     //    to the inference thread's GPU stream.
+    // Bound before the startup load, which can take minutes (a first Neural Engine compile):
+    // until it ends, `StartupResponder` answers in place of the accept loop below.
+    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = parseIp4(host), .port = port } };
+    var server = listenExclusive(io, ip_addr) catch |err| {
+        if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
+        return err;
+    };
+    defer server.deinit(io);
+    var startup: StartupResponder = .{ .server = &server, .registry = load_params.registry, .allocator = allocator, .io = io };
+    if (!load_params.no_initial_load) startup.start();
+    defer startup.stop();
+
     var scheduler = try scheduler_mod.Scheduler.init(
         allocator,
         io,
@@ -1888,6 +2013,7 @@ pub fn serve(
         max_concurrent,
     );
     defer scheduler.deinit();
+    startup.stop();
     global_scheduler = scheduler;
     defer global_scheduler = null;
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
@@ -2005,34 +2131,21 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    // Install signal handlers for graceful shutdown
-    const sigact = std.posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
-
-    // Parse host address
-    var ip4_bytes: [4]u8 = .{ 0, 0, 0, 0 };
-    if (!std.mem.eql(u8, host, "0.0.0.0")) {
-        // Parse dotted-decimal IP
-        var parts = std.mem.splitScalar(u8, host, '.');
-        var idx: usize = 0;
-        while (parts.next()) |part| {
-            if (idx >= 4) break;
-            ip4_bytes[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
-            idx += 1;
-        }
+    const gen_yield_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GEN_YIELD")) |p| std.mem.span(p) else null;
+    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable(), gen_yield_env);
+    if (!scheduler_mod.gen_yield_enabled and mlx.cudaAvailable())
+        log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job (MLX_SERVE_GEN_YIELD=1 interleaves)\n", .{});
+    // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
+    if (comptime builtin.os.tag != .windows) {
+        const sigact = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
     }
 
-    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
-    var server = listenExclusive(io, ip_addr) catch |err| {
-        if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
-        return err;
-    };
-    defer server.deinit(io);
 
     // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
     //    every serve path (model/headless/gen/ds4/llama) flows through — so the
@@ -2079,9 +2192,11 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (manualContext(config) > 0) {
+    if (config.glm_stream) {
+        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
+    } else if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.dsv41_stream) {
+    } else if (config.mlxStream()) {
         log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
@@ -2158,20 +2273,14 @@ pub fn serve(
         });
     }
 
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-
     while (!shutdown_requested.load(.acquire)) {
         // Poll with 1-second timeout so we can check shutdown flag
-        const poll_result = std.posix.poll(&poll_fds, 1000) catch |err| {
+        const ready = socketReadable(server.socket.handle, 1000) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
             log.err("poll error: {}\n", .{err});
             continue;
         };
-        if (poll_result == 0) continue; // timeout, re-check shutdown flag
+        if (!ready) continue; // timeout, re-check shutdown flag
         if (shutdown_requested.load(.acquire)) break;
 
         const accepted_stream = server.accept(io) catch |err| {
@@ -2218,12 +2327,17 @@ pub fn serve(
     // in-flight `complete()` is still touching. The inference thread is still
     // alive here (deinit joins it only after we return), so cancelled slots
     // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
+    // saves nothing (the join below waits out the inference thread's current chunk anyway) and
+    // lets a late `complete()` race the queues `deinit` frees.
+    if (global_scheduler) |sch| {
+        scheduler_mod.armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
+        sch.cancelAllInFlight();
+    }
     {
         var waited_ms: u64 = 0;
-        var idle_fds = [_]std.posix.pollfd{};
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
-            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+            crt.sleepMs(20);
             waited_ms += 20;
         }
         const remaining = active_conn_threads.load(.acquire);
@@ -2363,7 +2477,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     if (total_size > max_request_size) {
         var msg_buf: [128]u8 = undefined;
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
-        log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
+        log.warn("[http] 413 {s}: {s}\n", .{ logSafePath(req_path), msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
@@ -2435,7 +2549,7 @@ fn handleConnection(
     // carries its model in a multipart FIELD, which only the content-type's
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
-    logHttpRequest(method, raw_path, request_body);
+    logHttpRequest(method, logSafePath(raw_path), logSafeBody(method, path, request_content_type, request_body));
     if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
@@ -2453,15 +2567,27 @@ fn handleConnection(
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
     if (apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
-        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
-        !apiKeyAuthorized(request[0..header_end_pos], raw_path))
+        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")))
     {
-        log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        if (wantsLoginPage(method, path, request[0..header_end_pos]))
-            try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(request[0..header_end_pos], raw_path))
-        else
-            try sendUnauthorized(stream);
-        return;
+        const raw_headers = request[0..header_end_pos];
+        if (loginFormKey(method, path, request_content_type, request_body)) |k| {
+            if (encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            return sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPageHtml("<p class=err>That key was not accepted. Try again.</p>"));
+        }
+        if (!apiKeyAuthorized(raw_headers, raw_path)) {
+            log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
+            if (wantsLoginPage(method, path, raw_headers))
+                try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(raw_headers, raw_path))
+            else
+                try sendUnauthorized(stream);
+            return;
+        }
+        // A page opened with `?api_key=` trades it for the cookie, so the key leaves the address bar.
+        if (wantsLoginPage(method, path, raw_headers)) {
+            if (queryParamValue(raw_path, "api_key") orelse queryParamValue(raw_path, "key")) |k| {
+                if (cookieSafe(k) and encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            }
+        }
     }
 
     // ── LAN sharing gate. With sharing ON and no --api-key set, a non-loopback
@@ -2489,6 +2615,7 @@ fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+        if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
@@ -2581,6 +2708,16 @@ fn handleConnection(
         try handleLoadModelStrict(allocator, stream, request_body);
         return;
     }
+    // Any method: a status route never reaches `ensureLoaded`, whatever its body names.
+    if (std.mem.eql(u8, path, "/v1/load-progress")) {
+        const body = renderLoadProgressBody(allocator, stream.io) catch |err| switch (err) {
+            error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
+            else => return err,
+        };
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/unload-model")) {
         // Free a model's resident GPU state (the app's load→generate→unload
         // default). The stub stays registered so it can reload. Idempotent.
@@ -2641,9 +2778,11 @@ fn handleConnection(
     // so every consumer below (proxy, peek, ensureLoaded) sees the real id.
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
+    // The proxies splice over the value as written, so they also get the raw slice.
+    const body_model = parseModelFromRequest(request_body, request_content_type);
     var requested_model_id = lan_mod.unescapeJsonSlashes(
         &model_id_buf,
-        parseModelFromRequest(request_body, request_content_type) orelse queryModel(&query_model_buf, raw_path) orelse "",
+        body_model orelse queryModel(&query_model_buf, raw_path) orelse "",
     );
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
@@ -2659,13 +2798,13 @@ fn handleConnection(
     if (g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
-        try handleProviderProxy(allocator, stream, prov, path, request_body, requested_model_id);
+        try handleProviderProxy(allocator, stream, prov, path, request_body, body_model, requested_model_id);
         return;
     };
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
-        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
+        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, body_model, requested_model_id);
         return;
     }
     switch (resolveRequestModelId(registry, &g_model_aliases, requested_model_id, path)) {
@@ -2957,7 +3096,7 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     for (unsupported) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) {
             log.warn("{s} {s} -> 501 (unsupported ollama endpoint)\n", .{ method, path });
-            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX Core app");
+            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX-Serve app");
             return true;
         }
     }
@@ -3010,10 +3149,16 @@ test "quantizationJson: a declared width is N-bit, an undeclared one is null" {
 /// `architecture`: a NATIVE deepseek_v4 safetensors dir and a DeepSeek GGUF
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
-/// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+/// header is read at load time. A loaded model's `config` names the MLX path's own engines: the
+/// mlx-stream DeepSeek-V4.1 repack and a Sushi pack's EXL3 experts.
+fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (has_ane) return "ane";
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
+    if (config) |c| {
+        if (c.dsv41_stream) return "mlx-stream";
+        if (c.exl3 != null) return "sushi";
+    }
     if (mlx_gguf_served) return "mlx-gguf";
     if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
     return "mlx";
@@ -3474,7 +3619,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (config.dsv41_stream) return mlx_stream.contextLength(config);
+    if (config.mlxStream()) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -3682,23 +3827,6 @@ pub fn applyGpuCeilingEnv() void {
 
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
-/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
-/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
-/// 14 MB free) with every request admitted.
-pub fn osReserveBytes(total_ram: u64) u64 {
-    if (os_reserve_override) |v| return v;
-    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
-}
-
-/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
-pub var os_reserve_override: ?u64 = null;
-
-pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
-    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
-    if (n > 64) return error.InvalidOsReserve;
-    return @as(u64, n) << 30;
-}
-
 fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
@@ -3712,7 +3840,7 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
+        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
@@ -4064,9 +4192,10 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
-        // unexplained slowdown.
+        // unexplained slowdown. mlx-stream takes GLM-5.3's whole prompt in one
+        // forward and chunks it itself.
         if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit)
+            !generate_mod.prefill_chunk_explicit and !config.glm_stream)
         {
             log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
         }
@@ -5080,6 +5209,20 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     try t.expect(new_needed <= ceiling);
 }
 
+test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request width" {
+    // Flash Next on CUDA chose 8192 past the 2048 cap and MLX's expert gather failed at that width.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const saved = generate_mod.machine_prefill_chunk_cap;
+    defer generate_mod.machine_prefill_chunk_cap = saved;
+    generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
+    const cfg = qwen4RequestTestConfig();
+    const available: u64 = 28_909 << 20;
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 8192, .{}));
+}
+
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
     // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
@@ -5687,8 +5830,11 @@ fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool)
     }
     if (config.isMoe()) {
         const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+        // Puzzle experts contract in the latent width. The router and the
+        // shared expert stay on hidden_size and are not this replica.
+        const expert_in: u64 = if (config.moe_latent_size > 0) config.moe_latent_size else config.hidden_size;
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
-            (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
+            (expert_in + config.moe_intermediate_size) * 2;
     }
     return per_tok;
 }
@@ -5726,8 +5872,8 @@ fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// MLX qwen35 engine one model-switch earlier (live 2026-07-15, pi + ds4). Skip
 /// the memory guard whenever an embedded engine will serve; the context-length
 /// guard still bounds the prompt against ds4's own session ctx.
-fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
-    return !(uses_ds4 or uses_llama);
+fn mlxMemoryGuardApplies(engine_backed: bool) bool {
+    return !engine_backed;
 }
 
 /// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
@@ -5823,7 +5969,10 @@ const GLM5_INDEXER_BYTES_PER_POOL: u64 = 12;
 /// two are a max, not a sum.
 pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const ctx: u64 = getEffectiveContextLength(config);
-    const output = @min(max_tokens, if (ctx > 0) ctx -| seq else max_tokens);
+    // Generation growth is billed to the KV reserve's headroom, as the drafter term is: an omitted
+    // max_tokens is the rest of the window (1M here), and pricing that answer's KV refused a
+    // 431-token prompt at 43 GB beside 36 GB free.
+    const output = @min(max_tokens, transformer_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
     const end = seq +| output;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
@@ -5954,6 +6103,14 @@ pub const GenErrorWire = struct {
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    // Whatever the request saw, a lost context is the cause and a restart the remedy.
+    if (mlx.gpuContextLost()) return .{
+        .status_line = "503 Service Unavailable",
+        .code = 503,
+        .openai_type = "server_error",
+        .anthropic_type = "api_error",
+        .message = gpu_context_lost_message,
+    };
     return switch (err) {
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
@@ -5985,6 +6142,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = PROMPT_LOGPROBS_UNAVAILABLE_MSG,
+        },
+        // A Neural Engine model samples the raw logits: refused, not silently ignored.
+        error.NeuralEngineUnsupported => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "This model runs on the Neural Engine, which serves plain sampling only: structured output (response_format, grammars), logprobs, repetition or presence penalties and forced tool calls are not available. Use a GPU model for those.",
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -6199,7 +6364,7 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
-    if (config.dsv41_stream) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    if (config.mlxStream()) return 0; // billed at construction (`mlx_stream.loadBytes`)
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     const drafter: u64 = (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
     if (config.isGlm5()) return glm5PrefillMemoryNeeded(config, seq, max_tokens, kv_bits, chunk, warm) +| drafter;
@@ -6637,7 +6802,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
 
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
     const prompt_len: usize = prompt_ids.len;
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
+    if (!mlxMemoryGuardApplies(lm.engineBacked())) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
     var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
@@ -6888,7 +7053,7 @@ fn mediaRejectReason(messages: []const chat_mod.Message, continue_final: bool) ?
         const m = messages[i];
         if (std.mem.eql(u8, m.role, "assistant")) break;
         if (!std.mem.eql(u8, m.role, "user")) continue;
-        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision or no vision weights); image/video content is not supported";
+        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision, no vision weights, or on the Neural Engine); image/video content is not supported";
         if (m.audio != null) return "This model is serving without its audio embedder; input_audio content is not supported";
     }
     return null;
@@ -7015,8 +7180,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_video_engine = lm.video_engine != null,
         .has_mesh_engine = lm.mesh_engine != null,
         .has_decision_engine = lm.decision_engine != null,
-        .has_text_lm = lm.state != .ready or lm.transformer != null or
-            lm.ds4_engine != null or lm.llama_engine != null,
+        .has_text_lm = lm.state != .ready or lm.transformer != null or lm.engineBacked(),
     };
 }
 
@@ -7048,6 +7212,12 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
 }
 
+fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.ModelConfig) bool {
+    const ve = entry.vision_encoder orelse return false;
+    if (ve.radio) |radio| return radio.video_w.ctx != null;
+    return ve.supportsImages() and config.video_token_id != 0;
+}
+
 /// pulls full capabilities/dimensions off the resident config/chat_config;
 /// for non-ready entries renders a lightweight stub with state +
 /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
@@ -7072,7 +7242,7 @@ fn renderModelEntry(
         const has_chat = readyHasChat(
             config.is_encoder_only,
             chat_config.chat_template.len,
-            entry.ds4_engine != null or entry.llama_engine != null,
+            entry.engineBacked(),
         );
         const has_vision = if (entry.vision_encoder) |ve| ve.supportsImages() else false;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
@@ -7102,7 +7272,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
+        if (loadedSupportsVideo(entry, config)) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -7110,8 +7280,9 @@ fn renderModelEntry(
         // registry's arch hint (the pack's real model_type), never the stub
         // config's modality marker ("flux2" for every image backend).
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
-        const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
-        const drafter_loaded = entry.drafter != null or entry.dflash != null;
+        const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
+        defer allocator.free(model_id_json);
+        const drafter_loaded = entry.hasDrafter();
         const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
@@ -7145,9 +7316,9 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
-            model_id,
+            model_id_json,
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
@@ -7161,7 +7332,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -7292,7 +7463,7 @@ fn renderModelEntry(
     // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
+        modelEngineName(false, false, false, mlxGgufClaims(io, entry), null, entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -7322,9 +7493,42 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
+    const id_json = try jsonEscape(allocator, entry.id);
+    defer allocator.free(id_json);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+}
+
+test "renderModelEntry: a Windows path id stays valid JSON" {
+    const a = std.testing.allocator;
+    var e = model_registry_mod.LoadedModel{
+        .allocator = a,
+        .id = "C:\\Users\\d\\.mlx-serve\\models\\org\\m",
+        .path = "C:\\Users\\d\\.mlx-serve\\models\\org\\m",
+        .bytes_on_disk = null,
+        .arch_hint = "",
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+    };
+    const row = try renderModelEntry(a, std.testing.io, &e);
+    defer a.free(row);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(e.id, parsed.value.object.get("id").?.string);
 }
 
 fn handleModels(
@@ -7444,17 +7648,66 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
-    // Keyed peers we hold no working key for, so the app can ask for one.
-    var locked = std.ArrayList(u8).empty;
-    defer locked.deinit(allocator);
-    if (!lan_filtered) if (g_lan) |l| try l.appendPeersNeedingKey(allocator, &locked);
-    if (locked.items.len > 0) return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}],"lan_needs_key":[{s}]}}
-    , .{ entries_buf.items, locked.items });
-
+    // What this machine is; keyed peers we hold no working key for, so the app can ask for
+    // one; and every peer with what it said about itself.
+    var extras = std.ArrayList(u8).empty;
+    defer extras.deinit(allocator);
+    const machine = try machineJson(allocator);
+    defer allocator.free(machine);
+    try extras.appendSlice(allocator, machine);
+    if (!lan_filtered) if (g_lan) |l| {
+        var list = std.ArrayList(u8).empty;
+        defer list.deinit(allocator);
+        try l.appendPeersNeedingKey(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_needs_key\":[{s}]", .{list.items});
+        list.clearRetainingCapacity();
+        try l.appendPeerAddresses(allocator, &list);
+        if (list.items.len > 0) try extras.print(allocator, ",\"lan_peers\":[{s}]", .{list.items});
+    };
     return std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{s}]}}
-    , .{entries_buf.items});
+        \\{{"object":"list","data":[{s}]{s}}}
+    , .{ entries_buf.items, extras.items });
+}
+
+/// `/v1/models`' "machine" (behind the API key, unlike `/health`): the OS, the device model
+/// id the app draws its icon from, its memory (the pair card's split estimate), and the
+/// Thunderbolt pair this server leads, if any.
+fn machineJson(allocator: std.mem.Allocator) ![]u8 {
+    const pair = try @import("distributed.zig").pairFields(allocator);
+    defer allocator.free(pair);
+    var model_buf: [64]u8 = undefined;
+    const status_mod = @import("status.zig");
+    return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f},\"free_mib\":{d},\"total_mib\":{d}{s}}}", .{
+        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}),
+        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20, pair,
+    });
+}
+
+/// The device model id ("Mac16,5", "iPhone17,1"); empty off Apple platforms. iOS keeps it
+/// in `hw.machine`, where macOS has the CPU architecture.
+fn machineModel(buf: *[64]u8) []const u8 {
+    const key = switch (comptime builtin.os.tag) {
+        .macos => "hw.model",
+        .ios, .visionos => "hw.machine",
+        else => return "",
+    };
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname(key, buf, &len, null, 0) != 0) return "";
+    return std.mem.sliceTo(buf[0..len], 0);
+}
+
+test "machineJson names the OS and the device model, as valid JSON" {
+    const a = std.testing.allocator;
+    const field = try machineJson(a);
+    defer a.free(field);
+    const j = try std.fmt.allocPrint(a, "{{\"data\":[]{s}}}", .{field});
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    const m = parsed.value.object.get("machine").?.object;
+    try std.testing.expectEqualStrings(@tagName(builtin.os.tag), m.get("os").?.string);
+    if (builtin.os.tag == .macos) try std.testing.expect(m.get("model").?.string.len > 0);
+    try std.testing.expect(m.get("total_mib").?.integer >= m.get("free_mib").?.integer);
 }
 
 /// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
@@ -7484,6 +7737,42 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     try stream.writeAll(hdr);
     stream.length_framed = true;
     if (body.len > 0) try stream.writeAll(body);
+}
+
+/// `GET /v1/load-progress`: every model mid-load and what its load is doing (`load_progress.zig`).
+/// Cheap enough to poll while a load runs: it reads no configs.
+fn renderLoadProgressBody(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+    return loadProgressBody(allocator, io, global_registry orelse return error.RegistryNotReady);
+}
+
+fn loadProgressBody(allocator: std.mem.Allocator, io: std.Io, registry: *ModelRegistry) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const now = io_util.nowMsMonotonic(io);
+    const footprint = metrics.getAppMemFootprintMb();
+    try buf.appendSlice(allocator, "{\"loading\":[");
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    var it = registry.entries.valueIterator();
+    var first = true;
+    while (it.next()) |e| {
+        const entry = e.*;
+        if (entry.state != .loading) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"id\":");
+        try chat_mod.appendJsonString(allocator, &buf, entry.id);
+        try buf.appendSlice(allocator, ",\"path\":");
+        try chat_mod.appendJsonString(allocator, &buf, entry.path);
+        try buf.appendSlice(allocator, ",\"progress\":");
+        var jb: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&jb);
+        try entry.load_progress.snapshot(now, footprint).writeJson(&w);
+        try buf.appendSlice(allocator, w.buffered());
+        try buf.append(allocator, '}');
+    }
+    try buf.appendSlice(allocator, "]}");
+    return buf.toOwnedSlice(allocator);
 }
 
 /// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
@@ -7614,14 +7903,15 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_not_ready", "Loaded model has no parsed config", 500);
         return;
     };
-    const model_id: []const u8 = if (lm.id.len > 0) lm.id else config.model_type;
+    const model_id_json = try jsonEscape(allocator, if (lm.id.len > 0) lm.id else config.model_type);
+    defer allocator.free(model_id_json);
     const bytes_resident = lm.bytes_resident;
     const bytes_on_disk_str = if (lm.bytes_on_disk) |b|
         try std.fmt.allocPrint(allocator, "{d}", .{b})
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
-    const drafter_loaded = lm.drafter != null or lm.dflash != null;
+    const drafter_loaded = lm.hasDrafter();
     const drafter_path_json = if (drafter_loaded)
         try jsonEscape(allocator, lm.drafter_path)
     else
@@ -7629,9 +7919,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     defer allocator.free(drafter_path_json);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
+        \\{{"model":{{"id":{s},"object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
     , .{
-        model_id,
+        model_id_json,
         bytes_resident,
         bytes_on_disk_str,
         if (drafter_loaded) "true" else "false",
@@ -8042,6 +8332,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
+    if (lm.mesh_engine) |e| req.peak_bytes = media_mod.meshRequestPeakBytes(body, e.backend);
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
         .weight = @max(1, d.count()),
@@ -8161,9 +8452,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         },
     };
 
-    const id_for_body = if (requested_id.len > 0) requested_id else "mlx-serve";
+    const id_for_body = try jsonEscape(allocator, if (requested_id.len > 0) requested_id else "mlx-serve");
+    defer allocator.free(id_for_body);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
+        \\{{"model":{{"id":{s},"object":"model","loaded":false,"state":"unloaded"}}}}
     , .{id_for_body});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -8226,7 +8518,7 @@ fn renderPropsBody(
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
     // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
     if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
-    if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
+    if (entry.engineBacked()) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
 }
@@ -8274,7 +8566,7 @@ const PropsSettings = struct {
     prefill_decode_share: f32 = 0,
 };
 
-const PropsEngine = enum { mlx, llama, ds4 };
+const PropsEngine = enum { mlx, llama, ds4, ane };
 
 /// ds4 and llama.cpp bypass generate.zig: MLX decode levers, PLD and the MLX drafters never run there.
 fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bool) PropsSettings {
@@ -8294,15 +8586,17 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 }
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
-    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
+    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else if (lm.ane != null) .ane else .mlx;
     const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
-    return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
+    var out = embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
+    if (lm.ane != null) out.kv_quant = "off";
+    return out;
 }
 
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
-    const native = if (lm.transformer) |x| x.dsv41_ext else null;
+    const native = if (lm.transformer) |x| x.mlx_stream_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
@@ -8463,7 +8757,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    const cluster_json = try @import("distributed.zig").propsJson(allocator);
+    defer allocator.free(cluster_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, cluster_json, registryGeneration() });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -8473,6 +8769,15 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// `ModelRegistry.generation`: moves with every model added and every load state change (not with
+/// provider or LAN rows).
+/// Moves whenever `/v1/models` would list something else: the registry or a LAN peer.
+fn registryGeneration() u64 {
+    const reg: u64 = if (global_registry) |r| r.generation.load(.monotonic) else 0;
+    const lan: u64 = if (g_lan) |l| l.changes.load(.monotonic) else 0;
+    return reg +% lan;
 }
 
 /// The registry's residency bill: the weights of every ready model, media ones included.
@@ -8493,9 +8798,11 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
+    const cluster_json = try @import("distributed.zig").propsJson(allocator);
+    defer allocator.free(cluster_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, registryGeneration() });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -8555,6 +8862,21 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     const empty = try wrapEncoderIds(a, &.{}, 2, 1);
     defer a.free(empty);
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
+}
+
+test "wrapEmbeddingIds: a last-token pooler appends its tokenizer's terminator, not config.json's eos (#909)" {
+    const a = testing.allocator;
+    // Qwen3-Embedding-4B: config eos <|im_end|> 151645, post-processor appends <|endoftext|> 151643.
+    var cfg = model_mod.ModelConfig{};
+    cfg.pooling_mode = .last_token;
+    cfg.addEosToken(151645);
+    const ids = try wrapEmbeddingIds(a, &cfg, 151643, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151643 }, ids);
+    // No post-processor terminator: config eos.
+    const fallback = try wrapEmbeddingIds(a, &cfg, null, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(fallback);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151645 }, fallback);
 }
 
 fn handleEmbeddings(
@@ -8654,7 +8976,7 @@ fn handleEmbeddings(
             return;
         }
         const raw_ids = try tok.encode(allocator, text);
-        const ids = try wrapEmbeddingIds(allocator, config, raw_ids);
+        const ids = try wrapEmbeddingIds(allocator, config, tok.appended_special, raw_ids);
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }
@@ -8681,7 +9003,9 @@ fn handleEmbeddings(
 /// [CLS]/[SEP] come from WordPiece itself); a last-token pooler (Qwen3-Embedding) pools an APPENDED terminator,
 /// which its tokenizer's TemplateProcessing adds to every encode and the reference pools THAT position — without
 /// it we'd pool the final text token and quietly diverge from the model card. Frees `raw_ids`.
-fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, raw_ids: []u32) ![]u32 {
+/// `appended`: the tokenizer's post-processor terminator (`Tokenizer.appended_special`), which can differ from
+/// config.json's eos (Qwen3-Embedding-4B: `<|im_end|>` there, `<|endoftext|>` pooled).
+fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, appended: ?u32, raw_ids: []u32) ![]u32 {
     const eos: ?u32 = if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null;
     if (config.use_bidirectional_attention) {
         defer allocator.free(raw_ids);
@@ -8689,7 +9013,7 @@ fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.Model
     }
     if (config.effectivePooling() == .last_token) {
         defer allocator.free(raw_ids);
-        return wrapEncoderIds(allocator, raw_ids, null, eos);
+        return wrapEncoderIds(allocator, raw_ids, null, appended orelse eos);
     }
     return raw_ids;
 }
@@ -8841,7 +9165,7 @@ fn handleMessagesEmbedding(
     };
 
     // Wrapped, with the placeholders still one id each; the expansion below replaces them with the soft-token runs.
-    var ids = try wrapEmbeddingIds(allocator, config, try allocator.dupe(u32, prompt.ids));
+    var ids = try wrapEmbeddingIds(allocator, config, lm.tokenizer.?.appended_special, try allocator.dupe(u32, prompt.ids));
     defer allocator.free(ids);
     log.info("POST /v1/embeddings (messages: {d} media items)\n", .{prompt.items.len});
 
@@ -9425,6 +9749,13 @@ fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
 }
 
+/// The request's `enable_pld`, else the launch default; never on a Neural Engine model, whose
+/// engine drafts on its own.
+fn requestPld(root: std.json.ObjectMap, lm: *const LoadedModel) bool {
+    if (lm.ane != null) return false;
+    return if (root.get("enable_pld")) |v| v == .bool and v.bool else server_config.default_enable_pld;
+}
+
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -9871,10 +10202,7 @@ fn handleChatCompletions(
     // that came from the default — explicit user overrides are honored even
     // on novel content.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
     // Tools do NOT disable PLD: tool-pattern detection operates on emitted
     // text and is agnostic to how many tokens a decode step yields, and
     // agent traffic (tool results echoed into edits) is PLD's best workload.
@@ -9886,35 +10214,11 @@ fn handleChatCompletions(
     // `ssmSnapshot`/`ssmRestore` in transformer.zig.
     if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
 
-    // Parse enable_drafter: per-request override of the --drafter default.
-    // Auto-disabled when:
-    //   - the server didn't load a drafter (`default_drafter == null`)
-    //   - logprobs are requested (drafter doesn't expose realized log-probs)
-    //   - hybrid SSM architecture (same SSM-state issue as PLD; drafter would
-    //     hit it on the verify forward).
-    // Tools do NOT disable the drafter (same reasoning as PLD above);
-    // equivalence with tools is pinned by tests/test_drafter_tools.sh.
-    // Priority: drafter > PLD > regular. When drafter wins, force PLD off
-    // so logs / state stay consistent.
+    // Tools do not disable the drafter; logprobs require the target's plain path.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    // Plan 05: per-model drafter — when a drafter is loaded for this model,
-    // requests default to ON unless the target is MoE (where verify-forward
-    // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
-    // overrides either way.
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) {
-        enable_drafter = false; // no drafter loaded; quietly fall through
-    }
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and logprobs_n > 0) {
         log.info("  drafter=disabled (logprobs requested)\n", .{});
-        enable_drafter = false;
-    }
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
-        log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
@@ -10125,6 +10429,7 @@ fn handleChatCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -10242,7 +10547,7 @@ fn handleCompletions(
 
     const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
     if (prompt_logprobs) if (promptLogprobsRejectReason(.{
-        .engine_backed = lm.ds4_engine != null or lm.llama_engine != null,
+        .engine_backed = lm.engineBacked(),
         .diffusion = config.isDiffusion(),
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
     })) |reason| {
@@ -10317,17 +10622,9 @@ fn handleCompletions(
     // (tests/test_completions_spec.sh). Embedded engines (ds4/llama) ignore
     // these flags at dispatch.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -10406,6 +10703,7 @@ fn handleCompletions(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -11768,6 +12066,65 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
+/// Resolve sidecar admission before the request's logprobs, grammar and yield gates.
+fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflash_loaded: bool, is_moe: bool, has_hybrid_layers: bool) bool {
+    const enabled = if (explicit) |v| v == .bool and v.bool else (gemma_loaded and !is_moe) or dflash_loaded;
+    if (!enabled or (!gemma_loaded and !dflash_loaded)) return false;
+    return !archBlocksAssistantSidecar(has_hybrid_layers, dflash_loaded);
+}
+
+test "drafter admission: defaults and explicit opt-in cover every sidecar and architecture" {
+    const Case = struct {
+        gemma: bool,
+        dflash: bool,
+        moe: bool,
+        hybrid: bool,
+        default: bool,
+        explicit: bool,
+    };
+    const cases = [_]Case{
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+    };
+    for (cases) |c| {
+        const default = requestEnableDrafter(null, c.gemma, c.dflash, c.moe, c.hybrid);
+        const explicit = requestEnableDrafter(.{ .bool = true }, c.gemma, c.dflash, c.moe, c.hybrid);
+        try testing.expectEqual(c.default, default);
+        try testing.expectEqual(c.explicit, explicit);
+        try testing.expect(!requestEnableDrafter(.{ .bool = false }, c.gemma, c.dflash, c.moe, c.hybrid));
+        for ([_]bool{ default, explicit }) |enabled| {
+            const spec = requestSpecModes(false, enabled, false, c.gemma, c.dflash, false, false, 0, false);
+            try testing.expectEqual(enabled, spec.use_drafter);
+            try testing.expect(!spec.use_mtp and !spec.use_pld);
+            try testing.expectEqual(if (enabled) StreamMode.drafter else .regular, pickStreamMode(false, enabled, false, c.gemma, c.dflash, false, false, 0, false));
+        }
+    }
+}
+
+test "drafter admission: present non-boolean overrides disable either sidecar" {
+    for ([_][]const u8{ "null", "\"true\"", "1", "1.0", "[]", "{}" }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        try testing.expect(!requestEnableDrafter(parsed.value, true, false, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, true, true));
+    }
+}
+
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
 
 fn requestHasCompany() bool {
@@ -13119,6 +13476,68 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     if (responseBodyLogged(content_type)) logHttpBody("[http] response body", body);
 }
 
+/// The path as logged: a query carrying the API key is dropped.
+fn logSafePath(raw_path: []const u8) []const u8 {
+    if (queryParamValue(raw_path, "api_key") == null and queryParamValue(raw_path, "key") == null) return raw_path;
+    return raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
+}
+
+/// The body as logged: the login form's POST carries the API key.
+fn logSafeBody(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) []const u8 {
+    return if (loginFormKey(method, path, content_type, body) != null) "" else body;
+}
+
+test "a logged request never carries the API key" {
+    try testing.expectEqualStrings("/metrics", logSafePath("/metrics?api_key=s3cret"));
+    try testing.expectEqualStrings("/v1/models", logSafePath("/v1/models?x=1&key=s3cret"));
+    try testing.expectEqualStrings("/v1/messages?beta=true", logSafePath("/v1/messages?beta=true"));
+    const ct = "application/x-www-form-urlencoded";
+    try testing.expectEqualStrings("", logSafeBody("POST", "/", ct, "api_key=s3cret"));
+    try testing.expectEqualStrings("{\"a\":1}", logSafeBody("POST", "/v1/chat/completions", "application/json", "{\"a\":1}"));
+}
+
+test "the default-level log lines never carry the API key either" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s.log", .{root});
+    try log.openFile(path, 0);
+    defer log.closeFile();
+
+    // The 413 for an oversized body (warn).
+    var body_buf: [64]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    _ = try readRequestOver("POST /v1/chat/completions?api_key=s3cret HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
+
+    // The LAN proxy line (info), to a peer that accepts nothing.
+    const a = testing.allocator;
+    var l = lan_mod.Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    const models = try a.alloc(lan_mod.PeerModel, 1);
+    models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1, models, false, .{});
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    defer _ = std.c.close(sv[1]);
+    try handleLanProxy(a, &conn, &l, "POST", "/v1/chat/completions?key=s3cret", "{\"model\":\"gemma@studio\"}", null, "gemma@studio");
+
+    const logged = try tmp.dir.readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "s.log", a, .limited(1 << 20));
+    defer a.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "[lan] proxy") != null); // both lines were written
+    try testing.expect(std.mem.indexOf(u8, logged, "413") != null);
+    try testing.expect(std.mem.indexOf(u8, logged, "s3cret") == null);
+}
+
 /// The console page is half a megabyte of our own HTML and says nothing about a request;
 /// API responses (JSON, text) are what a post-mortem reads.
 fn responseBodyLogged(content_type: []const u8) bool {
@@ -13190,20 +13609,74 @@ fn bodyPreview(out: []u8, body: []const u8) []const u8 {
     return out[0..n];
 }
 
+/// A run of base64 this long is an embedded image or clip, not text anyone reads out of a log.
+const LOG_BASE64_RUN: usize = 4096;
+
+fn isBase64Byte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=' or c == '-' or c == '_';
+}
+
+/// `body` with every base64 run of `LOG_BASE64_RUN` bytes or more replaced by `<N base64 chars>`.
+fn elideLongBase64(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, @min(body.len, 1 << 20));
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < body.len) {
+        var j = i;
+        while (j < body.len and isBase64Byte(body[j])) j += 1;
+        if (j - i >= LOG_BASE64_RUN) {
+            try out.print(allocator, "<{d} base64 chars>", .{j - i});
+        } else {
+            try out.appendSlice(allocator, body[i..j]);
+        }
+        if (j < body.len) {
+            try out.append(allocator, body[j]);
+            j += 1;
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
     // Text bodies go out WHOLE — reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
+    // log is the documented way to reproduce a tool-calling bug — minus embedded
+    // images: a vision agent's history is megabytes of base64 per request.
     if (bodyIsText(body)) {
+        if (body.len > LOG_BASE64_RUN) if (elideLongBase64(std.heap.page_allocator, body)) |shown| {
+            defer std.heap.page_allocator.free(shown);
+            log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, shown });
+            return;
+        } else |_| {};
         log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
         return;
     }
     // Binary is a different story. `/v1/images/edits` is multipart, so one image
-    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // upload wrote raw PNG bytes into the log, and a body near the request
     // cap blew through the 32 MB rotation — taking the post-mortem file with it.
     var buf: [BODY_LOG_LIMIT]u8 = undefined;
     const preview = bodyPreview(&buf, body);
     log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
+}
+
+test "debug body log: an embedded image is elided and the text around it is kept whole" {
+    const gpa = std.testing.allocator;
+    var b64: [5000]u8 = undefined;
+    @memset(&b64, 'A');
+    const body = try std.fmt.allocPrint(gpa, "{{\"role\":\"user\",\"image\":\"data:image/png;base64,{s}\",\"text\":\"keep this\"}}", .{&b64});
+    defer gpa.free(body);
+    const out = try elideLongBase64(gpa, body);
+    defer gpa.free(out);
+    try std.testing.expect(out.len < 200);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<5000 base64 chars>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "keep this") != null);
+    // A short run (a token, a hash, a small id) is ordinary text.
+    const short = "{\"id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}";
+    const kept = try elideLongBase64(gpa, short);
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings(short, kept);
 }
 
 const GaugeSamplerCtx = struct {
@@ -13251,15 +13724,16 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // generated so far by still-decoding slots (the scheduler publishes that
     // aggregate atomically once per decode tick — race-free, no per-token
     // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
+    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic) + ctx.scheduler.ane_generated.load(.monotonic);
     ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU
     // pinned, decode reading 0, prefill reading "—". This gauge moves per
     // prefill chunk and returns to 0 the moment the prefill ends.
-    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
-    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic));
+    // Neural Engine requests count apart: the GPU's prefill stores its absolute progress.
+    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.done.load(.monotonic));
+    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.todo.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
 }
 
@@ -13286,13 +13760,12 @@ fn idleEvictLoop(ctx: IdleEvictCtx) void {
     const sch = ctx.scheduler;
     const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);
     // Wake every 500 ms to check the stop flag; sweep once per tick interval.
-    // `std.c.nanosleep` for the same reason as the gauge sampler: `std.time.sleep`
-    // is gone in Zig 0.16, and a blocking Io timer here could outlive the stop.
-    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    // `crt.sleepMs` for the same reason as the gauge sampler: a blocking Io timer
+    // here could outlive the stop.
     const ticks_per_sweep: u64 = @max(1, @as(u64, @intCast(@divTrunc(tick_ms, 500))));
     var tick: u64 = 0;
     while (!ctx.stop.load(.monotonic)) {
-        _ = std.c.nanosleep(&poll_ts, null);
+        crt.sleepMs(500);
         tick += 1;
         if (tick < ticks_per_sweep) continue;
         tick = 0;
@@ -13328,16 +13801,14 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
     // Wake every 500 ms to check the stop flag; sample system state once per
     // 2-second interval. The 2 s cadence is what makes generation_tokens_live a
     // real-time tok/s source — the panel windows over a few of these samples.
-    // Uses std.c.nanosleep (POSIX) because std.time.sleep was removed in Zig
-    // 0.16 — this thread has no Io handle.
+    // `crt.sleepMs`: this thread has no Io handle.
     const SAMPLE_INTERVAL_TICKS: u64 = 4; // 4 × 500 ms = 2 s
-    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
     // Sample once immediately so the panel / Grafana show real values from the
     // first scrape instead of zeros for the first interval.
     sampleGauges(ctx);
     var tick: u64 = 0;
     while (!ctx.stop.load(.monotonic)) {
-        _ = std.c.nanosleep(&poll_ts, null);
+        crt.sleepMs(500);
         tick += 1;
         if (tick < SAMPLE_INTERVAL_TICKS) continue;
         tick = 0;
@@ -13501,23 +13972,18 @@ const LAN_PEER_WAIT_MS: i64 = 15_000;
 ///     (client disconnect abandons the wait), then 404.
 /// 502 when the peer resolves but stops accepting. Never a silent fallback
 /// to the local default model.
-fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
-    // Swift/PHP clients escape '/' as '\/', so the raw body slice can read
-    // `ddalcu\/gemma…@peer` while the peer table stores the canonical id
-    // (live 404 "no longer shares this model" from the app). Look up with
-    // the CANONICAL form — and splice the canonical bare id into the
-    // forwarded body too, or the peer's own scanner would miss it and
-    // silently serve its default model.
-    var canon_buf: [512]u8 = undefined;
-    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
-    const rid = lan_mod.splitRemoteId(canon).?;
+/// `full_id` is canonical (`\/` collapsed) and `raw_model` the body's value as written: Swift/PHP
+/// clients send `ddalcu\/gemma…@peer`, the peer table stores `ddalcu/gemma…`, and the canonical
+/// bare id replaces the raw bytes, or the peer's own scanner would miss it and serve its default.
+fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
+    const rid = lan_mod.splitRemoteId(full_id).?;
     if (!l.discover) {
         try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "This id names a LAN peer's model, but LAN discovery is off on this server — start it with --lan-discover (app: Settings > LAN Sharing > Use models shared by other Macs)", 404);
         return;
     }
     const deadline = nowMsMonotonic(stream.io) + LAN_PEER_WAIT_MS;
     const remote: lan_mod.Remote = remote: while (true) {
-        switch (l.lookupRemote(canon)) {
+        switch (l.lookupRemote(full_id)) {
             .found => |r| break :remote r,
             .model_unlisted => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "The LAN peer no longer shares this model", 404);
@@ -13530,16 +13996,15 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
                 }
                 if (stream.peerClosed()) return; // client gave up while we waited
                 l.pokeDiscovery();
-                const ts = std.c.timespec{ .sec = 0, .nsec = 250_000_000 };
-                _ = std.c.nanosleep(&ts, null);
+                crt.sleepMs(250);
             },
         }
     };
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
+    const rewritten = try proxiedBody(allocator, body, raw_model, rid.bare);
     defer allocator.free(rewritten);
     const key = l.peerKey(allocator, rid.peer);
     defer if (key) |k| allocator.free(k);
-    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
+    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, logSafePath(raw_path), rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
     lan_mod.tunnel(remote, method, raw_path, rewritten, key, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
@@ -13548,19 +14013,26 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
 /// Proxy `<bare>@<provider>` to the provider's /v1/chat/completions. Only that
 /// surface exists upstream, so every other model-gated route is a named 400
 /// rather than a request the provider would reject in its own words.
-fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, full_id: []const u8) !void {
+/// `body` to forward with its model value replaced by `bare`: `raw` is that value as the client
+/// wrote it (a slice of `body`); a model named in the query string leaves the body as is.
+fn proxiedBody(allocator: std.mem.Allocator, body: []const u8, raw: ?[]const u8, bare: []const u8) ![]u8 {
+    const r = raw orelse return allocator.dupe(u8, body);
+    const bare_json = try jsonEscape(allocator, bare); // canonical again, so a backslash is re-escaped
+    defer allocator.free(bare_json);
+    return lan_mod.rewriteModelValue(allocator, body, r, bare_json[1 .. bare_json.len - 1]);
+}
+
+fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
     if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
         return;
     }
-    var canon_buf: [512]u8 = undefined;
-    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
-    var up = prov.lookup(allocator, canon) orelse {
+    var up = prov.lookup(allocator, full_id) orelse {
         try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No such provider", 404);
         return;
     };
     defer up.deinit(allocator);
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, up.bare);
+    const rewritten = try proxiedBody(allocator, body, raw_model, up.bare);
     defer allocator.free(rewritten);
     log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
     providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
@@ -13652,12 +14124,48 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
         if (constTimeEql(xk, key)) return true;
     }
-    // Percent-decoded: the login form sends the key back URL-encoded.
+    if (findHeaderValueCI(raw_headers, "cookie")) |c| {
+        if (pairValue(c, ';', KEY_COOKIE)) |v| if (encodedKeyMatches(v, key)) return true;
+    }
     var qbuf: [512]u8 = undefined;
     inline for (.{ "api_key", "key" }) |name| {
         if (queryDecoded(&qbuf, raw_path, name)) |q| if (constTimeEql(q, key)) return true;
     }
     return false;
+}
+
+/// The console's login cookie: the key as the form percent-encoded it. HttpOnly, so page
+/// scripts never read it; the browser sends it on the page load and on the console's own calls.
+const KEY_COOKIE = "mlx_serve_key";
+
+fn encodedKeyMatches(encoded: []const u8, key: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    return constTimeEql(percentDecoded(&buf, encoded) orelse return false, key);
+}
+
+/// Form encoding's own alphabet: nothing that could end a header or a cookie.
+fn cookieSafe(v: []const u8) bool {
+    if (v.len == 0 or v.len > 512) return false;
+    for (v) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "%+-._*~", c) == null) return false;
+    return true;
+}
+
+/// The still-encoded `api_key` of the login form's POST, or null when this is not that POST.
+fn loginFormKey(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, path, "/")) return null;
+    if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) return null;
+    const v = pairValue(body, '&', "api_key") orelse return null;
+    return if (cookieSafe(v)) v else null;
+}
+
+/// Trade an accepted key for the cookie and send the browser to the bare page, so the key
+/// never sits in the URL (`./` keeps a reverse proxy's path prefix).
+fn sendKeyCookie(stream: *Conn, encoded: []const u8) !void {
+    logHttpResponse("303 See Other", "", "");
+    var hdr_buf: [1024]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 303 See Other\r\nLocation: ./\r\nSet-Cookie: " ++ KEY_COOKIE ++ "={s}; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{encoded}) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    stream.length_framed = true;
 }
 
 /// A browser opening the page (`GET /` that accepts HTML) without the key gets
@@ -13669,10 +14177,12 @@ fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8)
 }
 
 /// The login form, saying so when a key was offered and refused. Script-free:
-/// a GET form back to the same path sends `?api_key=`, which the page then keeps.
+/// it POSTs the key back to `/` (`loginFormKey`), which answers with the cookie.
 fn loginPage(raw_headers: []const u8, raw_path: []const u8) []const u8 {
+    const cookie_key = if (findHeaderValueCI(raw_headers, "cookie")) |c| pairValue(c, ';', KEY_COOKIE) else null;
     const tried = findHeaderValueCI(raw_headers, "authorization") != null or
         findHeaderValueCI(raw_headers, "x-api-key") != null or
+        cookie_key != null or
         queryParamValue(raw_path, "api_key") != null or
         queryParamValue(raw_path, "key") != null;
     return if (tried) loginPageHtml("<p class=err>That key was not accepted. Try again.</p>") else loginPageHtml("");
@@ -13699,7 +14209,7 @@ fn loginPageHtml(comptime note: []const u8) []const u8 {
     \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
     \\
 ++ note ++
-    \\<form method="get">
+    \\<form method="post">
     \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
     \\<button type="submit">Continue</button>
     \\</form>
@@ -13763,12 +14273,27 @@ test "a browser opening the page without the key gets a login form; API clients 
 
     const first = loginPage("", "/");
     try std.testing.expect(std.mem.indexOf(u8, first, "name=\"api_key\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"get\"") != null);
+    // POST, so the key never lands in the URL, history or a Referer (#887).
+    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"post\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "<script") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "not accepted") == null);
     // A key that was tried and failed says so, whichever way it came.
     try std.testing.expect(std.mem.indexOf(u8, loginPage("", "/?api_key=bad"), "not accepted") != null);
     try std.testing.expect(std.mem.indexOf(u8, loginPage("Authorization: Basic dTpi\r\n", "/"), "not accepted") != null);
+}
+
+test "the login form's key comes back as a cookie that authorizes the page and its API calls (#887)" {
+    const prev = g_api_key;
+    defer g_api_key = prev;
+    g_api_key = "a+b/c=";
+    // The form body is percent-encoded; its value is what the cookie stores.
+    try std.testing.expectEqualStrings("a%2Bb%2Fc%3D", loginFormKey("POST", "/", "application/x-www-form-urlencoded", "api_key=a%2Bb%2Fc%3D").?);
+    try std.testing.expect(loginFormKey("GET", "/", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/v1/models", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/", "application/json", "{}") == null);
+    try std.testing.expect(apiKeyAuthorized("Cookie: theme=dark; " ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: " ++ KEY_COOKIE ++ "=a%2Bb\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: x" ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/"));
 }
 
 test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
@@ -13984,24 +14509,60 @@ test "every continuation surface consults continuationRejectReason before render
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
-    // Video piggybacks the SAME "does this model take image input?" signal —
-    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
-    // `vision_config`/`vision_encoder` — so a future edit to either the READY
-    // (live config) or STUB (unloaded, config.json-only) input_modalities
-    // builder that touches the image gate but forgets video would silently
-    // under-report every video-capable model to the app forever (the attach
-    // menu's video option reads exactly this field). Two independent checks:
-    // the two sites read DIFFERENT underlying signals (config.video_token_id
-    // vs StubMeta.has_video) and must each carry their own gate.
-    const src = @embedFile("server.zig");
-
-    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
-    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
-    const ready_window = src[ready_at .. ready_at + 260];
-    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
+test "input_modalities renders resident video weights and native unloaded capabilities" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const native = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\"}}";
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = native });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("video", path, 0);
+    defer {
+        entry.config = null;
+        entry.chat_config = null;
+        entry.vision_encoder = null;
+        entry.state = .unloaded;
+    }
+    var qwen_config = model_mod.ModelConfig{ .qwen_vision = true, .video_token_id = 7 };
+    var radio_config = try model_mod.parseConfigFromJson(a, native);
+    defer radio_config.deinit(a);
+    var chat_config = chat_mod.ChatConfig{
+        .chat_template = "template", .bos_token = null, .eos_token = null,
+        .add_bos_token = false, .allocator = a,
+    };
+    var encoder = std.mem.zeroInit(vision_mod.VisionEncoder, .{ .allocator = a, .config = qwen_config });
+    var radio = std.mem.zeroInit(radio_vision.RadioVision, .{ .allocator = a });
+    const video_weight = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(video_weight);
+    entry.config = &qwen_config;
+    entry.chat_config = &chat_config;
+    entry.vision_encoder = &encoder;
+    entry.state = .ready;
+    const expect_modalities = struct {
+        fn check(alloc: std.mem.Allocator, runtime_io: std.Io, model: *LoadedModel, want: []const []const u8) !void {
+            const json = try renderModelEntry(alloc, runtime_io, model);
+            defer alloc.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            const modalities = parsed.value.object.get("input_modalities").?.array.items;
+            try testing.expectEqual(want.len, modalities.len);
+            for (want, modalities) |expected, actual| try testing.expectEqualStrings(expected, actual.string);
+        }
+    }.check;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    entry.config = &radio_config;
+    encoder.config = radio_config;
+    radio.video_w = video_weight;
+    encoder.radio = radio;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    encoder.radio.?.video_w = .{ .ctx = null };
+    try expect_modalities(a, io, entry, &.{ "text", "image" });
+    entry.state = .unloaded;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -14268,6 +14829,9 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const gpu_context_lost_message =
+    "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
+
 /// Body text for a context-overflow 400, in a caller-owned buffer.
 ///
 /// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
@@ -14318,6 +14882,8 @@ fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *sc
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
+        error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a
@@ -14850,20 +15416,13 @@ fn formatLogprobsObject(
     return try std.fmt.allocPrint(allocator, "{{\"content\":{s}}}", .{content_buf.items});
 }
 
-/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
-/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
-/// `repeat_penalty` wins.
-/// Forced generation-defaults rules outrank both; unforced ones fill the request's silence.
+/// The multiplicative `repeat_penalty` (llama.cpp's); a value <= 0 is an omission.
 fn requestRepeatPenalty(root: std.json.ObjectMap, gen: generation_settings.Profile) f32 {
-    if (gen.forced(.repeat_penalty)) return gen.value(f32, .repeat_penalty).?;
-    if (gen.forced(.frequency_penalty)) return 1.0 + gen.value(f32, .frequency_penalty).?;
     const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-    if (repeat > 0) return repeat;
-    if (parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0)) |frequency| return 1.0 + frequency;
-    if (gen.value(f32, .repeat_penalty)) |r| if (r != 1.0) return r;
-    return 1.0 + (gen.value(f32, .frequency_penalty) orelse 0.0);
+    return gen.resolve(f32, .repeat_penalty, if (repeat > 0) repeat else null, 1.0);
 }
 
+/// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -14913,25 +15472,42 @@ fn collectMediaItems(allocator: std.mem.Allocator, messages: []const chat_mod.Me
     return items.toOwnedSlice(allocator);
 }
 
-fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+const MediaTokens = struct {
+    config: *const model_mod.ModelConfig,
+    /// `<img>`, emitted for each RADIO video part. Distinct from the image token.
+    video_sentinel: u32 = 0,
+    /// `</img>`, closing each tubelet's kept `<image>` run.
+    img_end: u32 = 0,
+};
+
+fn placeholderKindOf(token: u32, mt: MediaTokens) ?std.meta.Tag(MediaItem) {
     if (token == 0) return null;
-    if (token == config.image_token_id) return .image;
-    if (token == config.video_token_id) return .video;
-    if (token == config.audio_token_id) return .audio;
+    if (token == mt.config.image_token_id) return .image;
+    if (mt.video_sentinel != 0 and token == mt.video_sentinel) return .video;
+    if (token == mt.config.video_token_id) return .video;
+    if (token == mt.config.audio_token_id) return .audio;
     return null;
+}
+
+fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+    return placeholderKindOf(token, .{ .config = config });
 }
 
 const MEDIA_PLACEHOLDER_REJECT = "the rendered prompt does not carry one media placeholder per attached item: the chat template failed to render (see the server log), cannot place media in this message, or the text contains a literal media token";
 
 /// The k-th placeholder the template rendered must be item k, by kind.
-fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+fn placeholdersMatchOf(prompt_ids: []const u32, items: []const MediaItem, mt: MediaTokens) bool {
     var k: usize = 0;
     for (prompt_ids) |t| {
-        const kind = placeholderKind(t, config) orelse continue;
+        const kind = placeholderKindOf(t, mt) orelse continue;
         if (k == items.len or std.meta.activeTag(items[k]) != kind) return false;
         k += 1;
     }
     return k == items.len;
+}
+
+fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+    return placeholdersMatchOf(prompt_ids, items, .{ .config = config });
 }
 
 const ExpandedPrompt = struct { ids: []u32, media: []prefix_cache_mod.MediaSpan };
@@ -14946,7 +15522,22 @@ fn expandMediaPlaceholders(
     item_keys: []const u64,
     config: *const model_mod.ModelConfig,
 ) !ExpandedPrompt {
-    if (!placeholdersMatch(prompt_ids, items, config)) return error.MediaPlaceholderMismatch;
+    return expandMedia(allocator, prompt_ids, items, item_tokens, item_keys, .{ .config = config }, ByteTokenizer{}, &.{});
+}
+
+/// `item_keep[k]`, when set, is the pre-EVS mask for a RADIO video. Null keeps
+/// the tower's own run (Qwen, Gemma, still images).
+fn expandMedia(
+    allocator: std.mem.Allocator,
+    prompt_ids: []const u32,
+    items: []const MediaItem,
+    item_tokens: []const usize,
+    item_keys: []const u64,
+    mt: MediaTokens,
+    tok: anytype,
+    item_keep: []const ?[]const bool,
+) !ExpandedPrompt {
+    if (!placeholdersMatchOf(prompt_ids, items, mt)) return error.MediaPlaceholderMismatch;
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
     const media = try allocator.alloc(prefix_cache_mod.MediaSpan, items.len);
@@ -14954,15 +15545,20 @@ fn expandMediaPlaceholders(
     var k: usize = 0;
     var images_before: usize = 0;
     for (prompt_ids) |t| {
-        if (placeholderKind(t, config) == null) {
+        if (placeholderKindOf(t, mt) == null) {
             try ids.append(allocator, t);
             continue;
         }
         const run_start = ids.items.len;
-        try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, config);
+        if (items[k] == .video and mt.config.radio_vision) {
+            const mask: ?[]const bool = if (k < item_keep.len) item_keep[k] else null;
+            try appendRadioVideoRun(allocator, &ids, items[k].video, item_tokens[k], mask, mt, tok);
+        } else {
+            try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, mt.config);
+        }
         images_before += @intFromBool(items[k] == .image);
         var first = run_start;
-        while (first < ids.items.len and placeholderKind(ids.items[first], config) == null) first += 1;
+        while (first < ids.items.len and placeholderKindOf(ids.items[first], mt) == null) first += 1;
         media[k] = .{ .start = @intCast(first), .key = item_keys[k] };
         k += 1;
     }
@@ -14999,7 +15595,7 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
         }
         return;
     }
-    const wrap = !config.qwen_vision;
+    const wrap = !config.qwen_vision and !config.radio_vision;
     const open: u32, const pad: u32, const close: u32 = switch (item) {
         .image => |pieces| blk: {
             if (config.lfm2_vision) return appendLfm2ImageRun(allocator, ids, pieces, config);
@@ -15011,6 +15607,47 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
     if (open > 0) try ids.append(allocator, open);
     try ids.appendNTimes(allocator, pad, n);
     if (close > 0) try ids.append(allocator, close);
+}
+
+/// One RADIO clip: each tubelet is its label, `<img>`, the kept `<image>` ids, `</img>`.
+/// The label is tokenized alone so the specials stay atoms. A short last group
+/// omits the frame the encoder repeats. Dropped positions are absent, which is
+/// the sequence EVS leaves after it prunes the full run.
+fn appendRadioVideoRun(
+    allocator: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    vid: *const chat_mod.VideoData,
+    kept: usize,
+    mask: ?[]const bool,
+    mt: MediaTokens,
+    tok: anytype,
+) !void {
+    const geom = radio_vision.videoGeometry(vid.grid_t, vid.grid_h, vid.grid_w) orelse return error.InvalidVisionInput;
+    const full: usize = @as(usize, geom.groups) * geom.spatial;
+    const bits = mask orelse return error.InvalidVisionInput;
+    if (bits.len != full) return error.InvalidVisionInput;
+    if (mt.config.image_token_id == 0 or mt.video_sentinel == 0 or mt.img_end == 0) return error.InvalidVisionInput;
+    if (mt.video_sentinel == mt.config.image_token_id) return error.InvalidVisionInput;
+    var seen: usize = 0;
+    var g: u32 = 0;
+    while (g < geom.groups) : (g += 1) {
+        var buf: [96]u8 = undefined;
+        const label = radio_vision.videoGroupSegment(&buf, g, geom.frames);
+        if (label.len == 0) return error.InvalidVisionInput;
+        const label_ids = try tok.encode(allocator, label);
+        defer allocator.free(label_ids);
+        try ids.appendSlice(allocator, label_ids);
+        try ids.append(allocator, mt.video_sentinel);
+        const base: usize = @as(usize, g) * geom.spatial;
+        var i: usize = 0;
+        while (i < geom.spatial) : (i += 1) {
+            if (!bits[base + i]) continue;
+            try ids.append(allocator, mt.config.image_token_id);
+            seen += 1;
+        }
+        try ids.append(allocator, mt.img_end);
+    }
+    if (seen != kept) return error.InvalidVisionInput;
 }
 
 /// Soft tokens one MiniCPM-V piece contributes: its patch grid after both 2x2 merges (`16x`) or the last (`4x`).
@@ -15145,10 +15782,23 @@ fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
     return h.final();
 }
 
+const EncodedMedia = struct {
+    rows: mlx.mlx_array,
+    /// Parallel to encoder pieces. Empty when nothing was pruned. A mask is the
+    /// full pre-EVS length. Owned by the caller when `len != 0`.
+    item_keep: []?[]bool = &.{},
+};
+
+fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
+    for (keeps) |m| if (m) |s| allocator.free(s);
+    if (keeps.len != 0) allocator.free(keeps);
+}
+
 /// Encode `mp` on the inference thread (the sole mlx caller) and return every
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
-/// item k's row count.
-fn encodeMediaItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !mlx.mlx_array {
+/// item k's row count. RADIO video rows are already the EVS keep.
+fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
+    const sch = global_scheduler orelse return error.NoScheduler;
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
     var req = scheduler_mod.VisionEncodeRequest{
@@ -15159,6 +15809,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler,
         .allocator = allocator,
     };
     const arr = sch.encodeVision(&req) catch |err| {
+        if (req.item_keep) |keeps| freeKeepMasks(allocator, keeps);
         if (req.error_name) |e| {
             log.err("Vision encode (via scheduler) failed: {s}\n", .{e});
             allocator.free(e);
@@ -15172,7 +15823,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler,
         for (piece_tokens[p .. p + count]) |t| n.* += t;
         p += count;
     }
-    return arr;
+    return .{ .rows = arr, .item_keep = req.item_keep orelse &.{} };
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is
@@ -15272,13 +15923,31 @@ pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, sch: *scheduler_mod
     return prepareMultimodalItems(allocator, sch, lm, config, items, prompt_ids);
 }
 
+fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) MediaTokens {
+    if (!config.radio_vision) return .{ .config = config };
+    const tok = lm.tokenizer orelse return .{ .config = config };
+    return .{
+        .config = config,
+        .video_sentinel = tok.specialTokenId("<img>") orelse 0,
+        .img_end = tok.specialTokenId("</img>") orelse 0,
+    };
+}
+
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
-fn prepareMultimodalItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
+fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
+    var videos: usize = 0;
+    for (items) |it| videos += @intFromBool(it == .video);
+    if (videos > 0 and !loadedSupportsVideo(lm, config)) return error.VideoUnsupported;
+    const mt = radioMediaTokens(lm, config);
+    if (config.radio_vision and videos > 0 and (mt.video_sentinel == 0 or mt.img_end == 0 or mt.video_sentinel == config.image_token_id)) {
+        log.warn("  media: RADIO video needs distinct <img> and </img> special tokens\n", .{});
+        return error.MediaPlaceholderMismatch;
+    }
     // Before the encode: a mismatch is the client's, and cheap to refuse.
-    if (!placeholdersMatch(prompt_ids.*, items, config)) {
+    if (!placeholdersMatchOf(prompt_ids.*, items, mt)) {
         var rendered: usize = 0;
-        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKind(t, config) != null);
+        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKindOf(t, mt) != null);
         log.warn("  media: the prompt renders {d} placeholder(s) for {d} item(s); a `jinja render failed` line above means the generic fallback rendered none\n", .{ rendered, items.len });
         return error.MediaPlaceholderMismatch;
     }
@@ -15290,9 +15959,24 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Sche
 
     var out: MultimodalPrompt = .{};
     errdefer out.deinit(allocator);
-    out.embeddings = try encodeMediaItems(allocator, sch, lm, items, mp, item_tokens);
-    const expanded = try expandMediaPlaceholders(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, config);
+    const encoded = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
+    defer freeKeepMasks(allocator, encoded.item_keep);
+    out.embeddings = encoded.rows;
+    const item_keep = try allocator.alloc(?[]const bool, items.len);
+    defer allocator.free(item_keep);
+    var piece_at: usize = 0;
+    for (items, item_keep) |item, *slot| {
+        const n = piecesOf(item);
+        slot.* = if (item == .video and piece_at < encoded.item_keep.len) encoded.item_keep[piece_at] else null;
+        piece_at += n;
+    }
+    const expanded = if (lm.tokenizer) |tok|
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, tok, item_keep)
+    else
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, ByteTokenizer{}, item_keep);
     out.media = expanded.media;
+    // The rows the prefix-cache tiers key on this item's pixels; a restore past one needs the same key.
+    for (out.media, 0..) |m, k| log.debug("  media: item {d} at row {d} (key {x:0>16})\n", .{ k, m.start, m.key });
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
     for (items, item_tokens) |item, n| {
         soft.getPtr(std.meta.activeTag(item)).* += n;
@@ -15312,6 +15996,7 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, sch: *scheduler_mod.Sche
 
 /// The error response for a failed `prepareMultimodalPrompt`.
 fn multimodalFailure(err: anyerror) struct { status: []const u8, code: u16, kind: []const u8, message: []const u8 } {
+    if (err == error.VideoUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "video input is not supported by this model's loaded vision tower" };
     if (err == error.MediaPlaceholderMismatch) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = MEDIA_PLACEHOLDER_REJECT };
     return .{ .status = "500 Internal Server Error", .code = 500, .kind = "server_error", .message = "media encoding failed" };
 }
@@ -15341,6 +16026,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.radio_vision) return .{ .mode = .radio, .patch = radio_vision.PATCH, .merge = radio_vision.DOWNSAMPLE };
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -15363,6 +16049,14 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .mode = .minicpm,
         .patch = config.vision_patch_size,
         .max_slices = config.mcv_max_slice_nums,
+    };
+    if (config.dsv41_vision) return .{
+        .mode = .dsv41,
+        .patch = config.vision_patch_size,
+        .merge = config.dv_downsample,
+        .max_tokens = config.dv_max_image_tokens,
+        .min_pixels = config.dv_min_pixels,
+        .max_wh_ratio = config.dv_max_wh_ratio,
     };
     if (config.glm_vision) return .{
         .mode = .glm,
@@ -15469,7 +16163,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget }, .{ .mode = .dsv41 } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -15706,7 +16400,7 @@ fn appendAnthropicImageBlock(allocator: std.mem.Allocator, list: *std.ArrayList(
     return appendImageUrlContent(allocator, list, url, vp);
 }
 
-const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp;base64,...) with a readable payload; remote URLs are not fetched";
+const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp|gif|bmp;base64,...) with a readable payload; remote URLs are not fetched";
 
 /// `Lfm2VlImageProcessor.resize_and_split`: a source inside the budget is one
 /// resized image; past it, the WHOLE image is resized onto a `cols`x`rows`
@@ -15881,11 +16575,25 @@ const DecodedRgb = struct {
     }
 };
 
+test "decodeRgbOwned reads a GIF's first frame and a BMP, the formats the Anthropic and OpenAI image blocks allow beside JPEG/PNG/WebP" {
+    // 2x2: red, green / blue, white (Pillow-written).
+    const gif = "\x47\x49\x46\x38\x37\x61\x02\x00\x02\x00\x81\x00\x00\xff\xff\xff\x00\xff\x00\xff\x00\x00\x00\x00\xff\x2c\x00\x00\x00\x00\x02\x00\x02\x00\x00\x08\x07\x00\x05\x04\x18\x00\x20\x20\x00\x3b";
+    const bmp = "\x42\x4d\x46\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x10\x00\x00\x00\xc4\x0e\x00\x00\xc4\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\xff\xff\xff\x00\x00\x00\x00\xff\x00\xff\x00\x00\x00";
+    for ([_][]const u8{ gif, bmp }) |bytes| {
+        const d = decodeRgbOwned(std.testing.allocator, bytes, true) orelse return error.TestUnexpectedResult;
+        defer std.testing.allocator.free(d.rgb);
+        try std.testing.expectEqual(@as(u32, 2), d.w);
+        try std.testing.expectEqual(@as(u32, 2), d.h);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 }, d.rgb);
+    }
+    try std.testing.expect(decodeRgbOwned(std.testing.allocator, "II*\x00not a tiff we read", true) == null);
+}
+
 fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF first frame/BMP) — 4 channels so transparency composites onto white.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
@@ -15919,6 +16627,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
 
+    if (vp.mode == .radio) {
+        const img = radio_vision.prepareImage(allocator, src.rgb, src_h, src_w) catch return null;
+        log.info("  Decoded {d}x{d} image → RADIO {d}x{d} float32 CHW ({d} tokens, PIL bicubic)\n", .{ src_w, src_h, img.w, img.h, img.tokens });
+        return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
+
     if (vp.mode == .gemma_budget) {
         const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
         log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
@@ -15927,6 +16641,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
 
     // MiniCPM-V images are several pieces: `appendImageUrlContent` makes them.
     if (vp.mode == .minicpm) return null;
+
+    if (vp.mode == .dsv41) {
+        const pv = dsv41_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens, vp.min_pixels, vp.max_wh_ratio) catch return null;
+        log.info("  Decoded {d}x{d} image → deepseek grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, dsv41_vision.spanTokens((pv.grid_h + vp.merge - 1) / vp.merge, (pv.grid_w + vp.merge - 1) / vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
+    }
 
     if (vp.mode == .glm) {
         const pv = glm_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.tps, vp.merge, vp.min_tokens, vp.max_tokens) catch return null;
@@ -16092,7 +16812,7 @@ const EMBED_PART_REJECT = "content parts must be text, image_url or video_url ob
 const EMBED_NO_VISION_REJECT = "image and video parts need a model with a vision encoder: this one has none loaded (a text-only pack, or --no-vision)";
 const EMBED_AUDIO_REJECT = "audio parts are not served: this model's audio tower is not loaded";
 const EMBED_EMPTY_REJECT = "'messages' carry nothing to embed: add a text part, an image or a video";
-const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp;base64,...) with readable payloads; remote URLs are not fetched";
+const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp|gif|bmp;base64,...) with readable payloads; remote URLs are not fetched";
 
 /// `messages` the way the model's own chat template reads them for an embedding (EmbeddingGemma 2's is a bare
 /// concatenation): system turns first, then the rest in order; text parts verbatim, no separator invented; an
@@ -16192,6 +16912,7 @@ fn appendEmbeddingText(allocator: std.mem.Allocator, tok: anytype, ids: *std.Arr
 /// HF's video processor. Qwen's clips; EmbeddingGemma 2's (`.gemma_budget`) are `decodeBudgetVideo`'s.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
     if (vp.mode == .gemma_budget) return decodeBudgetVideo(allocator, frame_urls, vp);
+    if (vp.mode == .radio) return decodeRadioVideo(allocator, frame_urls);
     if (vp.mode != .qwen or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
@@ -16266,6 +16987,30 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
     });
     return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// RADIO video: every frame resized to frame 0's patch grid, CLIP-normalized,
+/// concatenated as float32 CHW. `grid_h` / `grid_w` are pixels, `grid_t` is the
+/// raw frame count. Null when any frame is not a decodable image.
+fn decodeRadioVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8) ?chat_mod.VideoData {
+    if (frame_urls.len == 0) return null;
+    var vb: ?radio_vision.VideoBuilder = null;
+    for (frame_urls, 0..) |url, i| {
+        const frame = decodeFrameUrl(allocator, url, true) orelse return cancelRadioVideo(allocator, vb);
+        defer frame.deinit(allocator);
+        if (vb == null) vb = radio_vision.VideoBuilder.init(allocator, frame_urls.len, frame.h, frame.w) catch return null;
+        vb.?.add(allocator, i, frame.rgb, frame.h, frame.w) catch return cancelRadioVideo(allocator, vb);
+    }
+    const prepared = vb.?.finish() catch return cancelRadioVideo(allocator, vb);
+    log.info("  Decoded {d} frames → RADIO video {d}x{d} ({d} tubelets x {d} tokens)\n", .{
+        frame_urls.len, prepared.w, prepared.h, prepared.groups, prepared.tokens,
+    });
+    return .{ .pixels = prepared.pixels, .grid_t = prepared.frames, .grid_h = prepared.h, .grid_w = prepared.w };
+}
+
+fn cancelRadioVideo(allocator: std.mem.Allocator, vb: ?radio_vision.VideoBuilder) ?chat_mod.VideoData {
+    if (vb) |v| allocator.free(v.buf);
+    return null;
 }
 
 /// Decode a `video_url` block's `frames` array into `list`, mirroring
@@ -16929,20 +17674,11 @@ fn handleAnthropicMessages(
     // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
     // runtime acceptance gate handle the rest).
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld: bool = requestPld(root, lm);
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -17120,6 +17856,7 @@ fn handleAnthropicMessages(
         .min_p = min_p,
         .repeat_penalty = sampled.repeat_penalty,
         .presence_penalty = sampled.presence_penalty,
+        .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
     };
 
@@ -18647,7 +19384,7 @@ fn handleResponsesInner(
     const top_p = sampled.top_p;
     const top_k = sampled.top_k;
     const min_p = sampled.min_p;
-    const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    const frequency_penalty = sampled.frequency_penalty;
     const repeat_penalty = sampled.repeat_penalty;
     const presence_penalty = sampled.presence_penalty;
 
@@ -18922,6 +19659,7 @@ fn handleResponsesInner(
         .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
+        .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
     var sc: generate_mod.SchemaConstraint = undefined;
@@ -19067,21 +19805,12 @@ fn handleResponsesInner(
     // chat-completions auto-disable logic exactly so the same prompt picks
     // the same path on /v1/chat/completions and /v1/responses.
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld_resp: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
+    var enable_pld_resp: bool = requestPld(root, lm);
 
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter_resp: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
+    var enable_drafter_resp = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -20866,6 +21595,56 @@ test "Conn.close does not wait for the peer after a Content-Length response" {
     try expectCloseWaitsForPeer(false);
 }
 
+/// `request` through `StartupResponder.answer` over a socketpair from `peer`; the reply's bytes.
+fn startupReply(r: *StartupResponder, request: []const u8, peer: std.Io.net.IpAddress, out: []u8) ![]const u8 {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = peer } }, testing.io);
+    defer conn.close();
+    try testing.expectEqual(@as(isize, @intCast(request.len)), std.c.send(sv[1], request.ptr, request.len, 0));
+    _ = std.c.shutdown(sv[1], 1);
+    try r.answer(&conn);
+    try conn.flush();
+    const got = std.c.recv(sv[1], out.ptr, out.len, std.c.MSG.DONTWAIT);
+    return out[0..@intCast(@max(got, 0))];
+}
+
+test "PLD: the request's flag, else the default; never on a Neural Engine model" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"enable_pld\":true}", .{});
+    defer parsed.deinit();
+    var lm: LoadedModel = undefined;
+    lm.ane = null;
+    try testing.expect(requestPld(parsed.value.object, &lm));
+    lm.ane = @ptrFromInt(0x1000);
+    try testing.expect(!requestPld(parsed.value.object, &lm));
+}
+
+test "startup: /health is 503 loading, a loopback client reads the load, the rest is 503" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("m", "/models/m", 10);
+    reg.mutex.lockUncancelable(testing.io);
+    try testing.expect(reg.tryBeginLoadLocked(stub));
+    reg.mutex.unlock(testing.io);
+    var r: StartupResponder = .{ .server = undefined, .registry = reg, .allocator = testing.allocator, .io = testing.io };
+    const local: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
+    const lan: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 5 }, .port = 0 } };
+    var buf: [4096]u8 = undefined;
+
+    var reply = try startupReply(&r, "GET /health HTTP/1.1\r\n\r\n", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+    try testing.expect(std.mem.endsWith(u8, reply, "{\"status\":\"loading\"}"));
+    reply = try startupReply(&r, "GET /v1/load-progress HTTP/1.1\r\n\r\n", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, reply, "\"path\":\"/models/m\",\"progress\":{\"phase\":\"starting\"") != null);
+    reply = try startupReply(&r, "GET /v1/load-progress HTTP/1.1\r\n\r\n", lan, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+    reply = try startupReply(&r, "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", local, &buf);
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 503"));
+}
+
 test "listenExclusive: a second server cannot bind a port that is already listening" {
     var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
     defer first.deinit(testing.io);
@@ -21007,7 +21786,7 @@ test "findContentLength returns null when missing" {
 test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
     // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
     // whatever it got verbatim, so at --log-level debug one image upload wrote
-    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // raw PNG bytes into the log — and a body near the request cap blew
     // straight through the 32 MB rotation, taking the post-mortem file with it.
     //
     // Text bodies must stay WHOLE: reading a full request body out of the debug
@@ -21217,9 +21996,9 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     defer server_config.max_context_size = original;
     server_config.max_context_size = 0;
     // The OS reserve alone eats a 7 GB CI runner's free RAM; it is not what is on trial.
-    const orig_reserve = os_reserve_override;
-    defer os_reserve_override = orig_reserve;
-    os_reserve_override = 0;
+    const orig_reserve = metrics.os_reserve_override;
+    defer metrics.os_reserve_override = orig_reserve;
+    metrics.os_reserve_override = 0;
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.
@@ -21306,6 +22085,15 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
     try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 9000, 4096));
     // ctx 0 (unknown) = no limit.
     try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 4000, 0));
+}
+
+test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps all of it: the arch's maxOutput, not the plugin's 8,192" {
+    if (comptime !mlx_stream.built) return error.SkipZigTest;
+    // The pack's parse records its arch's maxOutput (GLM-5.3's default, 131,072) beside its billed context.
+    mlx_stream.noteMaxOutput("/packs/glm-5.3-clamp", 131072);
+    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-5.3-clamp", .glm_stream = true, .ctx_override = 16448 };
+    try testing.expectEqual(@as(u32, 16448 + 131072), getEffectiveContextLength(&config));
+    try testing.expectEqual(@as(u32, 131072), clampMaxTokens(131072, 16387, getEffectiveContextLength(&config)));
 }
 
 test "getEffectiveContextLength uses ctx_size override" {
@@ -22322,6 +23110,128 @@ const ByteTokenizer = struct {
     }
 };
 
+test "RADIO video availability follows loaded embedder weights" {
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    var config = model_mod.ModelConfig{ .radio_vision = true };
+    try testing.expect(encoder.supportsImages());
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    encoder.radio.?.video_w.ctx = @ptrCast(&radio);
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    encoder.radio = null;
+    config.radio_vision = false;
+    config.video_token_id = 7;
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    config.video_token_id = 0;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    entry.vision_encoder = null;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+}
+
+test "RADIO video availability rejects a forced clip before encoding with a named 400" {
+    const a = testing.allocator;
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    entry.tokenizer = null;
+    const config = model_mod.ModelConfig{ .radio_vision = true, .image_token_id = 18 };
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{.{ .video = &clip }};
+    var ids = try a.dupe(u32, &.{19});
+    defer a.free(ids);
+    try testing.expectError(error.VideoUnsupported, prepareMultimodalItems(a, &entry, &config, &items, &ids));
+    const failure = multimodalFailure(error.VideoUnsupported);
+    try testing.expectEqual(@as(u16, 400), failure.code);
+    try testing.expect(std.mem.indexOf(u8, failure.message, "video") != null);
+}
+
+test "radio prompt: a video sentinel expands into labeled tubelets and the keep mask" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    config.image_token_id = 18;
+    const mt = MediaTokens{ .config = &config, .video_sentinel = 19, .img_end = 20 };
+    const img = [_]chat_mod.ImageData{.{ .pixels = "", .width = 64, .height = 64 }};
+
+    // A still image stays a bare run of `<image>`. The tubelet wrap is video-only.
+    const image_items = [_]MediaItem{.{ .image = &img }};
+    const image_out = try expandMedia(a, &.{ 1, 18, 2 }, &image_items, &.{4}, &.{11}, mt, ByteTokenizer{}, &.{});
+    defer a.free(image_out.ids);
+    defer a.free(image_out.media);
+    try testing.expectEqualSlices(u32, &.{ 1, 18, 18, 18, 18, 2 }, image_out.ids);
+    try testing.expectEqual(@as(u32, 1), image_out.media[0].start);
+
+    // 64×64 is a 4×4 patch grid and 2×2 tokens after the shuffle. Three frames
+    // are two tubelets; the second keeps only its first and third token.
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{ .{ .image = &img }, .{ .video = &clip } };
+    const mask = [_]bool{ true, true, true, true, true, false, true, false };
+    const keeps = [_]?[]const bool{ null, &mask };
+    const out = try expandMedia(a, &.{ 1, 18, 19, 2 }, &items, &.{ 2, 6 }, &.{ 11, 12 }, mt, ByteTokenizer{}, &keeps);
+    defer a.free(out.ids);
+    defer a.free(out.media);
+
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    try want.append(a, 1);
+    try want.appendNTimes(a, 18, 2);
+    var buf: [96]u8 = undefined;
+    const lab0 = radio_vision.videoGroupSegment(&buf, 0, 3);
+    var lab0_owned: [96]u8 = undefined;
+    @memcpy(lab0_owned[0..lab0.len], lab0);
+    const ids0 = try ByteTokenizer.encode(.{}, a, lab0_owned[0..lab0.len]);
+    defer a.free(ids0);
+    try want.appendSlice(a, ids0);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 4);
+    try want.append(a, 20);
+    const lab1 = radio_vision.videoGroupSegment(&buf, 1, 3);
+    const ids1 = try ByteTokenizer.encode(.{}, a, lab1);
+    defer a.free(ids1);
+    try want.appendSlice(a, ids1);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 2);
+    try want.append(a, 20);
+    try want.append(a, 2);
+    try testing.expectEqualSlices(u32, want.items, out.ids);
+    try testing.expectEqual(@as(u32, 1), out.media[0].start);
+    try testing.expectEqual(@as(u32, @intCast(3 + lab0.len)), out.media[1].start);
+
+    const bad = [_]bool{true};
+    const bad_keeps = [_]?[]const bool{&bad};
+    const only = [_]MediaItem{.{ .video = &clip }};
+    try testing.expectError(error.InvalidVisionInput, expandMedia(a, &.{ 1, 19, 2 }, &only, &.{6}, &.{1}, mt, ByteTokenizer{}, &bad_keeps));
+}
+
+test "radio video frames share frame 0's patch grid" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    const vp = visionPreprocFromConfig(&config);
+    try testing.expectEqual(.radio, vp.mode);
+    // 32×24 is the same 4:3 as a 640×480 frame, so the grid is the clip's grid.
+    const url = try solidPngUrl(a, 32, 24, .{ 10, 20, 30, 255 });
+    defer a.free(url);
+    const frames = [_][]const u8{ url, url };
+    const vid = decodeVideoUrlContent(a, &frames, vp) orelse return error.Undecoded;
+    defer a.free(vid.pixels);
+    try testing.expectEqual(@as(u32, 2), vid.grid_t);
+    try testing.expectEqual(@as(u32, 576), vid.grid_w);
+    try testing.expectEqual(@as(u32, 448), vid.grid_h);
+    try testing.expectEqual(@as(usize, 2 * 3 * 576 * 448 * 4), vid.pixels.len);
+    const broken = [_][]const u8{ url, "data:image/png;base64,AAAA" };
+    try testing.expect(decodeVideoUrlContent(a, &broken, vp) == null);
+}
+
 fn promptFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u8, media: *RequestMedia, can_see: bool) !EmbeddingPromptResult {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
@@ -22769,6 +23679,12 @@ test "embeddedEngineSettings: an engine-backed model reports only the levers its
     try testing.expectEqualStrings("8", llama.kv_quant);
     try testing.expect(!llama.decode_attn_quant and !llama.pld.enable and !llama.mtp_default_on);
     try testing.expectEqual(@as(f32, 0), llama.prefill_decode_share);
+
+    // The Neural Engine: none of the MLX levers either.
+    const ane = embeddedEngineSettings(base, .ane, false);
+    try testing.expectEqualStrings("ane", ane.engine);
+    try testing.expect(!ane.decode_attn_quant and !ane.pld.enable and !ane.mtp_loaded);
+    try testing.expectEqual(@as(usize, 0), ane.prefill_chunk);
 
     try testing.expect(embeddedEngineSettings(base, .mlx, false).decode_attn_quant);
     try testing.expectEqual(@as(f32, 0.5), embeddedEngineSettings(base, .mlx, false).prefill_decode_share);
@@ -23720,12 +24636,24 @@ test "resolveSampling: forced rule > request > rule > generation_config > fallba
     try std.testing.expectEqual(@as(f32, 0.0), got.temperature);
     try std.testing.expectEqual(@as(u32, 0), got.top_k);
     try std.testing.expectEqual(@as(?f32, 0.05), got.min_p);
-    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 1.5), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.0), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.0 }, false);
     gen.set(.frequency_penalty, .{ .number = 0.5 }, false);
-    try std.testing.expectEqual(@as(f32, 1.5), resolveSampling(gen, .empty, &config).repeat_penalty);
+    got = resolveSampling(gen, .empty, &config);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+    try std.testing.expectEqual(@as(f32, 0.5), got.frequency_penalty);
     gen.set(.repeat_penalty, .{ .number = 1.2 }, true);
     try std.testing.expectEqual(@as(f32, 1.2), resolveSampling(gen, zeros.value.object, &config).repeat_penalty);
+}
+
+test "OpenAI frequency_penalty is its own additive penalty, never a repeat_penalty multiplier (#912)" {
+    const a = std.testing.allocator;
+    const body = try std.json.parseFromSlice(std.json.Value, a, "{\"frequency_penalty\":1,\"presence_penalty\":0}", .{});
+    defer body.deinit();
+    const got = resolveSampling(.{}, body.value.object, &.{});
+    try std.testing.expectEqual(@as(f32, 1.0), got.frequency_penalty);
+    try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
 }
 
 test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule, a forced rule takes everything" {
@@ -23976,18 +24904,13 @@ test "readyHasChat: embedded-engine GGUF without a chat template still advertise
     try t.expect(!readyHasChat(false, 0, false));
 }
 
-test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill memory guard" {
+test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/ANE) skip the MLX-prefill memory guard" {
     const t = std.testing;
-    // MLX model — no embedded engine — the guard applies (real per-token working set).
-    try t.expect(mlxMemoryGuardApplies(false, false));
-    // ds4 (DeepSeek-V4-Flash): its stub config advertises 56 heads / 61 layers,
-    // so the guard would project ~25 GB for an 8.6K-token prompt and 400-reject
-    // a request ds4 serves fine (live 2026-07-15: the SAME prompt had succeeded
-    // on the MLX qwen35 engine one model-switch earlier). ds4 owns its KV
-    // outside MLX, so the guard is skipped.
-    try t.expect(!mlxMemoryGuardApplies(true, false));
-    // llama.cpp GGUF engine: same reasoning — no MLX prefill path.
-    try t.expect(!mlxMemoryGuardApplies(false, true));
+    // MLX model — the guard applies (real per-token working set).
+    try t.expect(mlxMemoryGuardApplies(false));
+    // ds4's stub config advertises 56 heads / 61 layers, so the guard would project ~25 GB for an
+    // 8.6K-token prompt and 400-reject a request ds4 serves fine; no engine-backed model prefills in MLX.
+    try t.expect(!mlxMemoryGuardApplies(true));
 }
 
 test "ungatedHotCacheAsk: a sliding-ring or hybrid arch asks for one whole session, every other arch keeps its ask" {
@@ -24712,17 +25635,6 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
 }
 
-test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
-    const gb: u64 = 1 << 30;
-    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb));
-    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb));
-    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb));
-    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb));
-    os_reserve_override = try parseOsReserveGib("0");
-    defer os_reserve_override = null;
-    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb));
-    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
-}
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // Fatal-class drift: the bill is linear in the chunk, so a guard that
@@ -24947,9 +25859,11 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
-test "MTP is off by default where the Metal verify kernels cannot run" {
-    try std.testing.expectEqual(mlx.metalKernelsAvailable(), mtpAllowedByDefault(false));
-    try std.testing.expect(mtpAllowedByDefault(true));
+test "MTP drafts by default on Metal and CUDA, and only when asked elsewhere" {
+    try std.testing.expect(mtpAllowedByDefault(false, true, false));
+    try std.testing.expect(mtpAllowedByDefault(false, false, true));
+    try std.testing.expect(!mtpAllowedByDefault(false, false, false));
+    try std.testing.expect(mtpAllowedByDefault(true, false, false));
 }
 
 test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
@@ -24985,7 +25899,7 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     xfm.config = cfg;
     xfm.dsv4 = null;
     xfm.dsv41 = &native;
-    xfm.dsv41_ext = null;
+    xfm.mlx_stream_ext = null;
     xfm.dense_attn_proj = false;
     var lm: LoadedModel = undefined;
     lm.config = &cfg;
@@ -25144,6 +26058,20 @@ test "PrefillDoesNotFit quotes the figures the inference thread refused on, once
     try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
+test "mapGenerationError: after a lost GPU context any failure is the named 503" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    defer mlx.resetGpuContextLostForTest();
+    var buf: [192]u8 = undefined;
+    try t.expectEqual(@as(u32, 500), mapGenerationError(error.GenerationFailed, &buf).code);
+    mlx.latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered");
+    _ = mlx.takeError(&stale);
+    const w = mapGenerationError(error.GenerationFailed, &buf);
+    try t.expectEqual(@as(u32, 503), w.code);
+    try t.expectEqualStrings(gpu_context_lost_message, w.message);
+}
+
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
     // The 400/503 mapping existed only on the non-streaming arms; streaming arms wrote a bare `server_error` frame.
     const t = std.testing;
@@ -25182,6 +26110,12 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         const w = mapGenerationError(error.EmptyPrompt, &buf);
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
+    }
+    {
+        // What a Neural Engine model cannot honor is the request's shape, not a fault.
+        const w = mapGenerationError(error.NeuralEngineUnsupported, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
     }
     {
         // Anything else keeps its name in the message, at a mapped status.
@@ -25272,18 +26206,26 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, null, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, null, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, null, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
     // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
-    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, null, "/m/qwen.gguf", ""));
+    // The MLX path's own engines, from a loaded model's config.
+    var stream: model_mod.ModelConfig = .{ .dsv41_stream = true };
+    try testing.expectEqualStrings("mlx-stream", modelEngineName(false, false, false, false, &stream, "/m/DeepSeek-V4.1-Flash-MLX", "deepseek_v41"));
+    var sushi: model_mod.ModelConfig = .{};
+    sushi.exl3 = @as(@typeInfo(@TypeOf(sushi.exl3)).optional.child, undefined);
+    try testing.expectEqualStrings("sushi", modelEngineName(false, false, false, false, &sushi, "/m/GLM-5.3-Flash-Sushi", "glm5_next"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, &(model_mod.ModelConfig{}), "/m/gemma-4-12b", "gemma4"));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/gemma-4-12b", "gemma4"));
 }
 
 test "formatCompletionsLogprobs: an echoed prompt's first token carries null, the rest shift by one" {
@@ -25521,8 +26463,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
 
 test "request body cap is per route: media bodies are base64 frame payloads" {
     // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
-    // three of them plus full-res ref images can approach 500 MB — while no
-    // JSON chat body has any business near 64 MB.
+    // three of them plus full-res ref images can approach 500 MB.
     for ([_][]const u8{
         "/v1/images/generations",
         "/v1/images/edits",
@@ -25535,6 +26476,14 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
+}
+
+test "the chat body cap admits an agent session that keeps its screenshots" {
+    // 100 screenshots at 4 MiB of base64 each.
+    const screenshots = 100;
+    const base64_png = 4 * 1024 * 1024;
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }) |p|
+        try std.testing.expect(maxRequestBytesFor(p) >= screenshots * base64_png);
 }
 
 test "the 413 names both counts it compared" {
@@ -25952,8 +26901,8 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 
     // A qwen3_5 slot keeps the flat bound, hook and all.
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
-    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive, false));
+    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive, false));
 
     const cfg = qwen4RequestTestConfig();
     per_request_chunk_override = true;
@@ -25964,7 +26913,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
         try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
-        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg), false));
     }
     try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
     scheduler_mod.prefill_chunk_adaptive_enabled = null;
@@ -25985,7 +26934,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     const off = adaptivePrefillChunkEnabled(&other);
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
     try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
-    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off, false));
 
     const cfg = qwen4RequestTestConfig();
     try t.expect(cfg.perRequestPrefillChunk());
@@ -25996,7 +26945,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
-    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true, false));
     // An operator pin turns the scaling back off.
     adaptive_chunk_override = false;
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
@@ -26612,21 +27561,24 @@ test "GLM bill: f32 checkpoints and the live state are billed" {
     try t.expect(glm5PrefillMemoryNeeded(&glm, 1, 1, 8, 512, .{}) >= 4 * glm.ssmCheckpointBytes() * 5 / 4);
 }
 
-test "GLM bill: prefill scratch and decode growth are a max, not a sum" {
+test "GLM bill: decode growth is billed to the generation headroom, never the auto budget's whole window" {
     const t = std.testing;
     const saved = GlmBillGlobals.pin();
     defer saved.restore();
     var glm = glm5TestConfig();
-    glm.ctx_override = 1 << 23;
+    glm.ctx_override = 1 << 20;
+    const headroom = transformer_mod.KVCache.RESERVE_GEN_HEADROOM;
     const kv_tok = glm.kvBytesPerToken();
-    const base = glm5PrefillMemoryNeeded(&glm, 100_000, 64, 16, 4096, .{});
-    // Below the crossover the prefill scratch is the peak, and its prompt-only indexer does not move.
-    try t.expectEqual(base, glm5PrefillMemoryNeeded(&glm, 100_000, 20_000, 16, 4096, .{}));
-    // Above it decode growth is the peak: each output token adds its row and its old row.
-    const long = glm5PrefillMemoryNeeded(&glm, 100_000, 4_000_000, 16, 4096, .{});
-    const longer = glm5PrefillMemoryNeeded(&glm, 100_000, 4_100_000, 16, 4096, .{});
-    try t.expect(long > base);
-    try t.expectEqual(100_000 * 2 * kv_tok * 5 / 4, longer - long);
+    // A client that sets no max_tokens gets the rest of the window: that answer is billed like one of
+    // `headroom` tokens, so a short prompt's bill does not depend on the window it was pegged to.
+    const auto = glm5PrefillMemoryNeeded(&glm, 431, (1 << 20) - 431, 16, 4096, .{});
+    try t.expectEqual(glm5PrefillMemoryNeeded(&glm, 431, headroom, 16, 4096, .{}), auto);
+    try t.expectEqual(auto, glm5PrefillMemoryNeeded(&glm, 431, 4_000_000, 16, 4096, .{}));
+    // Below the headroom the growth term still prices each output token's row and its old row,
+    // and it stays a max against the prefill scratch, never a sum.
+    const short = glm5PrefillMemoryNeeded(&glm, 431, 64, 16, 4096, .{});
+    try t.expect(auto >= short);
+    try t.expect(auto - short <= headroom * 2 * kv_tok * 5 / 4);
 }
 
 test "GLM bill: a prompt token costs its KV, one layer's grow copy and its indexer pools" {
@@ -27288,4 +28240,13 @@ test "MiniCPM-V 4.7: expanded image runs and canvas positions equal the processo
             try t.expectEqual(@as(i32, @intCast(w.integer)), mrope.pos.?[row * out.ids.len + k]);
         };
     }
+}
+
+test "proxiedBody: a Windows path id is spliced back escaped, so the forwarded body stays JSON" {
+    const a = std.testing.allocator;
+    const body = "{\"model\":\"C:\\\\m@local\"}";
+    const raw = body[10 .. body.len - 2];
+    const out = try proxiedBody(a, body, raw, "C:\\m");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("{\"model\":\"C:\\\\m\"}", out);
 }

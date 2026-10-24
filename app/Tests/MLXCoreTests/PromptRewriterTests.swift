@@ -31,11 +31,11 @@ final class PromptRewriterTests: XCTestCase {
     }
 
     func testImageRewriteShowsTheModesExamplesOnly() {
-        let t2i = PromptRewriter.image(text: "a fox", editing: false, groups: ImagePromptExamples.textToImage)
+        let t2i = PromptRewriter.image(text: "a fox", editing: false, groups: ImagePromptExamples.textToImage, denseText: false)
         XCTAssertTrue(t2i.system.contains(ImagePromptExamples.textToImage[0].examples[0].body))
         XCTAssertFalse(t2i.system.contains("instruction"))
 
-        let edit = PromptRewriter.image(text: "make it night", editing: true, groups: ImagePromptExamples.genericEdit)
+        let edit = PromptRewriter.image(text: "make it night", editing: true, groups: ImagePromptExamples.genericEdit, denseText: false)
         XCTAssertTrue(edit.system.contains(ImagePromptExamples.genericEdit[0].examples[0].body))
         XCTAssertTrue(edit.system.contains("instruction"))
         XCTAssertTrue(edit.user.contains("make it night"))
@@ -43,14 +43,43 @@ final class PromptRewriterTests: XCTestCase {
 
     func testImageRewriteTakesTwoExamplesPerGroup() {
         let groups = ImagePromptExamples.mageFlowEdit
-        let r = PromptRewriter.image(text: "x", editing: true, groups: groups)
+        let r = PromptRewriter.image(text: "x", editing: true, groups: groups, denseText: false)
         let g = groups[0].examples
         XCTAssertTrue(r.system.contains(g[1].body))
         XCTAssertFalse(r.system.contains(g[2].body))
     }
 
+    /// A model that renders dense text gets a quoted LAYOUT, never "one or two
+    /// sentences": a rewrite that drops the exact words is what comes back as
+    /// gibberish lettering.
+    func testDenseTextRewriteAsksForAQuotedLayout() {
+        let groups = ImageModelPreset.qwenImage21_8bit.promptExamples(editing: false)
+        let r = PromptRewriter.image(text: "an infographic about our app", editing: false, groups: groups, denseText: true)
+        XCTAssertTrue(r.system.contains("double quotation marks"))
+        XCTAssertTrue(r.system.contains("There is no other text in the image."))
+        XCTAssertTrue(r.system.contains(ImagePromptExamples.infographics.examples[0].body))
+        XCTAssertTrue(r.user.contains("an infographic about our app"))
+    }
+
+    /// Every model keeps the user's text word for word; only a dense-text model is asked to lay it out.
+    func testOtherModelsKeepTheirTextWithoutALayout() {
+        let r = PromptRewriter.image(text: "a sign reading \"OPEN\"", editing: false,
+                                     groups: ImagePromptExamples.textToImage, denseText: false)
+        XCTAssertTrue(r.system.contains("word for word"))
+        XCTAssertFalse(r.system.contains("There is no other text in the image."))
+    }
+
     func testCleanStripsFencesAndQuotes() {
         XCTAssertEqual(PromptRewriter.clean("```\n“A red fox.”\n```"), "A red fox.")
+        XCTAssertEqual(PromptRewriter.clean("\"A red fox.\""), "A red fox.")
+    }
+
+    /// Only a WRAPPING pair is the model's decoration; a prompt that ends on quoted text keeps its closing quote.
+    func testCleanKeepsTheQuotesOfTextInThePrompt() {
+        let sign = "A bakery sign reading \"MORNING LOAF\""
+        XCTAssertEqual(PromptRewriter.clean(sign), sign)
+        let both = "\"SALE\" in red above \"NEW\""
+        XCTAssertEqual(PromptRewriter.clean(both), both)
     }
 
     // MARK: - First frame
@@ -75,6 +104,22 @@ final class PromptRewriterTests: XCTestCase {
         let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10, firstFrame: png)
         XCTAssertFalse(r.user(seeingImage: false).contains("attached picture"))
         XCTAssertEqual(r.user(seeingImage: false), PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10).user)
+    }
+
+    /// Reference pictures ride along in order, with the rule that ties each to its `<Picture N>`.
+    func testReferencePicturesRideTheRequestInOrderWithTheirRule() {
+        let jpg = Data([0xFF, 0xD8, 0xFF, 9])
+        let r = PromptRewriter.video(text: "<Picture 1> meets <Picture 2>", format: .h3Reference, seconds: 10,
+                                     references: [png, jpg])
+        XCTAssertEqual(r.images, [png, jpg])
+        XCTAssertTrue(r.user(seeingImage: true).contains("<Picture 2>"))
+        XCTAssertFalse(r.user(seeingImage: true).contains("first frame"))
+        XCTAssertEqual(r.user(seeingImage: false), r.user)
+        // A first frame goes ahead of the references, each with its own rule.
+        let both = PromptRewriter.video(text: "x", format: .h3Reference, seconds: 10, firstFrame: png, references: [jpg])
+        XCTAssertEqual(both.images, [png, jpg])
+        XCTAssertTrue(both.user(seeingImage: true).contains("attached picture"))
+        XCTAssertTrue(both.user(seeingImage: true).contains("<Picture 1>"))
     }
 
     func testNoFirstFrameMeansNoPicture() {

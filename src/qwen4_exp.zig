@@ -12,6 +12,7 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
@@ -198,7 +199,7 @@ pub const NgramTable = struct {
     scols: u32,
     /// Kept open for the pool's `pread` gather (page faults on one mapping
     /// serialize on the VM map lock; preads run in parallel).
-    fd: std.c.fd_t = -1,
+    fd: c_int = -1,
     pool: ?*PrefetchPool = null,
     /// Boot-time page-cache warm: the weights load evicts this file, and the
     /// first long prompt then faults 48 rows/token from SSD (38k: 174 s vs
@@ -210,6 +211,7 @@ pub const NgramTable = struct {
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
     embedded: ?*embedded_ple.EmbeddedTable = null,
+    fmt: embedded_ple.Format = .affine,
 
     pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
         var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
@@ -228,6 +230,7 @@ pub const NgramTable = struct {
             .wcols = ptr.wcols,
             .scols = ptr.scols,
             .embedded = ptr,
+            .fmt = ptr.fmt,
         };
         if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
         return table;
@@ -238,16 +241,17 @@ pub const NgramTable = struct {
     }
 
     pub fn open(path: []const u8) !NgramTable {
+        if (comptime @import("builtin").os.tag == .windows) return error.NgramTableUnsupportedOnWindows;
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= pbuf.len) return error.NameTooLong;
         @memcpy(pbuf[0..path.len], path);
         pbuf[path.len] = 0;
-        const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = crt.openRead(pbuf[0..path.len :0]);
         if (fd < 0) return error.FileNotFound;
-        errdefer _ = std.c.close(fd);
+        errdefer crt.close(fd);
         // File size via lseek-to-end: 0.17 has no portable fstat wrapper on
         // Linux (std.c.Stat is void there) and this loader has no `std.Io`.
-        const size: usize = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+        const size: usize = @intCast(@max(crt.seekEnd(fd), 0));
         if (size == 0) return error.StatFailed;
         const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
@@ -372,13 +376,13 @@ pub const NgramTable = struct {
         live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
-        if (self.fd >= 0) _ = std.c.close(self.fd);
+        if (self.fd >= 0) crt.close(self.fd);
         self.fd = -1;
         if (self.embedded) |source| {
             source.close();
             std.heap.page_allocator.destroy(source);
             self.embedded = null;
-        } else if (!self.gpu_owns_map) std.posix.munmap(self.map);
+        } else if (!self.gpu_owns_map and !(comptime @import("builtin").os.tag == .windows)) std.posix.munmap(self.map); // never mapped on Windows
     }
 
     /// Sample before background warming; explicit read-path overrides skip calibration.
@@ -439,7 +443,7 @@ pub const NgramTable = struct {
     /// fails; `out` is then partial and the caller re-reads it serially.
     fn gatherPooled(self: *const NgramTable, p: *PrefetchPool, row_ids: []const i64, out: []f32) bool {
         const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * 2;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
         var start: usize = 0;
         while (start < row_ids.len) : (start += PrefetchPool.MAX_ROWS) {
             const end = @min(start + PrefetchPool.MAX_ROWS, row_ids.len);
@@ -494,7 +498,7 @@ pub const NgramTable = struct {
             while (off < r.len) {
                 if (self.warm_stop.load(.acquire)) return;
                 const want: usize = @intCast(@min(r.len - off, WARM_CHUNK));
-                const got = std.c.pread(r.fd, &scratch, want, @intCast(r.off + off));
+                const got = crt.pread(r.fd, &scratch, want, @intCast(r.off + off));
                 if (got <= 0) return;
                 off += @intCast(got);
                 done += @intCast(got);
@@ -538,6 +542,7 @@ pub const NgramTable = struct {
     }
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
+        if (self.fmt == .nvfp4) return dequantNvfp4Row(words, scales, self.embedded.?.scale, out[0..self.dim]);
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         // An embedded pack's global weight scale; 1.0 leaves every other table exact.
         const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
@@ -562,7 +567,7 @@ pub const NgramTable = struct {
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
-        const need: usize = self.wcols * 4 + self.scols * 4;
+        const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
         // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         if (wide) self.refreshAfterWarm();
@@ -580,18 +585,44 @@ pub const NgramTable = struct {
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
+        if (comptime @import("builtin").os.tag == .windows) unreachable; // `open` refuses on Windows
         const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * 2;
+        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
         const off: usize, const dst: []u8 = switch (region) {
             0 => .{ self.w_off + r * wl, buf[0..wl] },
             1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
             else => .{ self.b_off + r * sl, buf[wl + sl .. wl + 2 * sl] },
         };
         if (self.embedded) |source| return source.preadPart(r, region, dst);
-        return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
+        return crt.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
 };
+
+const E2M1 = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
+
+const E4M3: [256]f32 = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*v, b| {
+        const e: i32 = @intCast((b >> 3) & 15);
+        const m: f32 = @floatFromInt(b & 7);
+        const mag = if (e == 0) m / 8.0 * std.math.pow(f32, 2, -6) else (1 + m / 8.0) * std.math.pow(f32, 2, @as(f32, @floatFromInt(e - 7)));
+        v.* = if (b & 0x80 != 0) -mag else mag;
+    }
+    break :blk t;
+};
+
+/// One NVFP4 row: e2m1 codes low nibble first, an e4m3 scale per 16, times the table's global scale.
+fn dequantNvfp4Row(codes: []const u8, scales: []const u8, global: f32, out: []f32) void {
+    for (0..out.len / 16) |g| {
+        const sc = E4M3[scales[g]] * global;
+        for (codes[g * 8 ..][0..8], 0..) |b, j| {
+            out[g * 16 + 2 * j] = E2M1[b & 15] * sc;
+            out[g * 16 + 2 * j + 1] = E2M1[b >> 4] * sc;
+        }
+    }
+}
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
 /// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
@@ -656,7 +687,7 @@ const PrefetchPool = struct {
         for (self.threads[0..started]) |t| t.join();
     }
 
-    /// Fan the `3 * rows.len` preads over the workers; rows land in `bufs`.
+    /// Fan the per-row part preads over the workers; rows land in `bufs`.
     fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
         _ = self.runs.fetchAdd(1, .monotonic);
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -686,9 +717,10 @@ const PrefetchPool = struct {
             const table = self.table.?;
             const rows = self.rows;
             self.mu.unlock(io);
+            const parts = embedded_ple.partCount(table.fmt);
             var i = idx;
-            while (i < rows.len * 3) : (i += N) {
-                if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
+            while (i < rows.len * parts) : (i += N) {
+                if (!table.preadSite(@intCast(rows[i / parts]), i % parts, &self.bufs[i / parts])) _ = self.failed.fetchAdd(1, .acq_rel);
             }
             _ = self.pending.fetchSub(1, .acq_rel);
         }
@@ -998,6 +1030,66 @@ test "embedded PLE rows carry the pack's global weight scale" {
         table.row(5, &gathered[i]);
     }
     for (gathered[0], gathered[1]) |unit, doubled| try std.testing.expectEqual(unit * 2, doubled);
+}
+
+test "embedded PLE reads a ModelOpt NVFP4 table in a subdirectory" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeNvfp4Fixture(&td);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 });
+    defer table.close();
+    const e2m1 = [_]f32{ 0.5, 1.0, 1.5 };
+    var rows: [3][32]f32 = undefined;
+    for (0..3) |r| {
+        table.row(r, &rows[r]);
+        for (rows[r], 0..) |v, i| try std.testing.expectEqual(e2m1[r] * @as(f32, if (i < 16) 1.0 else 2.0) * 0.5, v);
+    }
+    var gathered: [3 * 32]f32 = undefined;
+    table.gather(&.{ 2, 0, 1 }, &gathered, 0);
+    try std.testing.expectEqualSlices(f32, &rows[2], gathered[0..32]);
+    try std.testing.expectEqualSlices(f32, &rows[1], gathered[64..96]);
+    if (table.pool) |p| {
+        var pooled: [3 * 32]f32 = undefined;
+        try std.testing.expect(table.gatherPooled(p, &.{ 2, 0, 1 }, &pooled));
+        try std.testing.expectEqualSlices(f32, &gathered, &pooled);
+    }
+}
+
+test "embedded PLE refuses an NVFP4 table whose group is not 16" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeNvfp4FixtureGroups(&td, true);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    try std.testing.expectError(error.EmbeddedPleGeometry, embedded_ple.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 }));
+}
+
+test "embedded PLE reads the affine width off the shard geometry" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const spec: EmbeddedSpec = .{ .rows = 2, .dim = 32, .shards = 1 };
+    for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try embedded_ple.writeAffineFixture(&td, bits);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try NgramTable.openEmbedded(path_buf[0..path_len], spec);
+        defer table.close();
+        try std.testing.expectEqual(bits, table.bits);
+        var out: [32]f32 = undefined;
+        table.row(1, &out);
+        for (out) |v| try std.testing.expectEqual(@as(f32, @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1)), v);
+    }
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeAffineFixture(&td, 7);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    try std.testing.expectError(error.EmbeddedPleGeometry, embedded_ple.openEmbedded(path_buf[0..path_len], spec));
 }
 
 test "embedded PLE rows and gathers match the merged table" {

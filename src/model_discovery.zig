@@ -43,14 +43,17 @@ const supported_model_types = [_][]const u8{
     "qwen3_moe_text",   "qwen3_next",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",     "mistral",
-    "lfm2", "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
+    "lfm2",       "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
     "nemotron_h",
+    "nemotron_h_puzzle", // Nemotron 3.5 Bolt language tower (latent heterogeneous MoE)
+    "nemotron_h_omni", // Bolt omni wrapper; language config is llm_config
     "bert",
     "deepseek_v4",
     "deepseek_v41", // DeepSeek-V4.1-Flash (src/deepseek_v41.zig; the EXL3 repack on mlx-stream)
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
+    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
@@ -62,6 +65,7 @@ const supported_model_types = [_][]const u8{
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
+    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE), the mlx-stream pack (experts streamed from experts.bin)
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
     "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
     "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
@@ -97,6 +101,12 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
     // Breeze-TTS-2: Mimi lives in `audio_tokenizer/`; a partial pull can miss the subdir.
     if (std.mem.eql(u8, model_type, "breeze_tts")) return "audio_tokenizer/model.safetensors";
+    // MOSS-Image: no root config.json, so model_index.json lands first; every pack names its VAE weights so.
+    if (std.mem.eql(u8, model_type, "moss_image")) return "vae/diffusion_pytorch_model.safetensors";
+    // TRELLIS.2: pipeline.json names the pack, so a pull lands its weights first; the SS decoder sorts last of them.
+    if (std.mem.eql(u8, model_type, "trellis2")) return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors";
+    // Pixal3D ships its decoders in its own ckpts/; the texture decoder sorts last.
+    if (std.mem.eql(u8, model_type, "pixal3d")) return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors";
     return null;
 }
 
@@ -112,6 +122,9 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
         std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image") or
+        std.mem.eql(u8, model_type, "trellis2") or
+        std.mem.eql(u8, model_type, "pixal3d") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -198,6 +211,13 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // (the 2.0 family's "QwenImagePipeline" is a different architecture).
         if (peekQwenImage21Index(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
+        if (peekMossImageIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "moss_image") catch return .missing_or_unparseable };
+        // …and a TRELLIS.2 pack: pipeline.json's `name`, no root config.json; Pixal3D keeps that name.
+        if (peekPixal3dPipeline(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "pixal3d") catch return .missing_or_unparseable };
+        if (peekTrellis2Pipeline(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "trellis2") catch return .missing_or_unparseable };
         // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
         if (peekStableAudio3Config(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
@@ -322,6 +342,64 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
 /// family spells "QwenImagePipeline" — a different architecture, never matched.
 /// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
 pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "QwenImage21Pipeline");
+}
+
+/// True when `sub/model_index.json` names the MOSS-Image pipeline (the release's
+/// diffusers tree, as published and as the mlx-community mirror ships it).
+pub fn peekMossImageIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return modelIndexClassIs(io, allocator, sub, "MOSSImagePipeline");
+}
+
+/// True when `sub/pipeline.json` names the TRELLIS.2 image-to-3D pipeline (microsoft/TRELLIS.2-4B as published,
+/// and the MLX packs that keep its layout). Twin of gen.isTrellis2Pack, which delegates here.
+pub fn peekTrellis2Pipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return trellisPipelineKind(io, allocator, sub) == .trellis2;
+}
+
+/// True for TencentARC/Pixal3D's layout: TRELLIS.2's pipeline.json (same `name`) over flows whose own config reads
+/// `"image_attn_mode": "proj"`. Twin of gen.isPixal3dPack, which delegates here.
+pub fn peekPixal3dPipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    return trellisPipelineKind(io, allocator, sub) == .pixal3d;
+}
+
+const TrellisKind = enum { trellis2, pixal3d };
+
+fn trellisPipelineKind(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) ?TrellisKind {
+    const pipe = readJsonIn(io, allocator, sub, "pipeline.json") orelse return null;
+    defer pipe.deinit();
+    const name = jsonPath(pipe.value, &.{"name"}) orelse return null;
+    if (name != .string or !std.mem.eql(u8, name.string, "Trellis2ImageTo3DPipeline")) return null;
+    const ss = jsonPath(pipe.value, &.{ "args", "models", "sparse_structure_flow_model" }) orelse return .trellis2;
+    if (ss != .string) return .trellis2;
+    var buf: [512]u8 = undefined;
+    const cfg_path = std.fmt.bufPrint(&buf, "{s}.json", .{ss.string}) catch return .trellis2;
+    const cfg = readJsonIn(io, allocator, sub, cfg_path) orelse return .trellis2;
+    defer cfg.deinit();
+    const mode = jsonPath(cfg.value, &.{ "args", "image_attn_mode" }) orelse return .trellis2;
+    return if (mode == .string and std.mem.eql(u8, mode.string, "proj")) .pixal3d else .trellis2;
+}
+
+fn readJsonIn(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, path: []const u8) ?std.json.Parsed(std.json.Value) {
+    var file = sub.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return null;
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always }) catch null;
+}
+
+fn jsonPath(v: std.json.Value, keys: []const []const u8) ?std.json.Value {
+    var cur = v;
+    for (keys) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return cur;
+}
+
+fn modelIndexClassIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, class_name: []const u8) bool {
     var file = sub.openFile(io, "model_index.json", .{}) catch return false;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
@@ -332,7 +410,7 @@ pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.I
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
+    return cn == .string and std.mem.eql(u8, cn.string, class_name);
 }
 
 /// True when `sub/model_config.json` is a stable-audio-tools inpainting
@@ -406,7 +484,7 @@ pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir)
 /// or null when there is no usable index (single-file packs, media packs).
 pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(void) {
     const a = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 * 1024 * 1024)) catch return null;
     defer a.free(raw);
     var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return null;
     defer parsed.deinit();
@@ -653,7 +731,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
+        std.mem.startsWith(u8, model_type, "qwen_image") or
+        std.mem.eql(u8, model_type, "moss_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "breeze_tts") or
         std.mem.eql(u8, model_type, "acestep") or
@@ -661,7 +740,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
-    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d") or std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
@@ -1045,6 +1124,9 @@ fn tryAddModel(
             !peekMfluxFlux2(io, allocator, sub) and
             !peekLayaCheckpoint(io, sub) and
             !peekQwenImage21Index(io, allocator, sub) and
+            !peekMossImageIndex(io, allocator, sub) and
+            !peekTrellis2Pipeline(io, allocator, sub) and
+            !peekPixal3dPipeline(io, allocator, sub) and
             !peekStableAudio3Config(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
@@ -1293,6 +1375,14 @@ fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
     return 0;
 }
 
+/// RADIO's native checkpoint discriminator, shared by discovery and the model loader.
+pub fn hasRadioVision(root: std.json.ObjectMap) bool {
+    const vc = root.get("vision_config") orelse return false;
+    if (vc != .object) return false;
+    const mt = vc.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "radio");
+}
+
 /// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
 /// supplied by the caller (the template lives outside config.json), and
 /// determines chat/tool capabilities — gated off for encoder-only (`bert`)
@@ -1314,9 +1404,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // `model.zig parseConfigFromJson` does. Reading the root alone made
     // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
     // unloaded Gemma 3/4 and Qwen-VL model.
-    // Qwen3-ASR nests it one level deeper, under `thinker_config`.
+    // Qwen3-ASR nests under `thinker_config`; Nemotron omni uses `llm_config`.
     const thinker: ?std.json.ObjectMap = if (root.get("thinker_config")) |t| (if (t == .object) t.object else null) else null;
-    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
+    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse root.get("llm_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
         (if (tc == .object) tc.object else null)
     else
         null;
@@ -1333,6 +1423,17 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     meta.vocab_size = cfgU32(root, text_cfg, "vocab_size");
     meta.hidden_size = cfgU32(root, text_cfg, "hidden_size");
     meta.num_hidden_layers = cfgU32(root, text_cfg, "num_hidden_layers");
+    if (meta.num_hidden_layers == 0) {
+        const tc = text_cfg orelse root;
+        if (tc.get("layers_block_type") orelse tc.get("block_configs") orelse tc.get("hybrid_override_pattern")) |layers| {
+            const count = switch (layers) {
+                .array => |arr| arr.items.len,
+                .string => |str| str.len,
+                else => 0,
+            };
+            meta.num_hidden_layers = std.math.cast(u32, count) orelse 0;
+        }
+    }
     meta.max_position_embeddings = cfgU32(root, text_cfg, "max_position_embeddings");
     if (root.get("quantization")) |q| {
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
@@ -1347,7 +1448,10 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
+    const nemotron = std.mem.eql(u8, mt, "nemotron_h") or std.mem.eql(u8, mt, "nemotron_h_puzzle") or std.mem.eql(u8, mt, "nemotron_h_omni");
+    const radio = nemotron and hasRadioVision(root);
+    if (nemotron) meta.has_vision = radio;
+    meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio;
     meta.is_aligner = isForcedAligner(root);
     meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
     const bidirectional = blk: {
@@ -1371,7 +1475,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // The model card's window, not the trunk's 262144 (model.zig EMBEDDING_GEMMA2_WINDOW).
     const embedding_gemma2_window: u32 = 8192;
     if (embedding_gemma2) meta.max_position_embeddings = if (meta.max_position_embeddings == 0) embedding_gemma2_window else @min(meta.max_position_embeddings, embedding_gemma2_window);
-    meta.has_chat = has_chat_template and !meta.is_encoder;
+    // Their packs ship no template; the loader embeds ours (chat.loadChatConfig).
+    const embeds_template = std.mem.eql(u8, mt, "deepseek_v4") or std.mem.eql(u8, mt, "deepseek_v41");
+    meta.has_chat = (has_chat_template or embeds_template) and !meta.is_encoder;
     meta.has_embedding = meta.is_encoder;
     if (root.get("pooling_mode")) |v| {
         if (v == .string) meta.has_embedding = true;
@@ -1757,6 +1863,84 @@ test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root conf
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
     try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
+}
+
+test "discoverModels finds a MOSS-Image repo by its model_index.json alone" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until its VAE weights land.
+    try tmp.dir.createDirPath(io, "me/MOSS-Image-half/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("moss_image", result.models[0].model_type);
+    try testing.expect(isMediaModelType("moss_image"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("moss_image"));
+}
+
+test "discoverModels finds a TRELLIS.2 pack by its pipeline.json alone, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{}}";
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/ckpts");
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until the SS decoder lands.
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-half/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    // Another pipeline.json (a different class) is no model.
+    try tmp.dir.createDirPath(io, "me/other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/other/pipeline.json", .data = "{\"name\":\"SomethingElse\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("trellis2", result.models[0].model_type);
+    try testing.expect(isMediaModelType("trellis2"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("trellis2"));
+}
+
+test "discoverModels tells a Pixal3D pack (TRELLIS.2's pipeline.json, proj flows) from TRELLIS.2, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{\"models\":{\"sparse_structure_flow_model\":\"ckpts/ss_flow\"}}}";
+    const proj_dit = "{\"name\":\"SparseStructureFlowModel\",\"args\":{\"image_attn_mode\":\"proj\"}}";
+    for ([_][]const u8{ "me/Pixal3D", "me/Pixal3D-half" }) |d| {
+        var buf: [64]u8 = undefined;
+        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/ckpts", .{d}));
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/pipeline.json", .{d}), .data = pipeline });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.json", .{d}), .data = proj_dit });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.safetensors", .{d}), .data = "0123456789" });
+    }
+    // Only the complete pack has its texture decoder, the last of its weights.
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/Pixal3D/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("pixal3d", result.models[0].model_type);
+    try testing.expect(isMediaModelType("pixal3d"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("pixal3d"));
 }
 
 test "discoverModels finds a Stable Audio 3 repo (model_config.json, no root config.json)" {
@@ -2195,6 +2379,7 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("minicpmv4_7"));
     try testing.expect(isSupportedModelType("qwen3_asr"));
     try testing.expect(isSupportedModelType("kolibri1"));
+    try testing.expect(isSupportedModelType("flint"));
     try testing.expect(isSupportedModelType("lfm2_moe"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
@@ -2223,6 +2408,8 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
     try testing.expect(isSupportedModelType("deepseek_v41"));
+    try testing.expect(isSupportedModelType("glm_moe_dsa"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("glm_moe_dsa"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
@@ -2278,6 +2465,20 @@ test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" 
     defer if (peek == .supported) a.free(peek.supported);
     try testing.expect(peek == .supported);
     try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
+}
+
+test "parseStubMeta reads the native Nemotron omni language config" {
+    const m = parseStubMeta(testing.allocator,
+        \\{"model_type":"nemotron_h_omni","vision_config":{"model_type":"radio"},
+        \\"llm_config":{"model_type":"nemotron_h_puzzle","hidden_size":4096,
+        \\"vocab_size":131072,"max_position_embeddings":262144,"num_experts":496,
+        \\"layers_block_type":["mamba","moe","attention"]}}
+    , true);
+    try testing.expect(m.found and m.has_vision and m.has_video and m.is_moe);
+    try testing.expectEqual(@as(u32, 4096), m.hidden_size);
+    try testing.expectEqual(@as(u32, 131072), m.vocab_size);
+    try testing.expectEqual(@as(u32, 262144), m.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 3), m.num_hidden_layers);
 }
 
 test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
@@ -2357,6 +2558,12 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         try testing.expect(!m.has_chat);
         try testing.expectEqual(@as(u32, 768), m.hidden_size);
     }
+    // DeepSeek V4/V4.1 packs ship no chat template: the loader embeds ours, so the stub is still chat.
+    for ([_][]const u8{ "deepseek_v4", "deepseek_v41" }) |mt| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"model_type\":\"{s}\",\"hidden_size\":5120}}", .{mt});
+        try testing.expect(parseStubMeta(a, json, false).has_chat);
+    }
     // A chat gemma3_text WITHOUT the flag stays a chat model.
     {
         const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
@@ -2383,6 +2590,16 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         // The trained window the loaded row reports (model.zig), not the trunk's 262144.
         try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
         try testing.expect(isSupportedModelType("embedding_gemma2"));
+    }
+    // RADIO video has no video_token_id; its native tower discriminator supplies the capability.
+    {
+        const on = parseStubMeta(a, "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\"}}", true);
+        try testing.expect(on.has_vision);
+        try testing.expect(on.has_video);
+        const off = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", true);
+        try testing.expect(!off.has_vision and !off.has_video);
+        const flag = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", true);
+        try testing.expect(!flag.has_vision and !flag.has_video);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

@@ -195,16 +195,39 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertTrue(VideoGenService.refFrameTimes(count: 0, fps: 24).isEmpty)
     }
 
-    func testRef2vaPresetIsTheOnlyOneAdvertisingReferences() {
+    func testOnlyTheRef2vaFamilyAdvertisesReferences() {
         // The factory takes the flag as a parameter precisely so the two FL2VA
         // presets cannot drift into claiming a capability their DiT lacks.
-        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsReferences)
-        for p in VideoModelPreset.all where p.id != VideoModelPreset.minimaxH3Ref2VA.id {
-            XCTAssertFalse(p.supportsReferences, "\(p.id) must not advertise references")
+        let ref2va: Set<String> = [VideoModelPreset.minimaxH3Ref2VA.id, VideoModelPreset.fastH3Omni.id]
+        for p in VideoModelPreset.all {
+            XCTAssertEqual(p.supportsReferences, ref2va.contains(p.id), "\(p.id)")
         }
         // REF2VA has no first/last-frame conditioning and FL2VA has no
         // references — two checkpoints, not two modes of one.
         XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
+    }
+
+    func testFastH3OmniRunsItsTrainedEightStepsOnly() {
+        // Bar: the server refuses any other count, Turbo and chaining, so the pane offers none of them.
+        let omni = VideoModelPreset.fastH3Omni
+        XCTAssertTrue(VideoModelPreset.all.contains { $0.id == omni.id })
+        XCTAssertEqual(omni.backend, .minimaxH3)
+        XCTAssertEqual(omni.promptFormat, .h3Reference)
+        XCTAssertEqual(omni.fixedSteps, 8)
+        XCTAssertEqual(omni.stepsRange(turbo: false), 8...8)
+        for q in QualityPreset.allCases { XCTAssertEqual(omni.settings(q).steps, 8, "\(q)") }
+        XCTAssertFalse(omni.supportsTurbo)
+        XCTAssertFalse(omni.supportsChainedWindows)
+        XCTAssertFalse(omni.supportsLastFrame)
+        XCTAssertFalse(omni.supportsFastRecipe)
+        XCTAssertNil(VideoModelPreset.minimaxH3Ref2VA.fixedSteps)
+    }
+
+    func testOmnisEstimateReadsItsOwnStepCost() {
+        // Bar: at the same canvas and step count, Omni's sparse-attention step prices below REF2VA's.
+        let omni = H3TimeEstimate.seconds(model: .fastH3Omni, width: 832, height: 480, frames: 243, steps: 8, fast: false, hardware: .anchor)
+        let base = H3TimeEstimate.seconds(model: .minimaxH3Ref2VA, width: 832, height: 480, frames: 243, steps: 8, fast: false, hardware: .anchor)
+        XCTAssertLessThan(omni, base)
     }
 
     func testTurboStepsStayInsideTheDistillationsTrainedRange() {
@@ -1090,9 +1113,11 @@ final class MediaGenServiceTests: XCTestCase {
     func testQwenImagePresetsOfferOnlyWhatTheBackendHonors() {
         for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit] {
             XCTAssertTrue(p.supportsImg2Img, "\(p.id): VAE encoder loads on first use")
+            XCTAssertTrue(p.supportsLoRA, "\(p.id): block linears take stacked adapters")
             XCTAssertTrue(p.supportsGuidance, "\(p.id): undistilled, real CFG")
-            XCTAssertFalse(p.supportsLoRA, "\(p.id): 0 matched modules -> 400")
-            XCTAssertFalse(p.supportsReferenceEdit)
+            XCTAssertTrue(p.supportsReferenceEdit, "\(p.id): unified t2i + edit checkpoint")
+            XCTAssertEqual(p.maxReferenceImages, 9, "gen.editRefCap: 10 total beside the source")
+            XCTAssertEqual(p.capabilityLabel, "Best for creating images")
             XCTAssertEqual(p.condWeightCount, 0)
             XCTAssertFalse(p.stepsAreFixed)
             XCTAssertEqual(p.settings(.quality).steps, 40, "\(p.id): the checkpoint's own default")
@@ -1104,6 +1129,9 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertTrue(ImageModelPreset.all.contains(p))
             XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
         }
+        XCTAssertTrue(ImageModelPreset.qwenImage21Turbo_8bit.supportsReferenceEdit)
+        XCTAssertEqual(ImageModelPreset.flux2Klein4B_Q4.maxReferenceImages, 3)
+        XCTAssertEqual(ImageModelPreset.mageFlowEditTurbo.maxReferenceImages, 3)
     }
 
     /// Turbo ships its own 8-sigma grid and the server runs it whatever `steps`
@@ -1115,7 +1143,7 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertEqual(p.fixedSteps, 8)
             for q in QualityPreset.allCases { XCTAssertEqual(p.settings(q).steps, 8) }
             XCTAssertTrue(p.supportsImg2Img)
-            XCTAssertFalse(p.supportsLoRA)
+            XCTAssertTrue(p.supportsLoRA, "\(p.id): Turbo shares the base DiT's linears")
             XCTAssertEqual(p.condWeightCount, 0)
             XCTAssertEqual(p.resolutionGrid.alignment, 16)
             XCTAssertEqual(p.configName, "qwen_image21")
@@ -1248,8 +1276,53 @@ final class MediaGenServiceTests: XCTestCase {
             "Extract the main foreground subject from the image and isolate it on a clean pure white background. Preserve its shape, identity, texture, and fine boundary details.")
     }
 
+    /// Qwen-Image lays out dense text (verified live on both packs), so its
+    /// text-to-image menu adds infographic layouts; the other models were never
+    /// verified on dense text and do not get them.
+    func testQwenImageOffersInfographicTemplates() {
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            XCTAssertTrue(p.rendersDenseText, "\(p.id)")
+            XCTAssertEqual(p.promptExamples(editing: false),
+                           ImagePromptExamples.textToImage + [ImagePromptExamples.infographics], "\(p.id)")
+        }
+        for p in [ImageModelPreset.flux2Klein4B_Q4, .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo] {
+            XCTAssertFalse(p.rendersDenseText, "\(p.id)")
+        }
+    }
+
+    /// The format Qwen's own prompt enhancer writes, which Enhance teaches from
+    /// these bodies: every string quoted, nothing left for the model to invent.
+    func testEveryInfographicTemplateQuotesItsTextAndClosesTheLayout() {
+        for e in ImagePromptExamples.infographics.examples {
+            let quotes = e.body.filter { $0 == "\"" }.count
+            XCTAssertGreaterThanOrEqual(quotes, 6, "\(e.title): at least three quoted strings")
+            XCTAssertEqual(quotes % 2, 0, "\(e.title): unbalanced quote")
+            XCTAssertTrue(e.body.contains("There is no other text in the image."), e.title)
+        }
+    }
+
+    /// Qwen's card recommends about 4 MP and the server caps a side at 2048, so
+    /// the 1 MP shapes come again at that cap. The default stays 1 MP: a 2048
+    /// run takes several times as long.
+    func testQwenImageOffersTwoKSizesOnItsGrid() {
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit, .qwenImage21Turbo_8bit, .qwenImage21Turbo_4bit] {
+            let sizes = p.resolutions.map { [$0.width, $0.height] }
+            for want in [[2048, 2048], [1360, 2048], [2048, 1360], [1152, 2048], [2048, 1152]] {
+                XCTAssertTrue(sizes.contains(want), "\(p.id): \(want)")
+            }
+            for r in p.resolutions {
+                let verdict = p.resolutionGrid.resolve(width: r.width, height: r.height)
+                XCTAssertTrue(verdict.isValid, "\(p.id): \(r.label)")
+                XCTAssertEqual(verdict.size?.width, r.width, "\(p.id): \(r.label)")
+                XCTAssertEqual(verdict.size?.height, r.height, "\(p.id): \(r.label)")
+            }
+            XCTAssertEqual(p.defaultResolution.width * p.defaultResolution.height, 1024 * 1024, "\(p.id)")
+        }
+    }
+
     func testEveryExampleGroupIsUsableInAMenu() {
-        for lib in [ImagePromptExamples.textToImage, ImagePromptExamples.mageFlowEdit, ImagePromptExamples.genericEdit] {
+        for lib in [ImagePromptExamples.textToImage, ImagePromptExamples.mageFlowEdit, ImagePromptExamples.genericEdit,
+                    [ImagePromptExamples.infographics]] {
             var seenGroups = Set<String>()
             for g in lib {
                 XCTAssertFalse(g.examples.isEmpty, "\(g.name): an empty submenu is a dead end")
@@ -1346,6 +1419,17 @@ final class MediaGenServiceTests: XCTestCase {
         let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
         XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/ok.safetensors"])
         XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
+    }
+
+    func testNegativeAndLargeLoraScalesReachTheServerUnchanged() {
+        var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
+        req.loras = [
+            LoraAdapter(path: "/tmp/slider.safetensors", scale: -0.75),
+            LoraAdapter(path: "/tmp/pornmaster.safetensors", scale: 20),
+            LoraAdapter(path: "/tmp/other.safetensors", scale: -20),
+        ]
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["lora_scales"] as? [Double], [-0.75, 20, -20])
     }
 
     func testImageRequestJsonOmitsGuidanceFieldsAtDefaults() {

@@ -1172,8 +1172,14 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
     defer home.close(io);
     for (try configFiles(arena.allocator(), io, kind, base_url, model, budget, entries)) |f| {
         try home.createDirPath(io, std.fs.path.dirname(f.path).?);
-        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) .{ .permissions = .fromMode(0o600) } else .{} });
+        try home.writeFile(io, .{ .sub_path = f.path, .data = f.data, .flags = if (f.private) privateFileFlags() else .{} });
     }
+}
+
+/// Owner-only on POSIX; Windows has no mode bits (files inherit the profile's ACL).
+fn privateFileFlags() std.Io.Dir.CreateFileOptions {
+    if (comptime @import("builtin").os.tag == .windows) return .{};
+    return .{ .permissions = .fromMode(0o600) };
 }
 
 // ── Served launch script (`GET /launch`) ────────────────────────────────
@@ -1300,7 +1306,7 @@ fn printLaunchUsage() void {
         \\  --port <n>     Server port for the default URL (default: 11234)
         \\  --print        Write the config files and print the launch script
         \\                 instead of running the agent
-        \\  --no-start     Never auto-start the MLX Core app when the server is down
+        \\  --no-start     Never auto-start the MLX-Serve app when the server is down
         \\
         \\Anything after `--` is passed to the agent, e.g.:
         \\  mlx-serve launch codex -- resume
@@ -1325,10 +1331,10 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         if (parsed.no_start or !tryStartApp(allocator, io)) {
             log.err("no mlx-serve server at {s}.\n", .{base_url});
             log.err("start one first:  mlx-serve serve   (or: mlx-serve run <model>)\n", .{});
-            log.err("or install the MLX Core app: https://github.com/ddalcu/mlx-serve/releases\n", .{});
+            log.err("or install the MLX-Serve app: https://github.com/ddalcu/mlx-serve/releases\n", .{});
             std.process.exit(1);
         }
-        log.info("starting the MLX Core app…\n", .{});
+        log.info("starting the MLX-Serve app…\n", .{});
         var waited: usize = 0;
         while (!serverUp(allocator, io, base_url)) : (waited += 1) {
             if (waited >= 60) {

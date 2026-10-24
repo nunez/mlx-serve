@@ -5,6 +5,8 @@
 //! fused Sinkhorn-collapse kernel is mlx-vlm's `hc_sinkhorn_collapse`.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const dsa = @import("dsa_nax.zig");
+const Scope = @import("mlx_scope.zig").Scope;
 
 pub const HC: c_int = 4;
 const MIX: c_int = (2 + HC) * HC;
@@ -225,7 +227,7 @@ fn mixes(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array, eps: 
     const sh = mlx.getShape(stream);
     // A threadgroup per 8 rows streams the whole `fn`: at decode widths that is one core
     // reading 1.5 MB per sublayer, and MLX's GEMV spreads it instead.
-    if (sh[0] * sh[1] < MIXES_KERNEL_MIN_ROWS) {
+    if (sh[0] * sh[1] < MIXES_KERNEL_MIN_ROWS or !mlx.streamIsGpu(s)) {
         var y = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_astype(&y, stream, .float32, s));
@@ -291,6 +293,7 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
     if (sh.len != 4 or sh[2] != HC or @rem(sh[3], 4) != 0) return error.Glm5HcShape;
     const m = try mixes(s, stream, fn_rows, norm_eps);
     defer _ = mlx.mlx_array_free(m);
+    if (!mlx.streamIsGpu(s)) return collapseOps(s, stream, m, scale, base, iters, hc_eps);
     const kernel = collapse_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "x_in", "mixes", "scale", "base" };
         const outs = [_][*:0]const u8{ "collapsed", "post", "comb" };
@@ -330,6 +333,36 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
     try mlx.check(mlx.mlx_vector_array_get(&out.post, ov, 1));
     try mlx.check(mlx.mlx_vector_array_get(&out.comb, ov, 2));
     return out;
+}
+
+/// `collapse` as MLX ops, where custom Metal kernels cannot run (CUDA).
+fn collapseOps(s: mlx.mlx_stream, stream: mlx.mlx_array, m: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, iters: u32, eps: f32) !Collapsed {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const sh = mlx.getShape(stream);
+    const Gate = struct {
+        fn z(c: *Scope, mix: mlx.mlx_array, sv: mlx.mlx_array, bv: mlx.mlx_array, k: c_int, lo: c_int, hi: c_int) !mlx.mlx_array {
+            return c.add(try c.mul(try c.slice(mix, 2, lo, hi), try c.slice(sv, 0, k, k + 1)), try c.slice(bv, 0, lo, hi));
+        }
+        /// Each row (axis -1) or column (axis -2) divided by its sum + eps.
+        fn norm(c: *Scope, r: mlx.mlx_array, axis: c_int, e: f32) !mlx.mlx_array {
+            return c.div(r, try c.addS(try c.sumAxis(r, axis), e));
+        }
+    };
+    const pre = try sc.addS(try sc.sigmoid(try Gate.z(&sc, m, scale, base, 0, 0, HC)), eps);
+    const post = try sc.mulS(try sc.sigmoid(try Gate.z(&sc, m, scale, base, 1, HC, 2 * HC)), 2.0);
+    const v = try sc.reshape(try Gate.z(&sc, m, scale, base, 2, 2 * HC, MIX), &.{ sh[0], sh[1], HC, HC });
+    var r = try sc.addS(try Gate.norm(&sc, try sc.exp(try sc.sub(v, try sc.maxAxis(v, -1))), -1, eps), eps);
+    r = try Gate.norm(&sc, r, -2, eps);
+    for (1..iters) |_| r = try Gate.norm(&sc, try Gate.norm(&sc, r, -1, eps), -2, eps);
+    // Four f32 multiply-adds, as the kernel does: an f32 matmul rounds through TF32 on CUDA.
+    const sf = try sc.astype(stream, .float32);
+    var x = try sc.zeros(&.{ sh[0], sh[1], sh[3] }, .float32);
+    for (0..HC) |i| {
+        const ic: c_int = @intCast(i);
+        x = try sc.add(x, try sc.mul(try sc.slice(pre, 2, ic, ic + 1), try sc.reshape(try sc.slice(sf, 2, ic, ic + 1), &.{ sh[0], sh[1], sh[3] })));
+    }
+    return .{ .x = sc.out(try sc.astype(x, mlx.mlx_array_dtype(stream))), .post = sc.out(post), .comb = sc.out(r) };
 }
 
 // One token, after oMLX `decode_kernels.py` `hc_pre_fused` (Apache-2.0, see NOTICE): the
@@ -438,8 +471,9 @@ const HC_PRE_BODY =
 ;
 const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
 const HC_PRE_SOURCE = "#define HVAL(k) float(x[row * K + (k)])\n#define STORE_H(k, v)\n#define TAIL4(k) float4(*(const device vec<T, 4>*)(x + row * K + (k)))\n" ++ HC_PRE_BODY;
-// The tail reads the stream the other threadgroups stored, two elements per 32-bit atomic.
-const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[row * K + (k)] = T(v)\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
+// Stream pairs cross threadgroups as 32-bit atomics: the even lane stores its odd neighbour's
+// element with its own, and the tail loads two elements per atomic.
+const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) { static_assert(SL % 2 == 0 && TPG % 2 == 0, \"pairs need even k on even lanes\"); const float v1 = simd_shuffle_down((v), 1u); if (((k) & 1) == 0) atomic_store_explicit((device atomic_uint*)(h + row * K + (k)), as_type<uint>(vec<T, 2>(T(v), T(v1))), memory_order_relaxed); }\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
 const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nconst uint row = thread_position_in_grid.y;\nh[row * HC * D + k] = T(HVAL(k));\n";
 var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -514,7 +548,7 @@ pub const Pre = struct {
 
 /// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS`.
 pub fn hcRowsServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
-    return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 4) == 0 and
+    return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 8) == 0 and
         @divTrunc(sh[3], 4) <= HC_PRE_TPG and @rem(HC * sh[3], HC_PRE_NT) == 0 and (dt == .bfloat16 or dt == .float16) and
         mlx.mlx_array_dtype(norm_w) == dt and mlx.mlx_array_dtype(fn_rows) == .float32;
 }
@@ -627,6 +661,7 @@ var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// `post * x + comb^T @ stream`, in f32, back to the stream's dtype: the new stream.
 pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *const Collapsed) !mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return expandOps(s, x, stream, c);
     const sh = mlx.getShape(stream);
     const dt = mlx.mlx_array_dtype(stream);
     const kern = expand_kernel orelse blk: {
@@ -664,6 +699,22 @@ pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *co
     return out;
 }
 
+/// `expand` as MLX ops: post * x + comb^T @ stream as f32 multiply-adds (no TF32 matmul),
+/// rounded once to the stream's dtype.
+fn expandOps(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *const Collapsed) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const sh = mlx.getShape(stream);
+    const sf = try sc.astype(stream, .float32);
+    var out = try sc.mul(try sc.reshape(c.post, &.{ sh[0], sh[1], HC, 1 }), try sc.reshape(try sc.astype(x, .float32), &.{ sh[0], sh[1], 1, sh[3] }));
+    for (0..HC) |j| {
+        const jc: c_int = @intCast(j);
+        const comb_j = try sc.reshape(try sc.slice(c.comb, 2, jc, jc + 1), &.{ sh[0], sh[1], HC, 1 });
+        out = try sc.add(out, try sc.mul(comb_j, try sc.slice(sf, 2, jc, jc + 1)));
+    }
+    return sc.out(try sc.astype(out, mlx.mlx_array_dtype(stream)));
+}
+
 // ── DeepSeek sparse attention: token selection ─────────────────────────
 
 pub const Indexer = struct {
@@ -684,194 +735,10 @@ fn scalarI(v: i32) mlx.mlx_array {
     return mlx.mlx_array_new_int(v);
 }
 
-/// oMLX `patches/glm_moe_dsa/indexer_nax.py` (Apache-2.0, see NOTICE): the indexer's
-/// head-summed `relu(q . k) * w` per (query, pool) on the tensor units, the causal pool mask
-/// folded into the epilogue. Here the scores leave in f32 (`O`), as the reference ranks them.
-const INDEXER_NAX_SOURCE =
-    \\    constexpr int D = 128;
-    \\    const int S = params[0];
-    \\    const int P = params[1];
-    \\    const int before = params[2];
-    \\    const int pool_len = params[3];
-    \\    const int ratio = params[4];
-    \\    const int H = params[5];
-    \\    const int q_row_stride = H * D;
-    \\    const uint sg = simdgroup_index_in_threadgroup;
-    \\    const uint lane = thread_index_in_simdgroup;
-    \\    const int sm = int(threadgroup_position_in_grid.y) * (32 * WM) + int(sg / WN) * 32;
-    \\    const int sn = int(threadgroup_position_in_grid.x) * (32 * WN) + int(sg % WN) * 32;
-    \\
-    \\    const short qid = short(lane >> 2);
-    \\    const short fm = short((qid & 4) | ((lane >> 1) & 3));
-    \\    const short fn = short(((qid & 2) | (lane & 1)) * 4);
-    \\
-    \\    // Every score of the block is masked when its first pooled key is not
-    \\    // yet complete for the block's last query row.
-    \\    const int s_last = min(sm + 31, S - 1);
-    \\    const bool live = sm < S && sn < P && sn < pool_len &&
-    \\        (sn + 1) * ratio - 1 <= before + s_last;
-    \\
-    \\    float acc[2][16];
-    \\    for (short a = 0; a < 2; ++a) {
-    \\        for (short e = 0; e < 16; ++e) {
-    \\            acc[a][e] = 0.0f;
-    \\        }
-    \\    }
-    \\
-    \\    int qrow[2][2];
-    \\    for (short tm = 0; tm < 2; ++tm) {
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            qrow[tm][i] = min(sm + tm * 16 + fm + i * 8, S - 1);
-    \\        }
-    \\    }
-    \\
-    \\    if (live) {
-    \\        constexpr auto desc = matmul2d_descriptor(
-    \\            16, 32, 16, false, true, true,
-    \\            matmul2d_descriptor::mode::multiply_accumulate);
-    \\        matmul2d<desc, execution_simdgroup> op;
-    \\
-    \\        int krow[2][2];
-    \\        for (short tn = 0; tn < 2; ++tn) {
-    \\            for (short i = 0; i < 2; ++i) {
-    \\                krow[tn][i] = min(sn + tn * 16 + fm + i * 8, P - 1);
-    \\            }
-    \\        }
-    \\        const device T* kbase[2][2];
-    \\        for (short tn = 0; tn < 2; ++tn) {
-    \\            for (short i = 0; i < 2; ++i) {
-    \\                kbase[tn][i] = k + ulong(krow[tn][i]) * D + fn;
-    \\            }
-    \\        }
-    \\
-    \\        for (int h = 0; h < H; ++h) {
-    \\            auto ct_a0 = op.template get_left_input_cooperative_tensor<T, T, float>();
-    \\            auto ct_a1 = op.template get_left_input_cooperative_tensor<T, T, float>();
-    \\            auto ct_b = op.template get_right_input_cooperative_tensor<T, T, float>();
-    \\            auto c0 = op.template get_destination_cooperative_tensor<
-    \\                metal::remove_addrspace_t<decltype(ct_a0)>,
-    \\                metal::remove_addrspace_t<decltype(ct_b)>, float>();
-    \\            auto c1 = op.template get_destination_cooperative_tensor<
-    \\                metal::remove_addrspace_t<decltype(ct_a0)>,
-    \\                metal::remove_addrspace_t<decltype(ct_b)>, float>();
-    \\            for (short e = 0; e < 16; ++e) {
-    \\                c0[e] = 0.0f;
-    \\                c1[e] = 0.0f;
-    \\            }
-    \\            const device T* a00 = q + ulong(qrow[0][0]) * q_row_stride + h * D + fn;
-    \\            const device T* a01 = q + ulong(qrow[0][1]) * q_row_stride + h * D + fn;
-    \\            const device T* a10 = q + ulong(qrow[1][0]) * q_row_stride + h * D + fn;
-    \\            const device T* a11 = q + ulong(qrow[1][1]) * q_row_stride + h * D + fn;
-    \\            for (short kk = 0; kk < D; kk += 16) {
-    \\                for (short j = 0; j < 4; ++j) {
-    \\                    ct_a0[j] = a00[kk + j];
-    \\                    ct_a0[4 + j] = a01[kk + j];
-    \\                    ct_a1[j] = a10[kk + j];
-    \\                    ct_a1[4 + j] = a11[kk + j];
-    \\                }
-    \\                for (short tn = 0; tn < 2; ++tn) {
-    \\                    for (short i = 0; i < 2; ++i) {
-    \\                        for (short j = 0; j < 4; ++j) {
-    \\                            ct_b[tn * 8 + i * 4 + j] = kbase[tn][i][kk + j];
-    \\                        }
-    \\                    }
-    \\                }
-    \\                op.run(ct_a0, ct_b, c0);
-    \\                op.run(ct_a1, ct_b, c1);
-    \\            }
-    \\            // relu * head weight in fp32, heads accumulated in order.
-    \\            for (short i = 0; i < 2; ++i) {
-    \\                const float w0 = float(w[ulong(qrow[0][i]) * H + h]);
-    \\                const float w1 = float(w[ulong(qrow[1][i]) * H + h]);
-    \\                for (short tn = 0; tn < 2; ++tn) {
-    \\                    for (short j = 0; j < 4; ++j) {
-    \\                        const short e = tn * 8 + i * 4 + j;
-    \\                        acc[0][e] += max(float(c0[e]), 0.0f) * w0;
-    \\                        acc[1][e] += max(float(c1[e]), 0.0f) * w1;
-    \\                    }
-    \\                }
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    const O masked = O(-1e30f);
-    \\    for (short tm = 0; tm < 2; ++tm) {
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            const int s = sm + tm * 16 + fm + i * 8;
-    \\            if (s >= S) {
-    \\                continue;
-    \\            }
-    \\            for (short tn = 0; tn < 2; ++tn) {
-    \\                for (short j = 0; j < 4; ++j) {
-    \\                    const int p = sn + tn * 16 + fn + j;
-    \\                    if (p >= P) {
-    \\                        continue;
-    \\                    }
-    \\                    const bool valid = p < pool_len && (p + 1) * ratio - 1 <= before + s;
-    \\                    out[ulong(s) * P + p] = valid ? O(acc[tm][tn * 8 + i * 4 + j]) : masked;
-    \\                }
-    \\            }
-    \\        }
-    \\    }
-;
-const INDEXER_WM: c_int = 2;
-const INDEXER_WN: c_int = 2;
-var indexer_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var indexer_nax_engaged = false;
-
-/// Masked scores f32 [1, S, P] of queries at positions `q_start..` (`q_idx` [1, S, H, 128],
-/// `w` [1, S, H] scaled) against pooled keys `pk` [1, P, 128] (`pool_len` of them complete,
-/// `kpool` tokens each); a pool a query cannot see scores -1e30. Null off NAX or outside the shape.
+/// `dsa_nax.indexerScores` where the device has NAX.
 fn indexerScoresNax(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, pk: mlx.mlx_array, q_start: c_int, kpool: c_int) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("transformer.zig").verifyQmmNaxAvailable()) return null;
-    const qs = mlx.getShape(q_idx);
-    const ps = mlx.getShape(pk);
-    if (qs.len != 4 or qs[0] != 1 or qs[3] != 128 or ps.len != 3 or ps[0] != 1 or ps[2] != 128) return null;
-    if (mlx.mlx_array_dtype(q_idx) != .bfloat16 or mlx.mlx_array_dtype(pk) != .bfloat16) return null;
-    const sq = qs[1];
-    const h = qs[2];
-    const p = ps[1];
-    if (sq < 1 or p < 1) return null;
-    const kern = indexer_nax_kernel orelse blk: {
-        const ins = [_][*:0]const u8{ "q", "k", "w", "params" };
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("msv_glm5_indexer_nax", iv, ov, INDEXER_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
-        if (k.ctx == null) return error.MetalKernelCompileFailed;
-        indexer_nax_kernel = k;
-        break :blk k;
-    };
-    const pdata = [6]i32{ sq, p, q_start, p, kpool, h };
-    const params = mlx.mlx_array_new_data(&pdata, &[_]c_int{6}, 1, .int32);
-    defer _ = mlx.mlx_array_free(params);
-    const tg_x = @divTrunc(p + 32 * INDEXER_WN - 1, 32 * INDEXER_WN);
-    const tg_y = @divTrunc(sq + 32 * INDEXER_WM - 1, 32 * INDEXER_WM);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, sq, p }, 3, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, tg_x * INDEXER_WM * INDEXER_WN * 32, tg_y, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, INDEXER_WM * INDEXER_WN * 32, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "O", .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WM", INDEXER_WM));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WN", INDEXER_WN));
-    const inputs = [_]mlx.mlx_array{ q_idx, pk, w, params };
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
-    if (!indexer_nax_engaged) {
-        indexer_nax_engaged = true;
-        @import("log.zig").info("[dsa] NAX indexer scores engaged\n", .{});
-    }
-    return out;
+    if (!@import("transformer.zig").verifyQmmNaxAvailable()) return null;
+    return dsa.indexerScores(s, q_idx, w, pk, q_start, kpool);
 }
 
 /// A forward's indexer rows (key | gate) as the cache stores them: the row that completes a
@@ -919,6 +786,7 @@ pub fn withPooledKeys(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_arr
     const csh = mlx.getShape(chunk);
     const dt = mlx.mlx_array_dtype(chunk);
     const prev_len: c_int = @min(pos0, mlx.getShape(prev)[1]);
+    if (!mlx.streamIsGpu(s)) return withPooledKeysOps(s, prev, chunk, ape, pos0, prev_len, ix);
     const kern = pooled_rows_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "prev", "chunk", "ape", "dims" };
         const outs = [_][*:0]const u8{"out"};
@@ -943,6 +811,35 @@ pub fn withPooledKeys(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_arr
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
     }
     return applyOne(s, kern, cfg, &.{ prev, chunk, ape, dims });
+}
+
+/// `withPooledKeys` as MLX ops: every row pools the `kpool` rows ending at it (rows before
+/// the cache read as zeros), and only a pool's completing row keeps the result.
+fn withPooledKeysOps(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_array, ape: mlx.mlx_array, pos0: c_int, prev_len: c_int, ix: Indexer) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const csh = mlx.getShape(chunk);
+    const dt = mlx.mlx_array_dtype(chunk);
+    const lead = try sc.zeros(&.{ csh[0], ix.kpool - 1 - prev_len, csh[2] }, dt);
+    const rows = try sc.concat(&.{ lead, try sc.slice(prev, 1, 0, prev_len), chunk }, 1);
+    var win: [16]mlx.mlx_array = undefined;
+    if (ix.kpool > win.len) return error.Glm5HcShape;
+    for (win[0..@intCast(ix.kpool)], 0..) |*w, j| w.* = try sc.reshape(try sc.slice(rows, 1, @intCast(j), @as(c_int, @intCast(j)) + csh[1]), &.{ csh[0], csh[1], 1, csh[2] });
+    const w4 = try sc.concat(win[0..@intCast(ix.kpool)], 2);
+    const logits = try sc.add(try sc.astype(try sc.slice(w4, 3, ix.head_dim, 2 * ix.head_dim), .float32), ape);
+    var o = mlx.mlx_array_new();
+    const probs = try sc.res(mlx.mlx_softmax_axis(&o, logits, 2, true, s), &o);
+    const prod = try sc.mul(try sc.astype(probs, dt), try sc.slice(w4, 3, 0, ix.head_dim));
+    const pooled = try sc.reshape(try sc.astype(try sc.sumAxis(try sc.astype(prod, .float32), 2), dt), &.{ csh[0], csh[1], ix.head_dim });
+    var done = mlx.mlx_array_new();
+    const pos = try sc.res(mlx.mlx_arange(&done, @floatFromInt(pos0 + 1), @floatFromInt(pos0 + 1 + csh[1]), 1, .int32, s), &done);
+    var rem = mlx.mlx_array_new();
+    const r = try sc.res(mlx.mlx_remainder(&rem, pos, try sc.keep(mlx.mlx_array_new_int(ix.kpool)), s), &rem);
+    var is0 = mlx.mlx_array_new();
+    const completes = try sc.reshape(try sc.res(mlx.mlx_equal(&is0, r, try sc.keep(mlx.mlx_array_new_int(0)), s), &is0), &.{ 1, csh[1], 1 });
+    var g = mlx.mlx_array_new();
+    const gate = try sc.res(mlx.mlx_where(&g, completes, pooled, try sc.slice(chunk, 2, ix.head_dim, 2 * ix.head_dim), s), &g);
+    return sc.out(try sc.concat(&.{ try sc.slice(chunk, 2, 0, ix.head_dim), gate }, 2));
 }
 
 /// [B, P, Dh] keys of the first `p` pools: the completing rows' gate halves.
@@ -986,6 +883,7 @@ var expand_sel_kernel: ?mlx.mlx_fast_metal_kernel = null;
 /// int32 [B, S, topk + kpool - 1] token indices from the selected pools `sel` [B, S, select_k].
 fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_int, ix: Indexer) !mlx.mlx_array {
     const ssh = mlx.getShape(sel);
+    if (!mlx.streamIsGpu(s)) return expandSelectionOps(s, sel, q_start, p, ix);
     const kern = expand_sel_kernel orelse blk: {
         const ins = [_][*:0]const u8{ "selected", "qpos" };
         const outs = [_][*:0]const u8{"out"};
@@ -1020,6 +918,53 @@ fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_i
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+/// `expandSelection` as MLX ops: each selected pool's tokens where the pool is complete by
+/// the row's position, -1 up to `topk`, then the row's own unfinished pool.
+fn expandSelectionOps(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_int, ix: Indexer) !mlx.mlx_array {
+    var sc = Scope.init(std.heap.page_allocator, s);
+    defer sc.deinit();
+    const ssh = mlx.getShape(sel);
+    const I = struct {
+        fn n(c: *Scope, v: c_int) !mlx.mlx_array {
+            return c.keep(mlx.mlx_array_new_int(v));
+        }
+        fn iota(c: *Scope, len: c_int, start: c_int, shape: []const c_int) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.reshape(try c.res(mlx.mlx_arange(&o, @floatFromInt(start), @floatFromInt(start + len), 1, .int32, c.s), &o), shape);
+        }
+        fn op(c: *Scope, comptime f: anytype, x: mlx.mlx_array, y: mlx.mlx_array) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.res(f(&o, x, y, c.s), &o);
+        }
+        fn where(c: *Scope, cond: mlx.mlx_array, x: mlx.mlx_array) !mlx.mlx_array {
+            var o = mlx.mlx_array_new();
+            return c.res(mlx.mlx_where(&o, cond, x, try n(c, -1), c.s), &o);
+        }
+    };
+    const kp = try I.n(&sc, ix.kpool);
+    const sel_w = ssh[2] * ix.kpool;
+    const qp = try I.iota(&sc, ssh[0] * ssh[1], q_start, &.{ ssh[0], ssh[1], 1 });
+    var o = mlx.mlx_array_new();
+    const pool = try sc.res(mlx.mlx_repeat_axis(&o, try sc.astype(sel, .int32), ix.kpool, 2, s), &o);
+    const tok = try sc.add(try sc.mul(pool, kp), try I.op(&sc, mlx.mlx_remainder, try I.iota(&sc, sel_w, 0, &.{ 1, 1, sel_w }), kp));
+    const pool_end = try sc.sub(try sc.mul(try sc.add(pool, try I.n(&sc, 1)), kp), try I.n(&sc, 1));
+    const valid = try I.op(&sc, mlx.mlx_logical_and, try I.op(&sc, mlx.mlx_less, pool, try I.n(&sc, p)), try I.op(&sc, mlx.mlx_less_equal, pool_end, qp));
+    var parts: [3]mlx.mlx_array = undefined;
+    var np: usize = 0;
+    parts[np] = try I.where(&sc, valid, tok);
+    np += 1;
+    if (ix.topk > sel_w) {
+        parts[np] = try sc.add(try sc.zeros(&.{ ssh[0], ssh[1], ix.topk - sel_w }, .int32), try I.n(&sc, -1));
+        np += 1;
+    }
+    const tail = try I.op(&sc, mlx.mlx_remainder, try sc.add(qp, try I.n(&sc, 1)), kp);
+    const t = try I.iota(&sc, ix.kpool - 1, 0, &.{ 1, 1, ix.kpool - 1 });
+    const tail_tok = try sc.add(try sc.sub(try sc.add(qp, try I.n(&sc, 1)), tail), t);
+    parts[np] = try sc.broadcast(try I.where(&sc, try I.op(&sc, mlx.mlx_less, t, tail), tail_tok), &.{ ssh[0], ssh[1], ix.kpool - 1 });
+    np += 1;
+    return sc.out(try sc.concat(parts[0..np], 2));
 }
 
 /// `x` that also evaluates `dep`: a cache row nothing in this forward reads (the indexer below
@@ -1596,355 +1541,10 @@ pub fn sparseLatentAttention(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: ml
     return out;
 }
 
-/// oMLX `patches/glm_moe_dsa/sparse_mla_nax.py` (Apache-2.0, see NOTICE): the sparse
-/// latent attention on the tensor units. One threadgroup per (query, 32-head half), 8
-/// simdgroups; per 128-slot tile, scores read key rows through the indices (never gathered),
-/// online exp2 softmax in f32, P as fp16 hi + lo pieces against bf16 values, f32 accumulate.
-const SPARSE_NAX_HEADER =
-    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-    \\using namespace mpp::tensor_ops;
-;
-const SPARSE_NAX_SOURCE =
-    \\    constexpr int D = 512;
-    \\    constexpr int BK = 128;
-    \\    const int L = params[0];
-    \\    const int Kn = params[1];
-    \\    const int TOPK = params[2];
-    \\    const int q_off = params[3];
-    \\    const float scale_log2 = scale[0] * 1.44269504088896341f;
-    \\    const int qi = int(threadgroup_position_in_grid.x);
-    \\    const int hh = int(threadgroup_position_in_grid.y);
-    \\    const uint sg = simdgroup_index_in_threadgroup;
-    \\    const uint lane = thread_index_in_simdgroup;
-    \\    const uint tid = sg * 32 + lane;
-    \\    const int hg = int(sg) / 4;
-    \\    const int j4 = int(sg) % 4;   // QK + softmax: key quarter; PV: dim quarter
-    \\    const int q_abs = q_off + qi;
-    \\    const int head0 = hh * 32 + hg * 16;
-    \\
-    \\    const short qid = short(lane >> 2);
-    \\    const short fm = short((qid & 4) | ((lane >> 1) & 3));
-    \\    const short fn = short(((qid & 2) | (lane & 1)) * 4);
-    \\    // Lanes with fn == 0: one per row (fm) of a fragment after the
-    \\    // xor-1 / xor-8 row reductions.
-    \\    const bool row_writer = (lane & 9u) == 0u;
-    \\
-    \\    threadgroup int sel[2][BK];
-    \\    threadgroup int live[2][BK / 32];
-    \\    threadgroup float red_max[2][4][16];
-    \\    threadgroup float red_sum[2][4][16];
-    \\    // P pieces per (head group, 16-key step, lane): the 8 values of the
-    \\    // lane's fragment slots (rows fm, fm + 8 x keys fn .. fn + 3).
-    \\    threadgroup half p_hi[2][BK / 16][32 * 8];
-    \\    threadgroup half p_lo[2][BK / 16][32 * 8];
-    \\
-    \\    constexpr auto qk_desc = matmul2d_descriptor(
-    \\        16, 32, 16, false, true, true,
-    \\        matmul2d_descriptor::mode::multiply_accumulate);
-    \\    matmul2d<qk_desc, execution_simdgroup> qk_op;
-    \\    constexpr auto pv_desc = matmul2d_descriptor(
-    \\        16, 32, 16, false, false, true,
-    \\        matmul2d_descriptor::mode::multiply_accumulate);
-    \\    matmul2d<pv_desc, execution_simdgroup> pv_op;
-    \\
-    \\    auto pa = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
-    \\    auto pm = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
-    \\    auto pb = pv_op.template get_right_input_cooperative_tensor<half, T, float>();
-    \\    auto o0 = pv_op.template get_destination_cooperative_tensor<
-    \\        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
-    \\    auto o1 = pv_op.template get_destination_cooperative_tensor<
-    \\        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
-    \\    auto o2 = pv_op.template get_destination_cooperative_tensor<
-    \\        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
-    \\    auto o3 = pv_op.template get_destination_cooperative_tensor<
-    \\        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
-    \\    for (short e = 0; e < 16; ++e) {
-    \\        o0[e] = 0.0f;
-    \\        o1[e] = 0.0f;
-    \\        o2[e] = 0.0f;
-    \\        o3[e] = 0.0f;
-    \\    }
-    \\    float m_run[2] = {-FLT_MAX, -FLT_MAX};
-    \\    float l_run[2] = {0.0f, 0.0f};
-    \\
-    \\    const device T* qr0 = q + (ulong(head0 + fm) * L + qi) * D + fn;
-    \\    const device T* qr1 = q + (ulong(head0 + fm + 8) * L + qi) * D + fn;
-    \\    const device int32_t* idx_row = idx + ulong(qi) * TOPK;
-    \\
-    \\    auto stage = [&](int t, int b) {
-    \\        if (tid < uint(BK)) {
-    \\            const int slot = t * BK + int(tid);
-    \\            int kp = slot < TOPK ? int(idx_row[slot]) : -1;
-    \\            if (kp < 0 || kp >= Kn || kp > q_abs) {
-    \\                kp = -1;
-    \\            }
-    \\            sel[b][tid] = kp;
-    \\            const bool any_live = simd_any(kp >= 0);
-    \\            if (lane == 0) {
-    \\                live[b][sg] = any_live ? 1 : 0;
-    \\            }
-    \\        }
-    \\    };
-    \\
-    \\    const int n_tiles = (TOPK + BK - 1) / BK;
-    \\    stage(0, 0);
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (int t = 0; t < n_tiles; ++t) {
-    \\        const int buf = t & 1;
-    \\        const int tile_keys = min(BK, TOPK - t * BK);
-    \\        // Unused slots sort last in the indexer's top-k rows: skip tiles
-    \\        // with no live key (uniform across the threadgroup).
-    \\        if ((live[buf][0] | live[buf][1] | live[buf][2] | live[buf][3]) == 0) {
-    \\            threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\            if (t + 1 < n_tiles) {
-    \\                stage(t + 1, buf ^ 1);
-    \\            }
-    \\            threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\            continue;
-    \\        }
-    \\
-    \\        // ---- S = Q K^T for key quarter j4 (16 heads x 32 keys).
-    \\        auto qa = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
-    \\        auto kb = qk_op.template get_right_input_cooperative_tensor<T, T, float>();
-    \\        auto sc = qk_op.template get_destination_cooperative_tensor<
-    \\            metal::remove_addrspace_t<decltype(qa)>, metal::remove_addrspace_t<decltype(kb)>, float>();
-    \\        for (short e = 0; e < 16; ++e) {
-    \\            sc[e] = 0.0f;
-    \\        }
-    \\        if (j4 * 32 < tile_keys) {
-    \\            const device T* kr[2][2];
-    \\            for (short tn = 0; tn < 2; ++tn) {
-    \\                for (short i = 0; i < 2; ++i) {
-    \\                    const int kp = sel[buf][j4 * 32 + tn * 16 + fm + i * 8];
-    \\                    kr[tn][i] = kv + ulong(max(kp, 0)) * D + fn;
-    \\                }
-    \\            }
-    \\            _Pragma("clang loop unroll_count(4)")
-    \\            for (short kk = 0; kk < D; kk += 16) {
-    \\                for (short j = 0; j < 4; ++j) {
-    \\                    qa[j] = qr0[kk + j];
-    \\                    qa[4 + j] = qr1[kk + j];
-    \\                }
-    \\                for (short tn = 0; tn < 2; ++tn) {
-    \\                    for (short i = 0; i < 2; ++i) {
-    \\                        for (short j = 0; j < 4; ++j) {
-    \\                            kb[tn * 8 + i * 4 + j] = kr[tn][i][kk + j];
-    \\                        }
-    \\                    }
-    \\                }
-    \\                qk_op.run(qa, kb, sc);
-    \\            }
-    \\        }
-    \\        bool ok[2][4];
-    \\        for (short tn = 0; tn < 2; ++tn) {
-    \\            for (short j = 0; j < 4; ++j) {
-    \\                ok[tn][j] = sel[buf][j4 * 32 + tn * 16 + fn + j] >= 0;
-    \\            }
-    \\        }
-    \\        // Partial row max of the raw scores over the quarter (scale > 0 and
-    \\        // rounding is monotonic: max(s) * c == max(s * c) bitwise).
-    \\        float pmx[2];
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            float m = -FLT_MAX;
-    \\            for (short tn = 0; tn < 2; ++tn) {
-    \\                for (short j = 0; j < 4; ++j) {
-    \\                    m = ok[tn][j] ? max(m, float(sc[tn * 8 + i * 4 + j])) : m;
-    \\                }
-    \\            }
-    \\            m = max(m, simd_shuffle_xor(m, ushort(1)));
-    \\            m = max(m, simd_shuffle_xor(m, ushort(8)));
-    \\            pmx[i] = m;
-    \\        }
-    \\        if (row_writer) {
-    \\            red_max[hg][j4][fm] = pmx[0];
-    \\            red_max[hg][j4][fm + 8] = pmx[1];
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        if (t + 1 < n_tiles) {
-    \\            stage(t + 1, buf ^ 1);
-    \\        }
-    \\
-    \\        // ---- Tile row max (the same value in the 4 simdgroups of the group).
-    \\        float factor[2];
-    \\        float mnew[2];
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            const int r = fm + i * 8;
-    \\            const float m = max(max(red_max[hg][0][r], red_max[hg][1][r]),
-    \\                                max(red_max[hg][2][r], red_max[hg][3][r]));
-    \\            // no usable key in the tile: keep the running max
-    \\            const float cand = m == -FLT_MAX ? -FLT_MAX : m * scale_log2;
-    \\            mnew[i] = max(m_run[i], cand);
-    \\            factor[i] = fast::exp2(m_run[i] - mnew[i]);
-    \\            m_run[i] = mnew[i];
-    \\        }
-    \\        // ---- P of this quarter, once: exp2, fp16 hi + lo pieces, row sums.
-    \\        float rs[2] = {0.0f, 0.0f};
-    \\        for (short tn = 0; tn < 2; ++tn) {
-    \\            vec<half, 8> h, lo;
-    \\            for (short i = 0; i < 2; ++i) {
-    \\                for (short j = 0; j < 4; ++j) {
-    \\                    const float e = ok[tn][j]
-    \\                        ? fast::exp2(float(sc[tn * 8 + i * 4 + j]) * scale_log2 - mnew[i])
-    \\                        : 0.0f;
-    \\                    const half hi = half(e);
-    \\                    h[i * 4 + j] = hi;
-    \\                    lo[i * 4 + j] = half(e - float(hi));
-    \\                    rs[i] += e;
-    \\                }
-    \\            }
-    \\            const int ks = j4 * 2 + tn;
-    \\            *(threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]) = h;
-    \\            *(threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]) = lo;
-    \\        }
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            rs[i] += simd_shuffle_xor(rs[i], ushort(1));
-    \\            rs[i] += simd_shuffle_xor(rs[i], ushort(8));
-    \\        }
-    \\        if (row_writer) {
-    \\            red_sum[hg][j4][fm] = rs[0];
-    \\            red_sum[hg][j4][fm + 8] = rs[1];
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\
-    \\        // ---- O = O * factor + P V for dim quarter j4 over the whole tile.
-    \\        // (factor == 1 exactly for every row of the simdgroup: O * 1 == O.)
-    \\        if (!simd_all(factor[0] == 1.0f && factor[1] == 1.0f)) {
-    \\            for (short e = 0; e < 16; ++e) {
-    \\                const float f = factor[(e >> 2) & 1];
-    \\                o0[e] *= f;
-    \\                o1[e] *= f;
-    \\                o2[e] *= f;
-    \\                o3[e] *= f;
-    \\            }
-    \\        }
-    \\        for (short i = 0; i < 2; ++i) {
-    \\            const int r = fm + i * 8;
-    \\            const float tsum = ((red_sum[hg][0][r] + red_sum[hg][1][r]) + red_sum[hg][2][r]) + red_sum[hg][3][r];
-    \\            l_run[i] = l_run[i] * factor[i] + tsum;
-    \\        }
-    \\        const int n_ks = (tile_keys + 15) / 16;
-    \\        for (short ks = 0; ks < n_ks; ++ks) {
-    \\            const vec<half, 8> h = *(const threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]);
-    \\            const vec<half, 8> lo = *(const threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]);
-    \\            for (short e = 0; e < 8; ++e) {
-    \\                pa[e] = h[e];
-    \\                pm[e] = lo[e];
-    \\            }
-    \\            const int kp0 = sel[buf][ks * 16 + fm];
-    \\            const int kp1 = sel[buf][ks * 16 + fm + 8];
-    \\            const device T* v0 = kv + ulong(max(kp0, 0)) * D + j4 * 128 + fn;
-    \\            const device T* v1 = kv + ulong(max(kp1, 0)) * D + j4 * 128 + fn;
-    \\            for (short np = 0; np < 4; ++np) {
-    \\                for (short tn = 0; tn < 2; ++tn) {
-    \\                    for (short j = 0; j < 4; ++j) {
-    \\                        pb[tn * 8 + j] = v0[np * 32 + tn * 16 + j];
-    \\                        pb[tn * 8 + 4 + j] = v1[np * 32 + tn * 16 + j];
-    \\                    }
-    \\                }
-    \\                if (np == 0) {
-    \\                    pv_op.run(pa, pb, o0);
-    \\                    pv_op.run(pm, pb, o0);
-    \\                } else if (np == 1) {
-    \\                    pv_op.run(pa, pb, o1);
-    \\                    pv_op.run(pm, pb, o1);
-    \\                } else if (np == 2) {
-    \\                    pv_op.run(pa, pb, o2);
-    \\                    pv_op.run(pm, pb, o2);
-    \\                } else {
-    \\                    pv_op.run(pa, pb, o3);
-    \\                    pv_op.run(pm, pb, o3);
-    \\                }
-    \\            }
-    \\        }
-    \\    }
-    \\
-    \\    for (short i = 0; i < 2; ++i) {
-    \\        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + j4 * 128 + fn;
-    \\        const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
-    \\        for (short tn = 0; tn < 2; ++tn) {
-    \\            for (short j = 0; j < 4; ++j) {
-    \\                const short e = tn * 8 + i * 4 + j;
-    \\                orow[tn * 16 + j] = T(o0[e] / denom);
-    \\                orow[32 + tn * 16 + j] = T(o1[e] / denom);
-    \\                orow[64 + tn * 16 + j] = T(o2[e] / denom);
-    \\                orow[96 + tn * 16 + j] = T(o3[e] / denom);
-    \\            }
-    \\        }
-    \\    }
-;
-
-var sparse_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var sparse_nax_engaged = false;
-
-/// `sparseLatentAttention` on the tensor units, for queries at the LAST rows of `latent`:
-/// `q_abs` [1, H, L, 512], `latent` [1, 1, K, 512], `idx` int32 [1, L, W]. An unused slot
-/// is -1 and unused pools sort last, so whole tiles skip. Null off NAX and outside the shape.
+/// `sparseLatentAttention` on the tensor units (`dsa_nax.sparseLatent`) where the device has NAX.
 pub fn sparseLatentNax(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("transformer.zig").verifyQmmNaxAvailable()) return null;
-    const qs = mlx.getShape(q_abs);
-    const ls = mlx.getShape(latent);
-    const is = mlx.getShape(idx);
-    if (qs.len != 4 or ls.len != 4 or is.len != 3) return null;
-    if (qs[0] != 1 or ls[0] != 1 or ls[1] != 1 or is[0] != 1) return null;
-    if (qs[3] != 512 or ls[3] != 512 or @rem(qs[1], 32) != 0) return null;
-    const dt = mlx.mlx_array_dtype(q_abs);
-    if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(latent) != dt or mlx.mlx_array_dtype(idx) != .int32) return null;
-    const h = qs[1];
-    const l = qs[2];
-    const k = ls[2];
-    const w = is[2];
-    if (l < 1 or k < l or is[1] != l or w < 1) return null;
-    const kern = sparse_nax_kernel orelse blk: {
-        const ins = [_][*:0]const u8{ "q", "kv", "idx", "params", "scale" };
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
-        if (kn.ctx == null) return error.MetalKernelCompileFailed;
-        sparse_nax_kernel = kn;
-        break :blk kn;
-    };
-    var q3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q3);
-    try mlx.check(mlx.mlx_reshape(&q3, q_abs, &[_]c_int{ h, l, 512 }, 3, s));
-    var kv2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(kv2);
-    try mlx.check(mlx.mlx_reshape(&kv2, latent, &[_]c_int{ k, 512 }, 2, s));
-    var idx2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(idx2);
-    try mlx.check(mlx.mlx_reshape(&idx2, idx, &[_]c_int{ l, w }, 2, s));
-    const pdata = [4]i32{ l, k, w, k - l };
-    const params = mlx.mlx_array_new_data(&pdata, &[_]c_int{4}, 1, .int32);
-    defer _ = mlx.mlx_array_free(params);
-    const sv = [1]f32{scale};
-    const scale_a = mlx.mlx_array_new_data(&sv, &[_]c_int{1}, 1, .float32);
-    defer _ = mlx.mlx_array_free(scale_a);
-
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ h, l, 512 }, 3, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * 256, @divExact(h, 32), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    const inputs = [_]mlx.mlx_array{ q3, kv2, idx2, params, scale_a };
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
-    var o3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o3);
-    try mlx.check(mlx.mlx_vector_array_get(&o3, ov, 0));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, o3, &[_]c_int{ 1, h, l, 512 }, 4, s));
-    if (!sparse_nax_engaged) {
-        sparse_nax_engaged = true;
-        @import("log.zig").info("[dsa] NAX sparse latent attention engaged\n", .{});
-    }
-    return out;
+    if (!@import("transformer.zig").verifyQmmNaxAvailable()) return null;
+    return dsa.sparseLatent(s, q_abs, latent, idx, scale);
 }
 
 // ── MoE decode ─────────────────────────────────────────────────────────
@@ -2352,10 +1952,11 @@ test "glm5 mHC mixes and expand kernels match the op chain" {
         const fn_rows = mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ MIX, HC * d }, 2, .float32);
         defer _ = mlx.mlx_array_free(fn_rows);
 
-        // mixes vs rms_norm(stream) @ fn^T in f64 (MLX's f32 matmul rounds on the tensor units).
+        // mixes vs rms_norm(stream) @ fn^T in f64 (MLX's f32 matmul rounds on the tensor units;
+        // off Metal the op chain's matmul rounds through TF32, past this bar).
         const got = try mixes(s, stream, fn_rows, 1e-5);
         defer _ = mlx.mlx_array_free(got);
-        {
+        if (mlx.streamIsGpu(s)) {
             const a = try readF32(got, s, alloc);
             defer alloc.free(a);
             const ssv = try readF32(stream, s, alloc);
@@ -2396,6 +1997,115 @@ test "glm5 mHC mixes and expand kernels match the op chain" {
             try testing.expectApproxEqAbs(acc, of[(r * 4 + i) * D + k], 0.02 + 0.004 * @abs(acc));
         };
     }
+}
+
+test "glm5 op-chain collapse and selection expand follow the kernels' arithmetic" {
+    // Bar: collapseOps matches an f64 transcription of COLLAPSE_SOURCE (1e-5), expandSelectionOps
+    // matches EXPAND_SEL_SOURCE exactly; both run on any backend.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const rows = 5;
+    const d = 64;
+    var sv: [rows * HC * d]f32 = undefined;
+    for (&sv) |*x| x.* = rand.floatNorm(f32);
+    var mv: [rows * MIX]f32 = undefined;
+    for (&mv) |*x| x.* = 2.0 * rand.floatNorm(f32);
+    var bv: [MIX]f32 = undefined;
+    for (&bv) |*x| x.* = 0.5 * rand.floatNorm(f32);
+    const scv = [3]f32{ 0.7, 1.3, 0.9 };
+    const eps: f64 = 1e-6;
+    const stream = mlx.mlx_array_new_data(&sv, &[_]c_int{ 1, rows, HC, d }, 4, .float32);
+    defer _ = mlx.mlx_array_free(stream);
+    const m = mlx.mlx_array_new_data(&mv, &[_]c_int{ 1, rows, MIX }, 3, .float32);
+    defer _ = mlx.mlx_array_free(m);
+    const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const base = mlx.mlx_array_new_data(&bv, &[_]c_int{MIX}, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    var c = try collapseOps(s, stream, m, scale, base, 20, @floatCast(eps));
+    defer c.deinit();
+    const gx = try readF32(c.x, s, alloc);
+    defer alloc.free(gx);
+    const gp = try readF32(c.post, s, alloc);
+    defer alloc.free(gp);
+    const gc = try readF32(c.comb, s, alloc);
+    defer alloc.free(gc);
+    const sig = struct {
+        fn f(z: f64) f64 {
+            return 1.0 / (1.0 + @exp(-z));
+        }
+    }.f;
+    for (0..rows) |r| {
+        const mr = mv[r * MIX ..][0..MIX];
+        var pre: [4]f64 = undefined;
+        var cm: [4][4]f64 = undefined;
+        for (0..4) |i| {
+            pre[i] = sig(mr[i] * scv[0] + bv[i]) + eps;
+            try testing.expectApproxEqAbs(2.0 * sig(mr[4 + i] * scv[1] + bv[4 + i]), gp[r * 4 + i], 1e-5);
+            var mx: f64 = -std.math.inf(f64);
+            for (0..4) |j| {
+                cm[i][j] = mr[8 + 4 * i + j] * scv[2] + bv[8 + 4 * i + j];
+                mx = @max(mx, cm[i][j]);
+            }
+            var sum: f64 = 0;
+            for (0..4) |j| {
+                cm[i][j] = @exp(cm[i][j] - mx);
+                sum += cm[i][j];
+            }
+            for (0..4) |j| cm[i][j] = cm[i][j] / (sum + eps) + eps;
+        }
+        for (0..20) |it| {
+            if (it > 0) for (0..4) |i| {
+                var sum: f64 = 0;
+                for (0..4) |j| sum += cm[i][j];
+                for (0..4) |j| cm[i][j] /= sum + eps;
+            };
+            for (0..4) |j| {
+                var sum: f64 = 0;
+                for (0..4) |i| sum += cm[i][j];
+                for (0..4) |i| cm[i][j] /= sum + eps;
+            }
+        }
+        for (0..4) |i| for (0..4) |j| try testing.expectApproxEqAbs(cm[i][j], gc[r * 16 + i * 4 + j], 1e-5);
+        for (0..d) |k| {
+            var acc: f64 = 0;
+            for (0..4) |i| acc += pre[i] * sv[(r * 4 + i) * d + k];
+            try testing.expectApproxEqAbs(acc, gx[r * d + k], 1e-5);
+        }
+    }
+
+    // Selection expand: pools past `p` or not yet complete at the query's position read -1.
+    const ix: Indexer = .{ .topk = 16, .kpool = 4, .heads = 1, .head_dim = 1 };
+    const sel_k = 3;
+    const q_start = 9;
+    const p = 4;
+    const selv = [rows * sel_k]i32{ 0, 1, 2, 3, 4, 1, 2, 0, 5, 1, 3, 2, 4, 0, 1 };
+    const sel = mlx.mlx_array_new_data(&selv, &[_]c_int{ 1, rows, sel_k }, 3, .int32);
+    defer _ = mlx.mlx_array_free(sel);
+    const got = try expandSelectionOps(s, sel, q_start, p, ix);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const out_w: usize = @intCast(ix.topk + ix.kpool - 1);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 1, rows, @intCast(out_w) }, mlx.getShape(got));
+    const gv = (mlx.mlx_array_data_int32(got) orelse return error.MlxArrayDataNull)[0 .. rows * out_w];
+    for (0..rows) |r| for (0..out_w) |col| {
+        const qp: i32 = q_start + @as(i32, @intCast(r));
+        var v: i32 = -1;
+        if (col < sel_k * 4) {
+            const sp = selv[r * sel_k + col / 4];
+            if (sp < p and (sp + 1) * 4 - 1 <= qp) v = sp * 4 + @as(i32, @intCast(col % 4));
+        } else if (col >= ix.topk) {
+            const t: i32 = @intCast(col - @as(usize, @intCast(ix.topk)));
+            const tail = @mod(qp + 1, 4);
+            if (t < tail) v = qp + 1 - tail + t;
+        }
+        try testing.expectEqual(v, gv[r * out_w + col]);
+    };
 }
 
 test "glm5 NAX indexer scores equal relu(q . k) * w summed over heads, causally masked" {
@@ -2458,9 +2168,11 @@ test "glm5 NAX indexer scores equal relu(q . k) * w summed over heads, causally 
 
 test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(21);
     const rand = prng.random();
@@ -2562,9 +2274,11 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
 
 test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verify window" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(33);
     const rand = prng.random();
@@ -2686,6 +2400,7 @@ test "glm5 one-query indexer scores match the NAX scorer over the pooled keys" {
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(17);
     const rand = prng.random();
@@ -2744,6 +2459,7 @@ test "glm5 one-query top-k expands the chronological top pools, ties to the lowe
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(23);
     const rand = prng.random();
@@ -2803,6 +2519,7 @@ test "glm5 one-token per-head qmv matches MLX's batched quantized matmul" {
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(31);
     const rand = prng.random();
@@ -2949,9 +2666,11 @@ test "glm5 a pool's completing row carries its pooled key, across a chunk bounda
 
 test "glm5 a deferred expand over R rows rebuilds the materialized stream and feeds the next hcPre, bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(77);
     const rand = prng.random();
@@ -3014,5 +2733,21 @@ test "glm5 a deferred expand over R rows rebuilds the materialized stream and fe
             if (!std.mem.eql(f32, a, b)) std.debug.print("{d} rows: output {d} differs\n", .{ rows, i });
             try testing.expectEqualSlices(f32, b, a);
         }
+    }
+}
+
+test "hcRowsServes: a width the kernel's pairs cannot split stays on the composed path" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const zeros: [16]u16 = @splat(0);
+    const fz: [MIX * HC * 16]f32 = @splat(0);
+    inline for (.{ .{ 16, true }, .{ 12, false } }) |c| {
+        const d: c_int = c[0];
+        const nw = mlx.mlx_array_new_data(&zeros, &[_]c_int{d}, 1, .float16);
+        defer _ = mlx.mlx_array_free(nw);
+        const fn_rows = mlx.mlx_array_new_data(&fz, &[_]c_int{ MIX, HC * d }, 2, .float32);
+        defer _ = mlx.mlx_array_free(fn_rows);
+        // Each threadgroup's slice (d/4) must be even: the h stores go in bf16/f16 pairs.
+        try testing.expectEqual(c[1], hcRowsServes(s, &.{ 1, 1, HC, d }, .float16, fn_rows, nw));
     }
 }

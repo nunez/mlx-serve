@@ -598,6 +598,22 @@ struct ModelInfo {
         return nil
     }
 
+    /// The engine serving it, for the tray's badge.
+    var engineBadge: String {
+        switch engineName {
+        case "ane": return "ANE"
+        case "sushi": return "Sushi"
+        case "mlx-stream": return "Stream"
+        default: break
+        }
+        switch engine {
+        case .mlx: return "MLX"
+        case .llama: return "GGUF"
+        case .dsv4: return "DS4"
+        case .mlxGguf: return "MLX GGUF"
+        }
+    }
+
     /// "KV4" / "KV8" while this model stores a quantized KV cache.
     var kvBadge: String? {
         kvQuant == "4" || kvQuant == "8" ? "KV\(kvQuant)" : nil
@@ -667,16 +683,6 @@ enum ServerEngine: String, CaseIterable {
     case dsv4
     /// A `.gguf` served on the MLX path by lib/mlx-serve-gguf (`--mlx-gguf`).
     case mlxGguf
-
-    /// Short human label for the running-model badge / section headings.
-    var label: String {
-        switch self {
-        case .mlx:     return "MLX"
-        case .llama:   return "llama.cpp (GGUF)"
-        case .dsv4:    return "ds4 (DSV4-Flash)"
-        case .mlxGguf: return "mlx-serve-gguf (GGUF on MLX)"
-        }
-    }
 
     /// The MLX forward, whatever the weights' container: MLX-only knobs
     /// (spec decode, kv-quant, prefix cache) apply here.
@@ -1051,6 +1057,9 @@ struct LocalModel: Identifiable, Hashable {
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
 
+    /// The files' size on disk, which `sizeFormatted` prints.
+    var sizeBytes: Int64 = 0
+
     /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
     /// A defective row is listed so you can see and remove it, and is excluded
     /// from every picker.
@@ -1249,16 +1258,13 @@ struct GemmaModelOption: Identifiable {
     /// downloader resolves a single `.gguf` artifact and the server loads it
     /// through the embedded ds4 engine instead of the MLX/safetensors path.
     let ggufFilename: String?
-    /// Minimum host RAM (bytes) before this entry is surfaced in the UI. 0 = no gate.
-    let minHostRamBytes: UInt64
 
-    init(id: String, displayName: String, repoId: String, sizeEstimate: String, ggufFilename: String? = nil, minHostRamBytes: UInt64 = 0) {
+    init(id: String, displayName: String, repoId: String, sizeEstimate: String, ggufFilename: String? = nil) {
         self.id = id
         self.displayName = displayName
         self.repoId = repoId
         self.sizeEstimate = sizeEstimate
         self.ggufFilename = ggufFilename
-        self.minHostRamBytes = minHostRamBytes
     }
 }
 
@@ -1287,46 +1293,13 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // speculative decode (26 -> 75 tok/s on code, M4 Max). Supersedes the
     // Qwen 3.6 27B MTP entry: same geometry, newer weights, images too.
     GemmaModelOption(id: "qwen38-27b-4bit", displayName: "Qwen 3.8 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit", sizeEstimate: "~18.2 GB, needs 24 GB+ RAM"),
-    // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
-    GemmaModelOption(
-        id: "dsv4-flash-mlx",
-        displayName: "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
-        sizeEstimate: "~130 GB, needs 128 GB RAM",
-        minHostRamBytes: 128 * (UInt64(1) << 30)
-    ),
-    // DeepSeek-V4.1-Flash (deepseek_v41) on mlx-stream: the trunk loads once, the EXL3
-    // experts stream from SSD and the Engram tables (~200 GB) stay on disk.
-    GemmaModelOption(
-        id: "deepseek-v41-flash-exl3",
-        displayName: "DeepSeek-V4.1-Flash (streaming repack, EXL3 3.0 bpw)",
-        repoId: "OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw",
-        sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
-        minHostRamBytes: 128 * (UInt64(1) << 30)
-    ),
-    // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
-    GemmaModelOption(
-        id: "hy3-oq2e",
-        displayName: "Hunyuan 3 295B-A21B (2-bit)",
-        repoId: "mlx-community/Hy3-oQ2e",
-        sizeEstimate: "~84 GB, needs 128 GB RAM",
-        minHostRamBytes: 128 * (UInt64(1) << 30)
-    ),
 ]
 
 /// Subset of `gemmaModelOptions` surfaced in the menu-bar Download Models
 /// popover. 4-bit quants are the default tray choice — they fit the widest
 /// range of Macs (the 4-bit 31B is ~18 GB vs 33 GB at 8-bit) so most users
 /// can install something useful without bouncing into the full Model Browser.
-/// DSV4 has only the one GGUF, so it rides along unconditionally.
 /// Excludes Gemma 3/4 12B and E2B since they're available in the model browser.
 let gemmaModelOptionsTrayMenu = gemmaModelOptions.filter {
-    !$0.id.contains("12b") && !$0.id.contains("e2b") && ($0.id.contains("4bit") || $0.id.contains("dsv4"))
-}
-
-/// Subset of `gemmaModelOptions` visible on the current host. Hides entries
-/// whose `minHostRamBytes` exceeds the system RAM.
-var availableGemmaModelOptions: [GemmaModelOption] {
-    let ram = ProcessInfo.processInfo.physicalMemory
-    return gemmaModelOptions.filter { $0.minHostRamBytes <= ram }
+    !$0.id.contains("12b") && !$0.id.contains("e2b") && $0.id.contains("4bit")
 }

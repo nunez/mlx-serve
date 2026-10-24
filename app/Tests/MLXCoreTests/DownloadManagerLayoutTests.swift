@@ -163,12 +163,23 @@ final class DownloadManagerLayoutTests: XCTestCase {
                                "engram/engram-L1.bin", "engram/engram-residents.safetensors"])
     }
 
+    /// NVIDIA ModelOpt packs keep their shards in `tensors/`; same rule as `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesModelOptTensorsFolder() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 4_000],
+            ["path": "model.safetensors.index.json", "type": "file", "size": 47_000_000],
+            ["path": "tensors/model-00001-of-00021.safetensors", "type": "file", "size": 5_000_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertEqual(paths, ["config.json", "model.safetensors.index.json", "tensors/model-00001-of-00021.safetensors"])
+    }
+
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
     /// of mlx-serve's `mtp/` layout) alongside `optiq/optiq_vision.safetensors`.
     /// The head must be pulled (server auto-loads it, delta-norms folded at load)
     /// but the relocated vision tower must NOT (the server can't use it and it's
     /// GBs). Mirrors mtp.sidecar_rel_paths.
-    func testSelectNeededFilesIncludesOptiQMtpHeadSkipsOptiQVision() {
+    func testSelectNeededFilesIncludesOptiQMtpHeadSkipsUnindexedOptiQVision() {
         let entries: [[String: Any]] = [
             ["path": "config.json", "type": "file", "size": 108_000],
             ["path": "model-00001-of-00004.safetensors", "type": "file", "size": 5_300_000_000],
@@ -184,8 +195,46 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertTrue(paths.contains("config.json"))
         XCTAssertTrue(paths.contains("model-00001-of-00004.safetensors"))
         XCTAssertFalse(paths.contains("optiq/optiq_vision.safetensors"),
-                       "relocated vision tower is unusable by the server — must not be pulled")
+                       "with no index naming it, the relocated vision tower is not pulled")
         XCTAssertEqual(picked.first { $0.0 == "optiq/mtp.safetensors" }?.1, 314_000_000)
+    }
+
+    /// The shard index is the checkpoint's own parts list, and `weightDefect` flags
+    /// "Missing shards" for any file it names that is absent. So whatever the index
+    /// names is part of the pack, nested or not (humanizer-12b-OptiQ-4bit keeps its
+    /// vision patch embedder in `optiq/`); a nested copy it does not name stays out.
+    func testSelectNeededFilesPullsEveryShardTheIndexNames() throws {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 72_000],
+            ["path": "model-00001-of-00002.safetensors", "type": "file", "size": 5_349_856_755],
+            ["path": "model-00002-of-00002.safetensors", "type": "file", "size": 3_510_027_171],
+            ["path": "model.safetensors.index.json", "type": "file", "size": 129_478],
+            ["path": "tokenizer.json", "type": "file", "size": 32_170_070],
+            ["path": "optiq/metadata.json", "type": "file", "size": 34_174],
+            ["path": "optiq/optiq_vision.safetensors", "type": "file", "size": 104_761_004],
+            ["path": "original/model.safetensors", "type": "file", "size": 50_000_000_000],
+        ]
+        let index = Data(#"""
+        {"metadata": {}, "weight_map": {
+            "language_model.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "language_model.model.norm.weight": "model-00002-of-00002.safetensors",
+            "vision_embedder.patch_dense.weight": "optiq/optiq_vision.safetensors",
+            "vision_embedder.pos_embedding": "optiq/optiq_vision.safetensors"}}
+        """#.utf8)
+        let indexed = try XCTUnwrap(DownloadManager.indexedShardNames(fromIndexData: index))
+        XCTAssertEqual(indexed, ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+                                 "optiq/optiq_vision.safetensors"])
+
+        let picked = Set(DownloadManager.selectNeededFiles(from: entries, indexedShards: indexed).map(\.0))
+        XCTAssertTrue(indexed.isSubset(of: picked), "a pack the index calls complete must download complete")
+        XCTAssertFalse(picked.contains("original/model.safetensors"), "a nested copy no index names stays out")
+        XCTAssertFalse(picked.contains("optiq/metadata.json"), "only files the index names ride past the depth gate")
+    }
+
+    func testIndexedShardNamesRejectsWhatIsNotAnIndex() {
+        XCTAssertNil(DownloadManager.indexedShardNames(fromIndexData: Data("not json".utf8)))
+        XCTAssertNil(DownloadManager.indexedShardNames(fromIndexData: Data(#"{"weight_map": {}}"#.utf8)))
+        XCTAssertNil(DownloadManager.indexedShardNames(fromIndexData: Data(#"{"metadata": {}}"#.utf8)))
     }
 
     // MARK: - Drafter discovery
@@ -318,9 +367,26 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
-    func testLfm2MoeAndKolibriAreChatPickable() {
-        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1"; the server serves both.
-        for mt in ["lfm2_moe", "kolibri1"] {
+    func testNemotronVariantsAreSupportedAndChatPickable() {
+        for mt in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/models/\(mt)",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(model.isSupportedArchitecture, "\(mt) must be recognized locally")
+            XCTAssertTrue(model.isChatPickable, "\(mt) must be available to chat pickers")
+        }
+        let unknown = LocalModel(
+            id: "test:unknown", name: "unknown", path: "/models/unknown",
+            sizeFormatted: "1 GB", modelType: "nemotron_unknown", source: .custom, kind: .base
+        )
+        XCTAssertFalse(unknown.isSupportedArchitecture)
+        XCTAssertFalse(unknown.isChatPickable)
+    }
+
+    func testLfm2MoeKolibriAndFlintAreChatPickable() {
+        // LFM2.5-8B-A1B / 24B-A2B ship "lfm2_moe", Kolibri-1 "kolibri1", Recursive Flint "flint"; the server serves all three.
+        for mt in ["lfm2_moe", "kolibri1", "flint"] {
             let m = LocalModel(
                 id: "test:\(mt)", name: mt, path: "/tmp/\(mt)",
                 sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base

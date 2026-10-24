@@ -23,6 +23,8 @@
 //!     the Swift Settings pane carries the disclosure.
 
 const std = @import("std");
+const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const log = @import("log.zig");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";
@@ -146,10 +148,13 @@ pub fn sanitizeName(buf: []u8, raw: []const u8) []const u8 {
 /// Rebuild `body` with the model value replaced by `bare_id`. `model_value`
 /// MUST be the slice `server.parseModelFromBody` returned — i.e. alias `body`
 /// — so the decide and rewrite layers can never disagree on which bytes are
-/// the model field.
+/// the model field. Anything else (a canonicalised copy) is refused: its
+/// offset would be read off an unrelated pointer.
 pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value: []const u8, bare_id: []const u8) ![]u8 {
-    const start = @intFromPtr(model_value.ptr) - @intFromPtr(body.ptr);
-    std.debug.assert(start + model_value.len <= body.len);
+    const at = @intFromPtr(model_value.ptr);
+    const base = @intFromPtr(body.ptr);
+    if (at < base or at - base + model_value.len > body.len) return error.ModelNotInBody;
+    const start = at - base;
     const out = try alloc.alloc(u8, body.len - model_value.len + bare_id.len);
     @memcpy(out[0..start], body[0..start]);
     @memcpy(out[start..][0..bare_id.len], bare_id);
@@ -157,18 +162,18 @@ pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value
     return out;
 }
 
-/// Collapse JSON's optional `\/` escape to `/`. Swift's JSONSerialization
-/// (and PHP's json_encode) escape every slash, so a remote id's org prefix
-/// arrives as `ddalcu\/gemma…` from the app while the peer table stores the
-/// canonical form — the same `\/` class the load-model handler documents.
-/// Returns the input verbatim (zero-copy) when there is nothing to collapse
-/// or the scratch buffer is too small.
+/// Collapse JSON's slash escapes: the optional `\/` to `/` and `\\` to `\`. Swift's
+/// JSONSerialization (and PHP's json_encode) escape every slash, so a remote id's org prefix
+/// arrives as `ddalcu\/gemma…` from the app while the peer table stores the canonical form —
+/// the same `\/` class the load-model handler documents — and a Windows path id arrives as
+/// `C:\\Users…`. Returns the input verbatim (zero-copy) when there is nothing to collapse or
+/// the scratch buffer is too small.
 pub fn unescapeJsonSlashes(buf: []u8, s: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, s, "\\/") == null or s.len > buf.len) return s;
+    if ((std.mem.indexOf(u8, s, "\\/") == null and std.mem.indexOf(u8, s, "\\\\") == null) or s.len > buf.len) return s;
     var n: usize = 0;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
-        if (s[i] == '\\' and i + 1 < s.len and s[i + 1] == '/') continue;
+        if (s[i] == '\\' and i + 1 < s.len and (s[i + 1] == '/' or s[i + 1] == '\\')) i += 1;
         buf[n] = s[i];
         n += 1;
     }
@@ -285,6 +290,71 @@ extern "c" fn DNSServiceRefDeallocate(ref: DNSServiceRef) void;
 
 pub const Remote = struct { ip4: [4]u8, port: u16 };
 
+/// What a peer says about itself in its `/v1/models` "machine" (behind its API key): its OS,
+/// device model id and, when it leads a Thunderbolt pair, that pair's model. Bounded copies.
+pub const PeerMachine = struct {
+    os: Text(16) = .{},
+    model: Text(32) = .{},
+    leads: Text(128) = .{},
+    joined: bool = false,
+    free_mib: u64 = 0,
+    total_mib: u64 = 0,
+
+    fn Text(comptime n: usize) type {
+        return struct {
+            buf: [n]u8 = undefined,
+            len: usize = 0,
+            fn set(self: *@This(), v: ?std.json.Value) void {
+                const str = if (v) |x| (if (x == .string) x.string else "") else "";
+                self.len = @min(str.len, n);
+                @memcpy(self.buf[0..self.len], str[0..self.len]);
+            }
+            fn get(self: *const @This()) []const u8 {
+                return self.buf[0..self.len];
+            }
+        };
+    }
+
+    fn mib(v: ?std.json.Value) u64 {
+        const x = v orelse return 0;
+        return if (x == .integer and x.integer > 0) @intCast(x.integer) else 0;
+    }
+
+    pub fn parse(alloc: std.mem.Allocator, body: []const u8) PeerMachine {
+        var out: PeerMachine = .{};
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return out;
+        defer parsed.deinit();
+        if (parsed.value != .object) return out;
+        const m = parsed.value.object.get("machine") orelse return out;
+        if (m != .object) return out;
+        out.os.set(m.object.get("os"));
+        out.model.set(m.object.get("model"));
+        out.leads.set(m.object.get("leads"));
+        if (m.object.get("joined")) |j| out.joined = j == .bool and j.bool;
+        out.free_mib = mib(m.object.get("free_mib"));
+        out.total_mib = mib(m.object.get("total_mib"));
+        return out;
+    }
+};
+
+fn appendPeerAddress(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), display: []const u8, ip4: [4]u8, port: u16, m: *const PeerMachine) !void {
+    if (buf.items.len > 0) try buf.append(alloc, ',');
+    try buf.print(alloc, "{{\"name\":{f},\"url\":\"http://{d}.{d}.{d}.{d}:{d}\",\"os\":{f},\"model\":{f},\"leads\":{f},\"joined\":{},\"free_mib\":{d},\"total_mib\":{d}}}", .{
+        std.json.fmt(display, .{}),             ip4[0], ip4[1], ip4[2], ip4[3], port,
+        std.json.fmt(m.os.get(), .{}),          std.json.fmt(m.model.get(), .{}),
+        std.json.fmt(m.leads.get(), .{}),       m.joined,
+        m.free_mib,                             m.total_mib,
+    });
+}
+
+/// Whether a refetched peer shows the app the same thing it did.
+fn samePeerView(old: *const Peer, models: []const PeerModel, needs_key: bool, m: *const PeerMachine) bool {
+    if (old.models.len != models.len or old.needs_key != needs_key or old.machine.joined != m.joined) return false;
+    for (old.models, models) |a, b| if (!std.mem.eql(u8, a.id, b.id)) return false;
+    return std.mem.eql(u8, old.machine.leads.get(), m.leads.get()) and
+        std.mem.eql(u8, old.machine.os.get(), m.os.get()) and std.mem.eql(u8, old.machine.model.get(), m.model.get());
+}
+
 const Peer = struct {
     display: []u8, // sanitized instance name — also the hash key
     ip4: [4]u8,
@@ -292,8 +362,9 @@ const Peer = struct {
     models: []PeerModel,
     /// The peer answered 401: it runs with --api-key and we hold no working key.
     needs_key: bool = false,
+    machine: PeerMachine = .{},
 
-    fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
+    pub fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
         freePeerModels(alloc, p.models);
         alloc.free(p.display);
     }
@@ -355,8 +426,11 @@ pub const Lan = struct {
     /// pthread mutex, not `std.Io.Mutex`: lookups run on conn threads and the
     /// browser thread, none of which should block through an Io handle for a
     /// micro critical section (same rationale as log.zig's sink_mutex).
-    mu: std.c.pthread_mutex_t = .{},
+    mu: os_mutex.Mutex = .{},
     peers: std.StringHashMap(Peer),
+    /// Moves whenever a peer comes, goes, or changes its models or machine: the app re-reads
+    /// `/v1/models` when `/props` "registry_generation" (which includes this) moves.
+    changes: std.atomic.Value(u64) = .init(0),
     /// Set by `pokeDiscovery` (conn threads); consumed by the browser loop.
     refresh_asap: std.atomic.Value(bool) = .init(false),
     // Browser-thread only (events + refresh both run there — no lock):
@@ -370,6 +444,7 @@ pub const Lan = struct {
     known: std.StringHashMap(Known),
 
     pub fn start(alloc: std.mem.Allocator, opts: Options) !*Lan {
+        if (comptime @import("builtin").os.tag == .windows) return error.LanUnsupportedOnWindows;
         const l = try alloc.create(Lan);
         errdefer alloc.destroy(l);
         l.* = .{
@@ -453,8 +528,8 @@ pub const Lan = struct {
     /// the wait covers it too.
     pub fn lookupRemote(l: *Lan, id: []const u8) RemoteLookup {
         const rid = splitRemoteId(id) orelse return .peer_unknown;
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         const p = l.peers.getPtr(rid.peer) orelse return .peer_unknown;
         for (p.models) |m|
             if (std.mem.eql(u8, m.id, rid.bare)) return .{ .found = .{ .ip4 = p.ip4, .port = p.port } };
@@ -472,13 +547,21 @@ pub const Lan = struct {
     /// Append the names of peers that refused us for want of a key, as JSON
     /// strings (sanitized names need no escaping).
     pub fn appendPeersNeedingKey(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         var it = l.peers.valueIterator();
         while (it.next()) |p| if (p.needs_key) {
             if (buf.items.len > 0) try buf.append(alloc, ',');
             try buf.print(alloc, "\"{s}\"", .{p.display});
         };
+    }
+
+    /// Every reachable peer as `{"name":…,"url":"http://a.b.c.d:port"}`, comma-separated.
+    pub fn appendPeerAddresses(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        l.mu.lock();
+        defer l.mu.unlock();
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| try appendPeerAddress(alloc, buf, p.display, p.ip4, p.port, &p.machine);
     }
 
     /// Ask the browser thread to re-attempt every known service NOW instead
@@ -492,8 +575,8 @@ pub const Lan = struct {
     /// load-model no-op renders it so app flows work unchanged).
     pub fn remoteEntryFor(l: *Lan, alloc: std.mem.Allocator, id: []const u8) ?[]u8 {
         const rid = splitRemoteId(id) orelse return null;
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         const p = l.peers.getPtr(rid.peer) orelse return null;
         for (p.models) |m|
             if (std.mem.eql(u8, m.id, rid.bare)) return alloc.dupe(u8, m.entry_json) catch null;
@@ -503,8 +586,8 @@ pub const Lan = struct {
     /// Append every discovered remote model's entry JSON to a /v1/models
     /// `data` array under construction (comma-managed by buffer length).
     pub fn appendRemoteEntries(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         var it = l.peers.valueIterator();
         while (it.next()) |p| for (p.models) |m| {
             if (buf.items.len > 0) try buf.append(alloc, ',');
@@ -529,26 +612,30 @@ pub const Lan = struct {
     }
 
     fn removePeer(l: *Lan, display: []const u8) void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         if (l.peers.fetchRemove(display)) |kv| {
             var p = kv.value;
             p.deinit(l.alloc);
+            _ = l.changes.fetchAdd(1, .monotonic);
         }
     }
 
-    fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool) void {
+    pub fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel, needs_key: bool, machine: PeerMachine) void {
         const owned = l.alloc.dupe(u8, display) catch {
             freePeerModels(l.alloc, models);
             return;
         };
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
+        var moved = true;
         if (l.peers.fetchRemove(display)) |kv| {
             var old = kv.value;
+            moved = !samePeerView(&old, models, needs_key, &machine);
             old.deinit(l.alloc);
         }
-        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key };
+        if (moved) _ = l.changes.fetchAdd(1, .monotonic);
+        const p = Peer{ .display = owned, .ip4 = ip4, .port = port, .models = models, .needs_key = needs_key, .machine = machine };
         l.peers.put(p.display, p) catch {
             var tmp = p;
             tmp.deinit(l.alloc);
@@ -595,12 +682,13 @@ pub const Lan = struct {
         const candidates = addr.ordered(&order_buf);
         var ip4: [4]u8 = candidates[0];
         var models: ?[]PeerModel = null;
+        var machine: PeerMachine = .{};
         var reachable = false;
         var needs_key = false;
         const key = l.peerKey(l.alloc, display);
         defer if (key) |k| l.alloc.free(k);
         for (candidates) |cand| {
-            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex, key) catch |err| switch (err) {
+            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex, key, &machine) catch |err| switch (err) {
                 error.PeerUnreachable => {
                     log.debug("[lan] \"{s}\" unreachable at {d}.{d}.{d}.{d}:{d}\n", .{ display, cand[0], cand[1], cand[2], cand[3], res.port });
                     continue;
@@ -627,17 +715,17 @@ pub const Lan = struct {
         }
         if (!reachable) return .failed;
         const fetched = models orelse {
-            l.installPeer(display, ip4, res.port, &.{}, needs_key);
+            l.installPeer(display, ip4, res.port, &.{}, needs_key, .{});
             return .installed;
         };
         const changed = blk: {
-            _ = std.c.pthread_mutex_lock(&l.mu);
-            defer _ = std.c.pthread_mutex_unlock(&l.mu);
+            l.mu.lock();
+            defer l.mu.unlock();
             const p = l.peers.getPtr(display) orelse break :blk true;
             break :blk p.models.len != fetched.len;
         };
         const count = fetched.len;
-        l.installPeer(display, ip4, res.port, fetched, false);
+        l.installPeer(display, ip4, res.port, fetched, false, machine);
         if (changed)
             log.info("[lan] peer \"{s}\" at {d}.{d}.{d}.{d}:{d} shares {d} models\n", .{ display, ip4[0], ip4[1], ip4[2], ip4[3], res.port, count });
         return .installed;
@@ -847,9 +935,7 @@ fn threadMain(l: *Lan) void {
             }
         }
         if (n == 0) {
-            // std.time.sleep was removed in Zig 0.16; this thread has no Io.
-            const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
-            _ = std.c.nanosleep(&ts, null);
+            crt.sleepMs(500); // this thread has no Io
             continue;
         }
         const ready = std.posix.poll(fds[0..n], 1000) catch break;
@@ -935,6 +1021,7 @@ fn fileStamp(path: [*:0]const u8) i64 {
 /// Regular files only, opened non-blocking: a FIFO at the path would park the
 /// browser thread in `open` until a writer came, and discovery with it.
 fn readSmallFile(alloc: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
+    if (comptime @import("builtin").os.tag == .windows) return null; // LAN is off on Windows
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
@@ -973,11 +1060,7 @@ const AuthLine = struct {
 
 /// Monotonic milliseconds without an `Io` handle (this thread has none —
 /// same rationale as log.zig's raw-libc sink).
-fn monoMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
-}
+const monoMs = crt.monotonicMs;
 
 /// One dns_sd ref pumped until its callback flips `done` or the deadline hits.
 fn pumpUntil(ref: DNSServiceRef, done: *const bool, timeout_ms: i64) bool {
@@ -1001,7 +1084,7 @@ const fd_t = std.c.fd_t;
 
 /// Non-blocking connect with a real deadline: a blocking connect to a
 /// powered-off host can hang for the kernel's full SYN-retry budget (~75 s).
-fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
+pub fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) !fd_t {
     const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.PeerUnreachable;
     errdefer _ = std.c.close(fd);
@@ -1075,7 +1158,7 @@ pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
 /// it — resolves back to this very server, and the loopback-first fetch
 /// would happily install our own models as a "peer" (live test_lan_share
 /// self-mirror after the peer-restart section, 2026-07-21).
-fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8) ![]PeerModel {
+fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8, machine: ?*PeerMachine) ![]PeerModel {
     const fd = try connectTimeout(ip4, port, 3000);
     defer _ = std.c.close(fd);
     const tv = std.c.timeval{ .sec = 5, .usec = 0 };
@@ -1099,6 +1182,7 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
     if (headerValueCI(raw[0..header_end], "x-mlx-lan-token")) |tok| {
         if (std.mem.eql(u8, tok, own_token)) return error.SelfFetch;
     }
+    if (machine) |m| m.* = PeerMachine.parse(alloc, raw[header_end + 4 ..]);
     return parsePeerModels(alloc, raw[header_end + 4 ..], peer_display);
 }
 
@@ -1111,6 +1195,7 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
 /// stream — the client sees a closed socket, the peer sees a disconnect and
 /// cancels its slot.
 pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []const u8, key: ?[]const u8, conn: anytype) error{PeerUnreachable}!void {
+    if (comptime @import("builtin").os.tag == .windows) return error.PeerUnreachable; // LAN is off on Windows
     const fd = connectTimeout(remote.ip4, remote.port, 3000) catch return error.PeerUnreachable;
     defer _ = std.c.close(fd);
     var head_buf: [2048]u8 = undefined;
@@ -1265,6 +1350,24 @@ test "lan: sanitizeName collapses hostile chars and never returns empty" {
     try t.expectEqualStrings("plain-name_1.local", sanitizeName(&buf, "plain-name_1.local"));
 }
 
+test "lan: rewriteModelValue refuses a model value that is not a slice of the body" {
+    const a = t.allocator;
+    const body = "{\"model\":\"org\\/m@Studio\",\"messages\":[]}";
+    const raw = body[10 .. 10 + "org\\/m@Studio".len];
+    var canon_buf: [64]u8 = undefined;
+    const canon = unescapeJsonSlashes(&canon_buf, raw);
+    try t.expectError(error.ModelNotInBody, rewriteModelValue(a, body, canon, "org/m"));
+    const out = try rewriteModelValue(a, body, raw, "org/m");
+    defer a.free(out);
+    try t.expectEqualStrings("{\"model\":\"org/m\",\"messages\":[]}", out);
+}
+
+test "lan: rewriteModelValue refuses an unescaped Windows path id" {
+    const body = "{\"model\":\"C:\\\\m@local\"}";
+    const canonical = "C:\\m@local"; // an unescaped copy, as handleConnection used to pass
+    try t.expectError(error.ModelNotInBody, rewriteModelValue(t.allocator, body, canonical, "C:\\m"));
+}
+
 test "lan: rewriteModelValue splices the aliased model value in place" {
     const a = t.allocator;
     const body = "{\"model\":\"qwen3.6-27b@Studio\",\"messages\":[{\"role\":\"user\",\"content\":\"hi @Studio\"}]}";
@@ -1330,8 +1433,10 @@ test "lan: JSON-escaped slashes canonicalize (Swift clients send org\\/name)" {
     // No escapes → the INPUT slice comes back verbatim (zero-copy).
     const plain = "ddalcu/gemma-e2b@Mini";
     try t.expect(unescapeJsonSlashes(&buf, plain).ptr == plain.ptr);
-    // Only the two-byte sequence `\/` collapses; other backslashes survive.
+    // Only the escapes `\/` and `\\` collapse; other backslashes survive.
     try t.expectEqualStrings("a\\b/c", unescapeJsonSlashes(&buf, "a\\b\\/c"));
+    // A Windows path id arrives with its backslashes escaped.
+    try t.expectEqualStrings("C:\\Users\\m", unescapeJsonSlashes(&buf, "C:\\\\Users\\\\m"));
     // Oversized input degrades to verbatim rather than truncating.
     var tiny: [4]u8 = undefined;
     try t.expectEqualStrings("x\\/y", unescapeJsonSlashes(tiny[0..2], "x\\/y"));
@@ -1354,7 +1459,7 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     const models = try a.alloc(PeerModel, 1);
     models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
-    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models, false);
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models, false, .{});
     try t.expect(l.lookupRemote("gemma@studio") == .found);
     // The peer answered recently and does NOT offer this model — definitive,
     // fail fast (probes/typos must not burn the wait).
@@ -1362,7 +1467,7 @@ test "lan: lookupRemote distinguishes found / unlisted / unknown" {
 
     // A mid-boot empty install (peer reachable, models not served yet)
     // counts as unknown so the wait covers it too.
-    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{}, false);
+    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{}, false, .{});
     try t.expect(l.lookupRemote("anything@booting") == .peer_unknown);
 }
 
@@ -1413,8 +1518,8 @@ test "lan: a peer that answered 401 is listed as needing a key" {
         l.peers.deinit();
         l.known.deinit();
     }
-    l.installPeer("open", .{ 127, 0, 0, 1 }, 1, &.{}, false);
-    l.installPeer("locked", .{ 127, 0, 0, 1 }, 2, &.{}, true);
+    l.installPeer("open", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    l.installPeer("locked", .{ 127, 0, 0, 1 }, 2, &.{}, true, .{});
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try l.appendPeersNeedingKey(a, &buf);
@@ -1543,9 +1648,49 @@ test "lan: discovery sends the peer's key, and a keyed peer's 401 reads as Unaut
     const th = try std.Thread.spawn(.{}, KeyedPeer.run, .{lst});
     defer th.join();
 
-    try t.expectError(error.Unauthorized, fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", null));
-    const models = try fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", "s3cret");
+    try t.expectError(error.Unauthorized, fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", null, null));
+    const models = try fetchPeerModels(a, .{ 127, 0, 0, 1 }, port, "Studio", "own-token", "s3cret", null);
     defer freePeerModels(a, models);
     try t.expectEqual(@as(usize, 1), models.len);
     try t.expectEqualStrings("gemma", models[0].id);
+}
+
+test "a peer that starts leading a pair moves the change count; a plain refetch does not" {
+    const a = std.testing.allocator;
+    var l = Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    const first = l.changes.load(.monotonic);
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, .{});
+    try std.testing.expectEqual(first, l.changes.load(.monotonic));
+    l.installPeer("M4Max", .{ 127, 0, 0, 1 }, 1, &.{}, false, PeerMachine.parse(a,
+        \\{"machine":{"os":"macos","leads":"Flash","joined":false}}
+    ));
+    try std.testing.expect(l.changes.load(.monotonic) > first);
+}
+
+test "a peer's machine rides from its /v1/models into the app's peer list" {
+    const a = std.testing.allocator;
+    const m = PeerMachine.parse(a,
+        \\{"object":"list","data":[],"machine":{"os":"macos","model":"Mac16,5","leads":"MiniMax-H3","joined":false,"free_mib":98205,"total_mib":131072}}
+    );
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try appendPeerAddress(a, &buf, "M4Max", .{ 192, 168, 137, 3 }, 11234, &m);
+    try appendPeerAddress(a, &buf, "5060-linux", .{ 192, 168, 2, 76 }, 11400, &PeerMachine.parse(a, "{\"data\":[]}"));
+    const j = try std.fmt.allocPrint(a, "[{s}]", .{buf.items});
+    defer a.free(j);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, j, .{});
+    defer parsed.deinit();
+    const first = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("http://192.168.137.3:11234", first.get("url").?.string);
+    try std.testing.expectEqualStrings("Mac16,5", first.get("model").?.string);
+    try std.testing.expectEqualStrings("MiniMax-H3", first.get("leads").?.string);
+    try std.testing.expectEqual(@as(i64, 98205), first.get("free_mib").?.integer);
+    try std.testing.expectEqualStrings("", parsed.value.array.items[1].object.get("os").?.string);
 }

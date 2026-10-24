@@ -1,5 +1,6 @@
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
+const crt = @import("crt.zig");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
@@ -11,6 +12,13 @@ const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
+/// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
+pub const sushi_exl3 = @import("sushi_exl3");
+pub const dsa_nax = @import("dsa_nax.zig");
+comptime {
+    // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
+    @import("plugin_host_check.zig").reexports(@This());
+}
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -20,12 +28,25 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const ane_lm = @import("arch/ane_lm.zig");
+const status = @import("status.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_arch = if (build_options.ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
+
+// codesign names an executable after its embedded Info.plist; without one it makes up a new name for
+// every build, and the Neural Engine keeps compiled programs per signing name: each app update
+// recompiled every model on it.
+const info_plist = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" ++
+    "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>com.dalcu.mlx-core.mlx-serve</string>" ++
+    "<key>CFBundleName</key><string>mlx-serve</string></dict></plist>\n").*;
+comptime {
+    if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
+}
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -35,24 +56,25 @@ const ane_mod = @import("ane.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
+/// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
+pub const plugin_profile: bool = build_options.plugin_profile;
 
 // ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine links on macOS and Linux builds (embedded_engines);
+// The embedded llama.cpp engine links on macOS, Linux and Windows builds (llama_engine);
 // elsewhere the stub engine replaces it, so the libllama symbols above are
 // not referenced and `--version` reports these placeholders instead.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.embedded_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_options.llama_engine) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.embedded_engines) return "";
+    if (comptime !build_options.llama_engine) return "";
     return std.mem.span(ggml_commit());
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -79,6 +101,10 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--ane`: serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine; `--ane-slots`: requests each such
+// model runs at once. File-level for the same reason.
+var ane_serve: bool = false;
+var ane_slots: u32 = 1;
 // `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
 // offload, published as ONE value (`ane.media_offload`) after the parse.
 var ane_media: ane_mod.MediaOffload = .{};
@@ -92,6 +118,7 @@ fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
     cli_mod.runRepl(allocator, io, port) catch |err| {
         log.warn("chat REPL exited: {s}\n", .{@errorName(err)});
     };
+    if (comptime @import("builtin").os.tag == .windows) std.process.exit(0);
     std.posix.raise(std.posix.SIG.TERM) catch {};
 }
 
@@ -112,9 +139,14 @@ fn printUsage(io: std.Io) void {
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every pulled model loads on demand by name)
+        \\  worker              Lend this Mac to another Mac's --dist host:
+        \\                      --coordinator <ip:port> --device <rdma_enX>
+        \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
+        \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
+        \\                      <ip:port> --device <rdma_enX> [--soak N]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode); starts the MLX Core app if the
+        \\                      hermes, aider, zcode); starts the MLX-Serve app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
         \\
@@ -202,16 +234,38 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
+        \\                        models with int8 Q/K (NAX GPUs, lossy, wins
+        \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
+        \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
+        \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
+        \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
+        \\                        per token). On by default for quantized Flash Next
+        \\                        packs on an integrated NVIDIA GPU (DGX Spark).
+        \\                        A model's "lm_head_mxfp8" setting wins.
+        \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
+        \\                        instead of the GPU (a model's "ane" setting in
+        \\                        model-settings.json wins). The first load on a
+        \\                        Mac builds and compiles its ANE programs (cached).
+        \\  --ane-slots <n>     Requests each Neural Engine model runs at once, 1..4
+        \\                        (default: 1). Slots share the weights; each adds
+        \\                        its own KV and state (2 slots: ~1.75x the
+        \\                        decode throughput on an M5 Ultra).
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
         \\                        share is calibrated once per Mac and model on
         \\                        the first request (~1 s) and reused; the server
         \\                        declines by name where the copy does not fit.
+        \\  --w8a8 / --no-w8a8  Run image, video, music and 3D DiT linears as rotated
+        \\                        per-row int8 x int8 on the Neural Accelerators
+        \\                        (lossy, faster; 4-bit packs hold more memory, bf16
+        \\                        packs half). On by default only on an M5-class
+        \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
-        \\  --mtp               No-op: a loaded MTP head drafts by default,
-        \\                        dense or MoE (--no-mtp turns it off).
+        \\  --mtp               Draft with a loaded MTP head, dense or MoE. The default
+        \\                        on Metal and CUDA; Vulkan needs it (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -305,7 +359,7 @@ fn printUsage(io: std.Io) void {
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
         \\                        prefills; also narrows that prefill's chunks.
-        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
+        \\                        Default 0.25; 0 = the old schedule (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -326,6 +380,11 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --shutdown-persist-secs <n>
+        \\                      On SIGTERM, finish writing the SSD-tier slices not
+        \\                        yet on disk, for at most <n> seconds, then exit
+        \\                        (default: 45; 0 disables). A launchd job needs
+        \\                        ExitTimeOut above it, or the flush is killed.
         \\  --ssm-checkpoint-stride <n>
         \\                      Hybrid SSM architectures only (e.g. Qwen3.5/3.6
         \\                        GDN): capture an SSM/conv state checkpoint every
@@ -445,6 +504,16 @@ fn printUsage(io: std.Io) void {
         \\                        proxied to that host. Off by default.
         \\  --lan-name <name>   Bonjour instance name for --lan-share
         \\                        (default: this Mac's hostname).
+        \\  --dist <pipeline|tensor>  Serve --dist-model across this Mac and a
+        \\                        worker over Thunderbolt RDMA: pipeline splits the
+        \\                        layers, tensor splits every MoE expert (Qwen3.8-
+        \\                        Flash-Next; DeepSeek-V4.1 pipeline only). An H3
+        \\                        pack splits each video step's rows instead. The
+        \\                        worker runs `mlx-serve worker`.
+        \\  --dist-model <dir>  The model the two Macs serve (default: --model)
+        \\  --dist-coordinator <ip:port>  This Mac's address the worker dials
+        \\  --dist-device <rdma_enX>  The RDMA port facing the worker (`ibv_devinfo`)
+        \\  --dist-split <n>    Pipeline: layers kept here (default: by free memory)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
@@ -456,6 +525,9 @@ fn printUsage(io: std.Io) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    crt.exportHomeDefault();
+    // Referenced, or the linker strips the unreferenced section.
+    if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;
     const io = init.io;
 
@@ -467,6 +539,7 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
+    mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -510,7 +583,8 @@ pub fn main(init: std.process.Init) !void {
             try cli_mod.cmdPull(allocator, io, args[2]);
             return;
         } else if (std.mem.eql(u8, cmd, "list")) {
-            try cli_mod.cmdList(allocator, io);
+            // `mlx-serve list | head`: the reader hanging up on stdout is not an error.
+            cli_mod.cmdList(allocator, io) catch |e| if (e != error.WriteFailed) return e;
             return;
         } else if (std.mem.eql(u8, cmd, "run")) {
             if (args.len < 3) {
@@ -540,6 +614,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "worker")) {
+            @import("distributed.zig").cmdWorker(io, allocator, args[2..]) catch std.process.exit(1);
+            return;
+        } else if (std.mem.eql(u8, cmd, "dist-probe")) {
+            @import("distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
+            return;
         } else if (std.mem.eql(u8, cmd, "launch")) {
             if (args.len < 3) {
                 log.err("usage: mlx-serve launch <agent> — supported: {s}\n", .{launch_mod.AgentKind.names});
@@ -548,7 +628,7 @@ pub fn main(init: std.process.Init) !void {
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, worker, or dist-probe)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -578,6 +658,12 @@ pub fn main(init: std.process.Init) !void {
     var top_p_flag: ?f32 = null;
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
+    // `--dist pipeline`: this server is rank 0 of a multi-Mac group (see distributed.zig).
+    var dist_mode: ?@import("distributed.zig").Mode = null;
+    var dist_coordinator: ?[]const u8 = null;
+    var dist_device: ?[]const u8 = null;
+    var dist_split: ?u32 = null;
+    var dist_model: ?[]const u8 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
@@ -610,6 +696,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
+    @import("w8a8.zig").enabled = @import("w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -675,6 +762,24 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--top-k") and i + 1 < args.len) {
             i += 1;
             top_k_flag = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist") and i + 1 < args.len) {
+            i += 1;
+            dist_mode = @import("distributed.zig").Mode.parse(args[i]) orelse {
+                log.err("--dist takes pipeline or tensor, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--dist-coordinator") and i + 1 < args.len) {
+            i += 1;
+            dist_coordinator = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-device") and i + 1 < args.len) {
+            i += 1;
+            dist_device = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-model") and i + 1 < args.len) {
+            i += 1;
+            dist_model = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dist-split") and i + 1 < args.len) {
+            i += 1;
+            dist_split = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
@@ -789,6 +894,24 @@ pub fn main(init: std.process.Init) !void {
             // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
             // the row share.
             ane_prefill = true;
+        } else if (std.mem.eql(u8, args[i], "--ane")) {
+            ane_serve = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-slots") and i + 1 < args.len) {
+            i += 1;
+            ane_slots = ane_lm.parseSlots(args[i]) catch {
+                log.err("--ane-slots: expected an integer 1..{d}, got '{s}'\n", .{ ane_lm.max_slots, args[i] });
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--w8a8")) {
+            @import("w8a8.zig").enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
+            @import("w8a8.zig").enabled = false;
+        } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
+            @import("nax_attention.zig").int8_qk_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = true;
+        } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
+            @import("transformer.zig").lm_head_mxfp8_cli = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -807,7 +930,7 @@ pub fn main(init: std.process.Init) !void {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
-            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+            crt.setEnv("MLX_SERVE_DSV4_DSPARK", "1");
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
@@ -898,6 +1021,12 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--shutdown-persist-secs") and i + 1 < args.len) {
+            i += 1;
+            server_mod.shutdown_persist_secs = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--shutdown-persist-secs: expected whole seconds (0 = off); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
             // Iteration 2 (perf-plan Phase 4 #3): caps the per-LoadedModel
             // chat-template tokenize cache. 0 = off (every request re-
@@ -925,7 +1054,7 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+            status.os_reserve_override = status.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -1051,7 +1180,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
-    if (!server_mod.mtpAllowedByDefault(mtp_forced)) enable_mtp = false;
+    if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
+    generate_mod.machine_prefill_chunk_cap = server_mod.autoPrefillChunkCap(mlx.cudaAvailable());
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1305,6 +1435,23 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
+    if (dist_mode) |mode| {
+        const coordinator = dist_coordinator orelse {
+            log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
+            std.process.exit(1);
+        };
+        const device = dist_device orelse {
+            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`)\n", .{});
+            std.process.exit(1);
+        };
+        const group_model = dist_model orelse if (model_dir.len > 0) model_dir else {
+            log.err("--dist needs --dist-model DIR (or --model): the model the two Macs serve together\n", .{});
+            std.process.exit(1);
+        };
+        log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
+        try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
+    }
+
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no
         // primary model; everything (chat + media) loads on demand through the
@@ -1408,6 +1555,7 @@ pub fn main(init: std.process.Init) !void {
         scheduler_mod.applyModelSettings(config, chat_config, &settings, enable_mtp);
     }
     config.applyTokenizer(tok, chat_config.eos_token);
+    if (config.radio_vision) chat_config.video_placeholder = "<img>";
 
     const load_vision = config.has_vision and !no_vision;
 
@@ -1488,6 +1636,8 @@ pub fn main(init: std.process.Init) !void {
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = depth_bounds.active.max,
             .ane_prefill = ane_prefill,
+            .ane = ane_serve,
+            .ane_slots = ane_slots,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
@@ -1913,6 +2063,8 @@ fn runGenServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane = ane_serve,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
@@ -2060,6 +2212,8 @@ fn runHeadlessServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .ane = ane_serve,
+        .ane_slots = ane_slots,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,

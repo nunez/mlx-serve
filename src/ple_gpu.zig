@@ -95,6 +95,7 @@ pub fn wrap(table: *qwen4.NgramTable) !Table {
 /// An embedded pack's shards copied into one anonymous page-aligned mapping in the
 /// `ngram_table.bin` layout, wrapped no-copy; MLX owns the munmap on success.
 fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
+    if (comptime @import("builtin").os.tag == .windows) return error.PleGpuUnsupportedOnWindows;
     const len: usize = @intCast(std.mem.alignForward(u64, src.repackedLen(), std.heap.pageSize()));
     const map = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     var owned = true;
@@ -103,7 +104,7 @@ fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
     const arr = try wrapMap(map);
     owned = false;
     const wbytes = src.rows * @as(u64, src.wcols) * 4;
-    const sbytes = src.rows * @as(u64, src.scols) * 2;
+    const sbytes = src.rows * @as(u64, src.scols) * qwen4_ple.scaleBytes(src.fmt);
     return .{ .arr = arr, .w_off = 0, .s_off = wbytes, .b_off = wbytes + sbytes, .scale = src.scale };
 }
 
@@ -191,10 +192,11 @@ const P_MULT = 13;
 const P_VOCAB = P_MULT + qwen4.MAX_NGRAM_SIZE;
 const P_OFFSETS = P_VOCAB + qwen4.MAX_HEADS;
 const P_SCALE = P_OFFSETS + qwen4.MAX_HEADS;
-const P_LEN = P_SCALE + 1;
+const P_NVFP4 = P_SCALE + 1;
+const P_LEN = P_NVFP4 + 1;
 comptime {
     // ple_gather.metal reads these slots by literal.
-    std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85);
+    std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85 and P_NVFP4 == 86);
 }
 
 /// bf16 `[S, n_heads * dim]` for the `S` ids of `ids` (any integer dtype, may be lazy),
@@ -211,6 +213,7 @@ pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const
     @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
     @memcpy(p[P_OFFSETS..P_SCALE], &h.offsets);
     p[P_SCALE] = @as(u32, @bitCast(tbl.scale));
+    p[P_NVFP4] = @intFromBool(t.fmt == .nvfp4);
     const params = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
     defer _ = mlx.mlx_array_free(params);
     var prev_i: [qwen4.MAX_NGRAM_SIZE]i32 = undefined;
@@ -459,6 +462,48 @@ test "ple gpu: an embedded sharded table, weight scale included, embeds like the
         defer tbl.release();
         try testing.expectEqual(table.embedded.?.scale, tbl.scale);
         try expectArmsEqual(tbl, &h, &table, &[_]u32{ 3, 4 }, &ids);
+    }
+}
+
+test "ple gpu: a ModelOpt NVFP4 table embeds like the host gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 2, 1, 2, 3, 1234, 0, TEST_EOS);
+    try testing.expectEqual(@as(u64, 3), h.total_rows);
+    var prng = std.Random.DefaultPrng.init(13);
+    var ids: [256]u32 = undefined;
+    randIds(prng.random(), &ids);
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try qwen4_ple.writeNvfp4Fixture(&td);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try qwen4.NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 });
+    defer table.close();
+    const tbl = try wrapEmbedded(table.embedded.?);
+    defer tbl.release();
+    try expectArmsEqual(tbl, &h, &table, &[_]u32{3}, &ids);
+}
+
+test "ple gpu: an embedded affine table embeds like the host gather at every width" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const h = try qwen4.NgramHash.init(TEST_VOCAB, 2, 1, 2, 2, 1234, 0, TEST_EOS);
+    try testing.expectEqual(@as(u64, 2), h.total_rows);
+    var prng = std.Random.DefaultPrng.init(14);
+    var ids: [256]u32 = undefined;
+    randIds(prng.random(), &ids);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try qwen4_ple.writeAffineFixture(&td, bits);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try qwen4.NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 2, .dim = 32, .shards = 1 });
+        defer table.close();
+        const tbl = try wrapEmbedded(table.embedded.?);
+        defer tbl.release();
+        try expectArmsEqual(tbl, &h, &table, &[_]u32{3}, &ids);
     }
 }
 

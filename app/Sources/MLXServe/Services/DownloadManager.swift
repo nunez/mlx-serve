@@ -252,12 +252,14 @@ class DownloadManager: ObservableObject {
     /// (mlx-serve native) and `optiq/mtp.safetensors` (oMLX OptiQ). Without them
     /// an MTP model silently loses its speculative-decoding speedup because a
     /// non-recursive listing returns the dir as a bare entry that the
-    /// `type == "file"` filter drops. Everything else nested — `optiq/optiq_vision.safetensors`
-    /// (the server can't use a relocated vision tower, ~GB), `original/` or
-    /// alternate-precision shadow copies — is skipped so we don't pull tens of
-    /// GB of unused weights. This allowlist mirrors `mtp.sidecar_rel_paths`; keep
-    /// them in sync. Returns (path, size) pairs.
-    nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault) -> [(String, Int64)] {
+    /// `type == "file"` filter drops. A nested file the shard index names
+    /// (`indexedShards`) is part of the checkpoint and rides along; any other
+    /// nested file — `original/` or alternate-precision shadow copies — is
+    /// skipped so we don't pull tens of GB of unused weights. The sidecar
+    /// allowlist mirrors `mtp.sidecar_rel_paths`; keep them in sync. Returns
+    /// (path, size) pairs.
+    nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault,
+                                              indexedShards: Set<String> = []) -> [(String, Int64)] {
         // `.bin` is allowed because some packs ship an engine-READ binary
         // sidecar (qwen4_exp's `ngram_table.bin`, mmapped at serve time); the
         // extension allowlist used to drop it, so app-downloaded packs failed
@@ -273,7 +275,7 @@ class DownloadManager: ObservableObject {
             // (`4bit/config.json`), never anything deeper. Chat default:
             // top-level files + the pack's `drafter/` + the MTP sidecar (native
             // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`) + DeepSeek-V4.1's
-            // `engram/` tables (same list as `cli.shouldDownload`). Media (recursive): keep nested
+            // `engram/` tables + ModelOpt's `tensors/` shards (same list as `cli.shouldDownload`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -283,7 +285,8 @@ class DownloadManager: ObservableObject {
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
-                    || path.hasPrefix("engram/") || path == "optiq/mtp.safetensors" else { return nil }
+                    || path.hasPrefix("engram/") || path.hasPrefix("tensors/") || path == "optiq/mtp.safetensors"
+                    || indexedShards.contains(path) else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -365,6 +368,9 @@ class DownloadManager: ObservableObject {
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         case "breeze_tts": return "audio_tokenizer/model.safetensors"
+        case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
+        case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+        case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
         default: return nil
         }
     }
@@ -396,6 +402,8 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if isPixal3dPipeline(inDir: dir) { return "pixal3d" }
+        if isTrellis2Pipeline(atPath: (dir as NSString).appendingPathComponent("pipeline.json")) { return "trellis2" }
         if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
         return nil
     }
@@ -407,6 +415,28 @@ class DownloadManager: ObservableObject {
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = cfg["auto_map"] as? [String: Any] else { return false }
         return map["AutoModel"] as? String == "modeling_d1.D1Model"
+    }
+
+    /// Microsoft's TRELLIS.2 image-to-3D pack: no root config.json, its `pipeline.json` names the pipeline.
+    /// Twin of `model_discovery.peekTrellis2Pipeline`.
+    nonisolated static func isTrellis2Pipeline(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return cfg["name"] as? String == "Trellis2ImageTo3DPipeline"
+    }
+
+    /// TencentARC's Pixal3D pack: TRELLIS.2's pipeline.json, name and all, over flows whose own config reads
+    /// `"image_attn_mode": "proj"`. Twin of `model_discovery.peekPixal3dPipeline`.
+    nonisolated static func isPixal3dPipeline(inDir dir: String) -> Bool {
+        let pipe = (dir as NSString).appendingPathComponent("pipeline.json")
+        guard isTrellis2Pipeline(atPath: pipe),
+              let data = FileManager.default.contents(atPath: pipe),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = (cfg["args"] as? [String: Any])?["models"] as? [String: Any],
+              let ss = models["sparse_structure_flow_model"] as? String,
+              let flowData = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent(ss + ".json")),
+              let flow = try? JSONSerialization.jsonObject(with: flowData) as? [String: Any] else { return false }
+        return (flow["args"] as? [String: Any])?["image_attn_mode"] as? String == "proj"
     }
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
@@ -787,7 +817,16 @@ class DownloadManager: ObservableObject {
                 throw URLError(.cannotParseResponse)
             }
 
-            let neededFiles = Self.selectNeededFiles(from: files, selection: selection)
+            // The shard index lists the checkpoint's own parts; `weightDefect`
+            // flags the folder "Missing shards" for any it names that is absent.
+            // Unreadable = the old allowlist alone.
+            var indexed: Set<String> = []
+            if files.contains(where: { ($0["path"] as? String) == "model.safetensors.index.json" }),
+               let indexURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/model.safetensors.index.json"),
+               let (indexData, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(indexURL)) {
+                indexed = Self.indexedShardNames(fromIndexData: indexData) ?? []
+            }
+            let neededFiles = Self.selectNeededFiles(from: files, selection: selection, indexedShards: indexed)
 
             // A download that matches NOTHING must say so. `LiquidAI/LFM2.5-2.6B-MLX`
             // keeps every model in a quant subfolder and has no loadable file at
@@ -1882,7 +1921,8 @@ class DownloadManager: ObservableObject {
                     source: source,
                     kind: .base,
                     quantFile: primaryBase,
-                    quantLabel: quant.label
+                    quantLabel: quant.label,
+                    sizeBytes: Int64(size)
                 )
             }
         }
@@ -1923,6 +1963,7 @@ class DownloadManager: ObservableObject {
             numExperts: meta.numExperts,
             activeExperts: meta.activeExperts,
             hasMtpHead: dirHasMtpHead(atDir: resolved),
+            sizeBytes: Int64(size),
             defect: defect
         )]
     }
@@ -1956,11 +1997,16 @@ class DownloadManager: ObservableObject {
     nonisolated static func missingIndexedShards(inDir dir: String) -> Bool? {
         let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
         guard let data = FileManager.default.contents(atPath: indexPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let map = obj["weight_map"] as? [String: String] else { return nil }
-        let declared = Set(map.values)
-        if declared.isEmpty { return nil }
+              let declared = indexedShardNames(fromIndexData: data) else { return nil }
         return declared.contains { !FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }
+    }
+
+    /// The shards a `model.safetensors.index.json` names (paths relative to the
+    /// checkpoint dir, nested ones included); nil when it names none.
+    nonisolated static func indexedShardNames(fromIndexData data: Data) -> Set<String>? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = obj["weight_map"] as? [String: String], !map.isEmpty else { return nil }
+        return Set(map.values)
     }
 
     /// Classify a safetensors directory: nil when it holds a loadable
