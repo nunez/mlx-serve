@@ -321,6 +321,20 @@ const Ops = struct {
         return out;
     }
 
+    fn sliceAxis(self: *Ops, x: A, axis: c_int, start: i64, end: i64) !A {
+        const shape = mlx.getShape(x);
+        var starts: [4]c_int = .{ 0, 0, 0, 0 };
+        var stops: [4]c_int = undefined;
+        @memcpy(stops[0..shape.len], shape);
+        starts[axis] = @intCast(start);
+        stops[axis] = @intCast(end);
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        var out = mlx.mlx_array_new();
+        errdefer free(out);
+        try mlx.check(mlx.mlx_slice(&out, x, &starts, shape.len, &stops, shape.len, &strides, shape.len, self.s));
+        return out;
+    }
+
     fn sliceLastAxis(self: *Ops, x: A, start: i64, end: i64) !A {
         const shape = mlx.getShape(x);
         var starts: [4]c_int = .{ 0, 0, 0, 0 };
