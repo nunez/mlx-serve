@@ -15797,8 +15797,11 @@ fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
 /// Encode `mp` on the inference thread (the sole mlx caller) and return every
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
 /// item k's row count. RADIO video rows are already the EVS keep.
-fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
-    const sch = global_scheduler orelse return error.NoScheduler;
+fn encodeMediaItems(allocator: std.mem.Allocator, sch_opt: ?*scheduler_mod.Scheduler, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
+    // The scheduler arrives from the caller (the embed lane threads its own
+    // instance; the server's handlers pass the global). Null falls back to
+    // the process-global for any caller that predates the threading.
+    const sch = sch_opt orelse (global_scheduler orelse return error.NoScheduler);
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
     var req = scheduler_mod.VisionEncodeRequest{
@@ -15917,10 +15920,10 @@ pub const MultimodalPrompt = struct {
 
 /// Encode every media item in `messages` and expand the placeholders the
 /// template rendered for them; `prompt_ids` is replaced by the expanded prompt.
-pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, sch: *scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
+pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, sch_opt: ?*scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, messages: []const chat_mod.Message, prompt_ids: *[]u32) !MultimodalPrompt {
     const items = try collectMediaItems(allocator, messages);
     defer allocator.free(items);
-    return prepareMultimodalItems(allocator, sch, lm, config, items, prompt_ids);
+    return prepareMultimodalItems(allocator, sch_opt, lm, config, items, prompt_ids);
 }
 
 fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) MediaTokens {
@@ -15934,7 +15937,7 @@ fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) Medi
 }
 
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
-fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
+fn prepareMultimodalItems(allocator: std.mem.Allocator, sch_opt: ?*scheduler_mod.Scheduler, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
     var videos: usize = 0;
     for (items) |it| videos += @intFromBool(it == .video);
@@ -15959,7 +15962,7 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
     var out: MultimodalPrompt = .{};
     errdefer out.deinit(allocator);
-    const encoded = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
+    const encoded = try encodeMediaItems(allocator, sch_opt, lm, items, mp, item_tokens);
     defer freeKeepMasks(allocator, encoded.item_keep);
     out.embeddings = encoded.rows;
     const item_keep = try allocator.alloc(?[]const bool, items.len);
@@ -23148,7 +23151,7 @@ test "RADIO video availability rejects a forced clip before encoding with a name
     const items = [_]MediaItem{.{ .video = &clip }};
     var ids = try a.dupe(u32, &.{19});
     defer a.free(ids);
-    try testing.expectError(error.VideoUnsupported, prepareMultimodalItems(a, &entry, &config, &items, &ids));
+    try testing.expectError(error.VideoUnsupported, prepareMultimodalItems(a, null, &entry, &config, &items, &ids));
     const failure = multimodalFailure(error.VideoUnsupported);
     try testing.expectEqual(@as(u16, 400), failure.code);
     try testing.expect(std.mem.indexOf(u8, failure.message, "video") != null);

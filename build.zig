@@ -422,6 +422,10 @@ fn addMacLib(
     embed_options.addOption(bool, "ios", false);
     embed_options.addOption(bool, "macos_engines", true);
     embed_options.addOption(bool, "embedded_engines", true);
+    // Upstream's scheduler gates the ds4/llama plug engines on these
+    // build_options members; the embed module must expose the same surface.
+    embed_options.addOption(bool, "ds4_engine", true);
+    embed_options.addOption(bool, "llama_engine", true);
     // mlx-stream (DeepSeek-V4.1 SSD expert streaming) needs the host's
     // mtp_acceptance surface; the fleet NIF host never loads that family.
     embed_options.addOption(bool, "mlx_stream", false);
