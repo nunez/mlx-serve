@@ -69,6 +69,8 @@ pub const Modality = enum {
     /// Speaker diarization (Nemotron 3 Diarization): no route of its own, the
     /// speakers of a `diarized_json` transcription.
     diarization,
+    /// Voxtral-Mini-4B-Realtime speech-to-text (`/v1/audio/transcriptions`).
+    asr,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -78,6 +80,7 @@ pub const Modality = enum {
             .mesh => "3d",
             .decision => "decisions",
             .diarization => "diarization",
+            .asr => "asr",
         };
     }
 
@@ -90,6 +93,7 @@ pub const Modality = enum {
             .audio => "qwen3_tts",
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
+            .asr => "voxtral_realtime",
             .decision => "laya",
             .diarization => "nemotron_diarization",
         };
@@ -116,6 +120,7 @@ pub const media_model_types = [_][]const u8{
     "AudioVideo", "hunyuan3d", "minimax_h3",     "minimax_music3",
     "qwen_image", "laya",       "kev",            "clef",
     "d1",         "stable_audio3", "yue2",       "nemotron_diarization",
+    "voxtral_realtime",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -135,6 +140,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
+    if (std.mem.eql(u8, model_type, "voxtral_realtime")) return .asr;
     return null;
 }
 

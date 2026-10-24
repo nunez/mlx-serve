@@ -953,7 +953,7 @@ fn scalarLike(like: A, v: f32) A {
 }
 
 /// Exact (erf) GELU — `mlx.nn.gelu`.
-fn gelu(x: A, s: S) !A {
+pub fn gelu(x: A, s: S) !A {
     const inv_sqrt2 = scalarLike(x, 1.0 / @sqrt(2.0));
     defer free(inv_sqrt2);
     var scaled = mlx.mlx_array_new();

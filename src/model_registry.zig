@@ -33,6 +33,7 @@ const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
+const asr_mod = @import("asr.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
@@ -264,6 +265,7 @@ pub const LoadedModel = struct {
     mesh_engine: ?*gen_mod.MeshEngine = null,
     decision_engine: ?*gen_mod.DecisionEngine = null,
     diarization_engine: ?*diarization_mod.Engine = null,
+    asr_engine: ?*asr_mod.Engine = null,
     /// Model-wide serialization gate for media generation. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
@@ -410,6 +412,10 @@ pub const LoadedModel = struct {
         if (self.diarization_engine) |e| {
             e.deinit();
             self.diarization_engine = null;
+        }
+        if (self.asr_engine) |e| {
+            e.deinit();
+            self.asr_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -594,6 +600,10 @@ pub const LoadedModel = struct {
         if (self.diarization_engine) |e| {
             e.deinit();
             self.diarization_engine = null;
+        }
+        if (self.asr_engine) |e| {
+            e.deinit();
+            self.asr_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {

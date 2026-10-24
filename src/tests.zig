@@ -85,6 +85,7 @@ test {
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
     _ = @import("kev.zig");
+    _ = @import("asr.zig");
     _ = @import("d1.zig");
     _ = @import("clef.zig");
     _ = @import("clef_http_test.zig");

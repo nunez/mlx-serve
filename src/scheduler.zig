@@ -41,6 +41,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
+const asr_mod = @import("asr.zig");
 const gen_sse = @import("gen_sse.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -3342,6 +3343,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
         .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
         .diarization => entry.diarization_engine = try diarization_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
+        .asr => entry.asr_engine = try asr_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).

@@ -126,6 +126,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "clef") or
         std.mem.eql(u8, model_type, "d1") or
         std.mem.eql(u8, model_type, "nemotron_diarization") or
+        std.mem.eql(u8, model_type, "voxtral_realtime") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 

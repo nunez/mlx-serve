@@ -1,0 +1,83 @@
+generate_video() {
+    local USER_PROMPT="$1"
+    local DURATION="${2:-5}"
+    local FRAMES=$(( DURATION * 24 ))
+    
+    # --- Configuration ---
+    local LLM_HOST="192.168.1.188:8079"
+    local LLM_MODEL="gemma-4-E2B-it-MLX-4bit"
+    # ---------------------
+    
+    if [[ -z "$USER_PROMPT" ]]; then
+        echo "Usage: generate_video \"<prompt>\" [duration_in_seconds]"
+        return 1
+    fi
+
+    echo ">> Expanding prompt via $LLM_MODEL at $LLM_HOST..."
+    
+    # Safely build the payload for the LLM
+    local LLM_PAYLOAD=$(jq -n \
+        --arg prompt "$USER_PROMPT" \
+        --arg model "$LLM_MODEL" \
+        '{
+            model: $model,
+            messages: [
+                {
+                    role: "system", 
+                    content: "You are an expert video director. Expand the user prompt into a highly detailed visual description for an AI video generator. Describe lighting, camera motion, subjects, and setting. Append an \"overall_soundscape: ...\" clause at the end. Output ONLY the raw prompt string. Do not use quotes, markdown, or introductory text."
+                },
+                {
+                    role: "user", 
+                    content: $prompt
+                }
+            ],
+            temperature: 0.7
+        }')
+
+    # Fetch the expanded prompt
+    local EXPANDED_PROMPT=$(curl -s http://${LLM_HOST}/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d "$LLM_PAYLOAD" | jq -r '.choices[0].message.content')
+        
+    # Fallback just in case the LLM endpoint is offline
+    if [[ "$EXPANDED_PROMPT" == "null" ]] || [[ -z "$EXPANDED_PROMPT" ]]; then
+        echo ">> Prompt expansion failed or returned empty. Falling back to original prompt."
+        EXPANDED_PROMPT="$USER_PROMPT"
+    fi
+    
+    echo ">> Expanded Prompt: $EXPANDED_PROMPT"
+    echo ">> Generating $DURATION seconds ($FRAMES frames)..."
+
+    # Build payload for mlx-serve
+    local VIDEO_PAYLOAD=$(jq -n \
+        --arg prompt "$EXPANDED_PROMPT" \
+        --argjson frames "$FRAMES" \
+        '{
+            prompt: $prompt,
+            num_frames: $frames,
+            width: 864,
+            height: 480,
+            steps: 30
+        }')
+
+    # Generate a clean filename based on the prompt and current Unix timestamp
+    local TEMP_JSON="/tmp/minimax_out_$$.json"
+    local OUT_PREFIX=$(echo "$USER_PROMPT" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-15)
+    local OUT_FILE="${OUT_PREFIX}_$(date +%s).mp4"
+
+    # Fire the generation request to the local MiniMax-H3 server
+    curl -s -X POST "http://127.0.0.1:8000/v1/video/generations" \
+        -H 'Content-Type: application/json' \
+        -d "$VIDEO_PAYLOAD" -o "$TEMP_JSON"
+        
+    echo ">> Generation complete. Extracting multiplexed stream to $OUT_FILE..."
+
+    # Decode base64 directly into FFmpeg via process substitution
+    ffmpeg -y \
+        -f rawvideo -pix_fmt rgb24 -s 864x480 -r 24 -i <(jq -r '.data' "$TEMP_JSON" | base64 --decode) \
+        -f s16le -ar 32000 -ac 2 -i <(jq -r '.audio_data' "$TEMP_JSON" | base64 --decode) \
+        -c:v libx264 -pix_fmt yuv420p -c:a aac "$OUT_FILE" -loglevel warning
+        
+    rm "$TEMP_JSON"
+    echo ">> Done! Saved as $OUT_FILE"
+}

@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Bench 2026-10-13 · mlx-serve 26.10.2 vs mflux (Fleet)</title>
+<style>
+  body{font:14px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;margin:24px}
+  h1{font-size:20px} h2{font-size:16px;margin-top:32px;color:#8fc}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+  figure{margin:0;background:#1b1b1b;border:1px solid #2a2a2a;border-radius:10px;padding:12px}
+  figure img{width:100%;height:auto;border-radius:6px;display:block}
+  figcaption{margin-top:8px;font-size:13px;color:#bbb}
+  .t{color:#8fc;font-weight:600}
+  table{border-collapse:collapse;margin-top:16px} td,th{padding:6px 12px;border-bottom:1px solid #333;text-align:left} th{color:#8fc}
+</style>
+<h1>mlx-serve 26.10.2 vs mflux (Fleet :8904)</h1>
+<p>M3 Ultra · 1024×1024 · seed 42 · "A cinematic portrait of a red fox in a snowy forest at golden hour, shallow depth of field"</p>
+
+<h2>Qwen-Image-2.1 · the headline</h2>
+<div class="grid">
+  <figure><img src="turbo-8step-34s.png"><figcaption><span class="t">mlx-serve Turbo</span> · 8 steps · <span class="t">34.0 s</span> · single-forward, no CFG</figcaption></figure>
+  <figure><img src="mflux-qwen21-40step-155s.png"><figcaption><span class="t">mflux qwen21</span> · 40 steps · <span class="t">155.8 s</span> · q8</figcaption></figure>
+</div>
+
+<h2>FLUX.2-klein-9B · dead heat</h2>
+<div class="grid">
+  <figure><img src="mlxs-flux2-18s.png"><figcaption><span class="t">mlx-serve FLUX.2</span> · 4 steps · <span class="t">18.8 s</span></figcaption></figure>
+  <figure><img src="mflux-flux2-18s.png"><figcaption><span class="t">mflux flux2</span> · 4 steps · <span class="t">18.8 s</span></figcaption></figure>
+</div>
+
+<h2>Krea-2-Turbo · parity within noise</h2>
+<div class="grid">
+  <figure><img src="mlxs-26.10.1-krea-48s.png"><figcaption><span class="t">mlx-serve 26.10.1</span> · 8 steps · <span class="t">47.5 s</span></figcaption></figure>
+  <figure><img src="mlxs-26.10.2-krea-51s.png"><figcaption><span class="t">mlx-serve 26.10.2</span> · 8 steps · <span class="t">51.3 s</span></figcaption></figure>
+  <figure><img src="mflux-krea-48s.png"><figcaption><span class="t">mflux krea2</span> · 8 steps · <span class="t">48.1 s</span></figcaption></figure>
+</div>
+
+<h2>YuE2 songs · v26.10.2's new music lane</h2>
+<p>Same style + lyrics + seed 42, cot full, steps 32. <a href="yue2-fleet-28s.wav">Fleet :8902 WAV</a> · <a href="yue2-mlxserve-30s.wav">mlx-serve :8080 WAV</a></p>
+<div class="grid">
+  <figure><figcaption><span class="t">Fleet yue2-mlx (:8902)</span> · 28.4 s cold / <span class="t">28.2 s warm</span> · 52.1 s song · RTF 0.543 · byte-deterministic (md5 b198e716)</figcaption></figure>
+  <figure><figcaption><span class="t">mlx-serve YuE2-3B (:8080)</span> · 30.5 s cold / <span class="t">30.6 s warm</span> · 57.4 s song · RTF 0.531 · byte-deterministic (md5 f732f07d)</figcaption></figure>
+</div>
+
+<h2>Summary</h2>
+<table>
+  <tr><th>lane</th><th>steps</th><th>cold</th><th>warm</th><th>s/step</th></tr>
+  <tr><td>mlx-serve Qwen-Image-2.1-Turbo</td><td>8</td><td>35.4 s</td><td>34.0 s</td><td>4.25</td></tr>
+  <tr><td>mflux qwen21</td><td>40</td><td>154.7 s</td><td>155.8 s</td><td>3.90</td></tr>
+  <tr><td>mlx-serve FLUX.2-klein</td><td>4</td><td>19.8 s</td><td>18.8 s</td><td>4.70</td></tr>
+  <tr><td>mflux flux2</td><td>4</td><td>—</td><td>18.8 s</td><td>4.70</td></tr>
+  <tr><td>mlx-serve 26.10.1 Krea</td><td>8</td><td>48.6 s</td><td>47.5 s</td><td>5.94</td></tr>
+  <tr><td>mlx-serve 26.10.2 Krea</td><td>8</td><td>52.6 s</td><td>51.3 s</td><td>6.41</td></tr>
+  <tr><td>mflux krea2</td><td>8</td><td>54.7 s</td><td>48.1 s</td><td>6.01</td></tr>
+  <tr><td>Fleet YuE2 (yue2-mlx)</td><td>32 NAR</td><td>28.4 s</td><td>28.2 s</td><td>RTF 0.543</td></tr>
+  <tr><td>mlx-serve YuE2-3B q8</td><td>32 NAR</td><td>30.5 s</td><td>30.6 s</td><td>RTF 0.531</td></tr>
+</table>
+<p>Same DiT backbone → same per-step cost; turbo's 4.6× win is pure distillation (8 steps vs 40). "8 s" in the release notes is M5-Ultra marketing.</p>

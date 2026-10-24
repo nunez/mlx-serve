@@ -1,0 +1,192 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "omlx": {
+      "models": {
+        "Jundot/DeepSeek-V4.1-Flash-oQ2e-mtp": {
+          "limit": {
+            "context": 1048576,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "DeepSeek-V4.1-Flash-oQ2e-mtp"
+        },
+        "pxleng/GLM-5.3-Flash-UNCENSORED-oQ4e-mtp": {
+          "limit": {
+            "context": 1048576,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "GLM-5.3-Flash-UNCENSORED-oQ4e-mtp"
+        },
+        "LiquidAI/LFM2.5-24B-A2B-MLX-8bit": {
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "LFM2.5-24B-A2B-MLX-8bit"
+        },
+        "Avicennasis/MiniCPM-V-4.7-35B-A3B-abliterated-MLX-4bit": {
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "MiniCPM-V-4.7-35B-A3B-abliterated-MLX-4bit"
+        },
+        "mlx-community/MiniCPM5-2B-8bit": {
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "MiniCPM5-2B-8bit"
+        },
+        "mlx-community/Nemotron-3-Diarization": {
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "name": "Nemotron-3-Diarization"
+        },
+        "Jundot/Qwen3.8-27B-oQ4e-mtp": {
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "Qwen3.8-27B-oQ4e-mtp"
+        },
+        "orcarouter/Qwen3.8-Flash-Next-Uncensored-Q6_K": {
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "Qwen3.8-Flash-Next-Uncensored-Q6_K"
+        },
+        "Jundot/Qwen3.8-Flash-Next-oQ4e-mtp": {
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "Qwen3.8-Flash-Next-oQ4e-mtp"
+        },
+        "lmstudio-community/gemma-4-E2B-it-MLX-4bit": {
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "gemma-4-E2B-it-MLX-4bit"
+        },
+        "lmstudio-community/gemma-4-E4B-it-MLX-8bit": {
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "tool_call": true,
+          "name": "gemma-4-E4B-it-MLX-8bit"
+        }
+      }
+    }
+  }
+}

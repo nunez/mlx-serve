@@ -1,0 +1,28 @@
+[
+  {
+    "session_id": "manual-clone",
+    "config_ok": true,
+    "speaker": "sunward",
+    "ref_pending": true,
+    "ref_active": false,
+    "positions": 0,
+    "done": true,
+    "bytes": 130560,
+    "duration_s": 2.72,
+    "ttfa_ms": 1077.8,
+    "path": "/tmp/fleet_stream_clone_sunward.wav"
+  },
+  {
+    "session_id": "manual-default",
+    "config_ok": true,
+    "speaker": "S0",
+    "ref_pending": false,
+    "ref_active": false,
+    "positions": 0,
+    "done": true,
+    "bytes": 111360,
+    "duration_s": 2.32,
+    "ttfa_ms": 141.6,
+    "path": "/tmp/fleet_stream_default_s0.wav"
+  }
+]

@@ -37,7 +37,7 @@ const build_options = @import("build_options");
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -59,6 +59,8 @@ pub const Event = enum(u32) {
     /// Speech stream chunk: raw s16le mono PCM (engine sample rate).
     /// Prefix-exact with the one-shot WAV under the causal codec decoder.
     pcm = 9,
+    /// ASR transcription: the full reply JSON {"text","language","duration"}.
+    asr = 10,
 };
 
 pub const Callback = *const fn (
@@ -171,9 +173,16 @@ pub const MediaGenConfig = extern struct {
     stream: u8 = 0,
     /// Streaming: emit every N completed frames (0 = engine default 12).
     stream_chunk_frames: u32 = 0,
+    /// ASR (/v1/audio/transcriptions): the 16 kHz mono s16 WAV bytes. The
+    /// engine decodes, pads, and transcribes; the reply JSON arrives as one
+    /// ASR event. prompt is unused for ASR.
+    audio: ?[*]const u8 = null,
+    audio_len: usize = 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+const asr_mod = @import("asr.zig");
 
 const Embed = struct {
     allocator: std.mem.Allocator,
@@ -953,6 +962,7 @@ pub const MediaEngine = union(enum) {
     tts: *gen_mod.AudioEngine, // speech backends (.breeze / .tts)
     video: *gen_mod.VideoEngine,
     decision: *gen_mod.DecisionEngine,
+    asr: *asr_mod.Engine,
 };
 
 const MediaGenCtx = struct {
@@ -976,6 +986,7 @@ const MediaGenCtx = struct {
     instruction: []u8,
     ref_audio: []u8,
     ref_text: []u8,
+    audio: []u8,
     max_frames: u32,
     stream: u8,
     stream_chunk_frames: u32,
@@ -1109,6 +1120,13 @@ fn mediaConstructEngine(io: std.Io, alloc: std.mem.Allocator, dir: []const u8) ?
                 };
                 break :blk MediaEngine{ .decision = e };
             },
+            .asr => {
+                const e = asr_mod.Engine.load(io, alloc, dir) catch |err| {
+                    setErr("media asr load: {s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                break :blk MediaEngine{ .asr = e };
+            },
             else => {
                 setErr("media: modality {s} not supported by embed", .{@tagName(modality)});
                 break :blk null;
@@ -1164,6 +1182,7 @@ fn mediaDeinitEngine(engine: MediaEngine) void {
         .video => |e| e.deinit(),
         .decision => |e| e.deinit(),
         .tts => |e| e.deinit(),
+        .asr => |e| e.deinit(),
     }
 }
 
@@ -1283,6 +1302,24 @@ fn runMediaDecision(c: *MediaGenCtx, eng: *gen_mod.DecisionEngine) void {
     out.deinit(alloc);
 }
 
+fn runMediaAsr(c: *MediaGenCtx, eng: *asr_mod.Engine) void {
+    if (c.audio.len == 0) {
+        const msg = "asr: no audio bytes";
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    }
+    const reply = asr_mod.transcribe(eng, c.alloc, c.audio, .{
+        .cancelled = c.cancelled,
+    }) catch |err| {
+        const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
+        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+        return;
+    };
+    defer c.alloc.free(reply);
+    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.asr), reply.ptr, @intCast(reply.len));
+    mediaEmitDone(c, 0, 0);
+}
+
 fn runMediaVideo(c: *MediaGenCtx, eng: *gen_mod.VideoEngine) void {
     const alloc = c.alloc;
     const io = g_media_threaded.?.io();
@@ -1391,6 +1428,9 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
     }
 
     switch (engine.?) {
+        .asr => |eng| {
+            runMediaAsr(c, eng);
+        },
         .video => |eng| {
             runMediaVideo(c, eng);
         },
@@ -1648,6 +1688,7 @@ fn mediaFeederCleanup(c: *MediaGenCtx) void {
     if (c.voice.len > 0) alloc.free(c.voice);
     if (c.ref_audio.len > 0) alloc.free(c.ref_audio);
     if (c.ref_text.len > 0) alloc.free(c.ref_text);
+    if (c.audio.len > 0) alloc.free(c.audio);
     if (c.instruction.len > 0) alloc.free(c.instruction);
     for (c.edit_images) |b| alloc.free(b);
     if (c.edit_images.len > 0) alloc.free(c.edit_images);
@@ -1751,7 +1792,7 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
     const prompt: []const u8 = if (cfg.prompt) |p| p[0..cfg.prompt_len] else "";
     const lyrics: []const u8 = if (cfg.lyrics) |p| p[0..cfg.lyrics_len] else "";
     const abc: []const u8 = if (cfg.abc) |p| p[0..cfg.abc_len] else "";
-    if (prompt.len == 0) {
+    if (prompt.len == 0 and cfg.audio_len == 0) {
         setErr("media: empty prompt", .{});
         return -3;
     }
@@ -1805,6 +1846,7 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .voice = if (cfg.voice) |p| alloc.dupe(u8, p[0..cfg.voice_len]) catch &.{} else &.{},
         .instruction = if (cfg.instruction) |p| alloc.dupe(u8, p[0..cfg.instruction_len]) catch &.{} else &.{},
         .ref_audio = if (cfg.ref_audio) |p| alloc.dupe(u8, p[0..cfg.ref_audio_len]) catch &.{} else &.{},
+        .audio = if (cfg.audio) |p| alloc.dupe(u8, p[0..cfg.audio_len]) catch &.{} else &.{},
         .ref_text = if (cfg.ref_text) |p| alloc.dupe(u8, p[0..cfg.ref_text_len]) catch &.{} else &.{},
         .max_frames = cfg.max_frames,
         .stream = cfg.stream,
