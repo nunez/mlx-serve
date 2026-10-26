@@ -326,8 +326,8 @@ const Ops = struct {
         var starts: [4]c_int = .{ 0, 0, 0, 0 };
         var stops: [4]c_int = undefined;
         @memcpy(stops[0..shape.len], shape);
-        starts[axis] = @intCast(start);
-        stops[axis] = @intCast(end);
+        starts[@intCast(axis)] = @intCast(start);
+        stops[@intCast(axis)] = @intCast(end);
         const strides = [_]c_int{ 1, 1, 1, 1 };
         var out = mlx.mlx_array_new();
         errdefer free(out);
@@ -1160,8 +1160,12 @@ fn encoderAttention(
             const sw: i64 = @intCast(ec.sliding_window);
             if (total > sw) {
                 const drop = total - sw;
-                const kk = try ops.sliceRows(new_k, drop, total);
-                const vv = try ops.sliceRows(new_v, drop, total);
+                // 4-D [1,H,kv,HD] cache: trim along the KEY axis (2).
+                // sliceRows would slice axis 0 = batch -> empty batch ->
+                // sdpa "mismatching batch dimension (0,32,..)" (the
+                // e332d74a fix; the merge lost these call sites).
+                const kk = try ops.sliceAxis(new_k, 2, drop, total);
+                const vv = try ops.sliceAxis(new_v, 2, drop, total);
                 c.start += @intCast(drop);
                 free(c.k);
                 free(c.v);
@@ -1431,8 +1435,9 @@ fn decoderAttention(
             const sw: i64 = @intCast(dc.sliding_window);
             if (total > sw) {
                 const drop = total - sw;
-                const kk = try ops.sliceRows(new_k, drop, total);
-                const vv = try ops.sliceRows(new_v, drop, total);
+                // axis-2 trim (see encoderAttention): never batch-slice a cache
+                const kk = try ops.sliceAxis(new_k, 2, drop, total);
+                const vv = try ops.sliceAxis(new_v, 2, drop, total);
                 free(new_k);
                 free(new_v);
                 cache.start += @intCast(drop);
