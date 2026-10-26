@@ -1238,19 +1238,26 @@ fn buildEncWindowMask(ops: *Ops, eng: *const Engine, chunk_len: u32, cache: *con
     _ = ops;
     const ec = &eng.cfg.encoder_args;
     const sw = ec.sliding_window;
-    const kv_len: u32 = @intCast(mlx.getShape(cache.k)[2]);
-    const buf = try std.heap.page_allocator.alloc(f16, chunk_len * kv_len);
+    // The mask must describe the cache AS THE ATTENTION WILL SEE IT: the
+    // layer rotates (cat + trim to sw) BEFORE sdpa, so columns are the
+    // post-trim key span [end - final_len, end). Building from the
+    // pre-update span [start, start+kv) shifts every column by `drop`
+    // (10/26 F2 quality bug: early EOS / phrase repetition past 750 rows).
+    const kv_pre: u32 = @intCast(mlx.getShape(cache.k)[2]);
+    const final_len = @min(sw, kv_pre + chunk_len);
+    const first_key: u32 = end_pos - final_len;
+    const buf = try std.heap.page_allocator.alloc(f16, @as(usize, chunk_len) * final_len);
     var q_pos: u32 = end_pos - chunk_len;
     while (q_pos < end_pos) : (q_pos += 1) {
-        var k_pos: u32 = cache.start;
-        while (k_pos < cache.start + kv_len) : (k_pos += 1) {
+        var k_pos: u32 = first_key;
+        while (k_pos < first_key + final_len) : (k_pos += 1) {
             const causal = k_pos <= q_pos;
             const in_window = k_pos + sw > q_pos;
-            const idx = (q_pos - (end_pos - chunk_len)) * kv_len + (k_pos - cache.start);
+            const idx = (q_pos - (end_pos - chunk_len)) * final_len + (k_pos - first_key);
             buf[@intCast(idx)] = if (causal and in_window) 0.0 else -1e9;
         }
     }
-    const shape = [_]c_int{ @intCast(chunk_len), @intCast(kv_len) };
+    const shape = [_]c_int{ @intCast(chunk_len), @intCast(final_len) };
     return mlx.mlx_array_new_data_managed_payload(buf.ptr, &shape, 2, .float16, @ptrCast(buf.ptr), managedFreeF16);
 }
 
