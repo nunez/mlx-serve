@@ -1326,6 +1326,12 @@ pub const Engine = struct {
         }
         if (clone) {
             try self.enc(&seg1, req.ref_text.?);
+            // Every text segment is encoded with its own BOS: the reference
+            // tokenizer applies add_special_tokens=True per segment, so the
+            // target-text segment must open with BOS too. Without it the
+            // model continues the ref-text segment (speaks a sample-continuation
+            // prefix) instead of starting a new segment at the target text.
+            try seg2.append(allocator, 2); // BOS on the second text segment
             if (req.voice) |v| {
                 if (!voiceSlotValid(v)) return error.UnknownVoice;
                 try seg2.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
