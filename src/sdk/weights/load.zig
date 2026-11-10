@@ -315,7 +315,42 @@ pub fn loadSafetensorsFile(
         // oMLX's V4.1 packs nest the text model under `language_model.`: kept under the release's names.
         const name = if (opts.dsv41 and std.mem.startsWith(u8, key_str, dsv41_text_prefix)) key_str[dsv41_text_prefix.len..] else key_str;
         const owned_key = try allocator.dupe(u8, name);
-        try weights.map.put(owned_key, final_value);
+        const gpe = weights.map.getOrPut(owned_key) catch |e| {
+            allocator.free(owned_key);
+            return e;
+        };
+        if (gpe.found_existing) {
+            _ = mlx.mlx_array_free(gpe.value_ptr.*);
+            // A float weight replacing a packed one (a fork that ships the
+            // replacement in its own shard and retires the triple from the
+            // index) leaves the old shard's scales/biases as orphans: the
+            // quantized arms refuse a non-uint32 weight, so drop the pair the
+            // dtype no longer justifies. The reverse order needs nothing: a
+            // packed weight beside float scales is a different key that never
+            // met this one.
+            if (std.mem.endsWith(u8, name, ".weight")) dropOrphanQuantPair(weights, allocator, name, final_value);
+        }
+        gpe.key_ptr.* = owned_key;
+        gpe.value_ptr.* = final_value;
+    }
+}
+
+/// A `.weight` whose dtype is float cannot be the packed half of a quant pair:
+/// free a still-set `.scales`/`.biases` beside it.
+fn dropOrphanQuantPair(weights: *Weights, allocator: std.mem.Allocator, weight_key: []const u8, weight: mlx.mlx_array) void {
+    if (weight.ctx == null) return;
+    switch (mlx.mlx_array_dtype(weight)) {
+        .bfloat16, .float16, .float32 => {},
+        else => return,
+    }
+    var buf: [512]u8 = undefined;
+    const base = weight_key[0 .. weight_key.len - ".weight".len];
+    inline for (.{ ".scales", ".biases", ".weight_scale_inv" }) |leaf| {
+        const side = std.fmt.bufPrint(&buf, "{s}{s}", .{ base, leaf }) catch return;
+        if (weights.map.fetchRemove(side)) |rm| {
+            _ = mlx.mlx_array_free(rm.value);
+            allocator.free(rm.key);
+        }
     }
 }
 

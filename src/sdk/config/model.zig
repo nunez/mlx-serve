@@ -5554,6 +5554,47 @@ test "loadWeights ignores an index that names no shard on disk (re-sharded uploa
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
 
+test "loadWeights drops a leaked quant pair beside a float weight a later shard overwrote" {
+    // An abliterated fork ships the replacement weight in its own shard and
+    // retires the packed triple from the index, but the trunk shard still
+    // carries it: shard order decides which `weight` wins while the unnamed
+    // scales/biases always survive. The dtype decides — MLX's quantized arm
+    // refuses a non-uint32 weight — so the pair is dropped at the merge.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const shard_a = "{\"l.weight\":{\"dtype\":\"U32\",\"shape\":[4,1],\"data_offsets\":[0,16]}," ++
+        "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}," ++
+        "\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[24,32]}}";
+    const shard_b = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}}";
+    const files = [_]struct { name: []const u8, hdr: []const u8, body: usize }{
+        .{ .name = "model-a.safetensors", .hdr = shard_a, .body = 32 },
+        .{ .name = "model-b.safetensors", .hdr = shard_b, .body = 8 },
+    };
+    for (files) |f| {
+        var st: [8 + 256 + 8]u8 = undefined;
+        std.mem.writeInt(u64, st[0..8], f.hdr.len, .little);
+        @memcpy(st[8 .. 8 + f.hdr.len], f.hdr);
+        @memset(st[8 + f.hdr.len .. 8 + f.hdr.len + f.body], 0);
+        try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = st[0 .. 8 + f.hdr.len + f.body] });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"l.weight\":\"model-b.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{ .index_owners = true });
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 1), w.count());
+    const weight = w.get("l.weight") orelse return error.NoWeight;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weight));
+    try testing.expect(w.get("l.scales") == null);
+    try testing.expect(w.get("l.biases") == null);
+}
+
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
     // mlx-community/LFM2.5-2.6B-{8bit,nvfp4} declare `Lfm2ForCausalLM` with NO
     // text_config (just an empty `vision_config`), yet ship every weight under
