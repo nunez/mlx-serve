@@ -15,6 +15,7 @@ const std = @import("std");
 // == this module), so they must be `pub`, mirroring main.zig.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+pub const env = @import("env.zig");
 const model_mod = @import("sdk/config/model.zig");
 const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
 const tokenizer_load = @import("sdk/tokenizer/load.zig");
@@ -44,6 +45,16 @@ const embed_asr = @import("embed/asr.zig");
 const wav_mod = @import("sdk/media/wav.zig");
 pub const log = @import("sdk/util/log.zig");
 const build_options = @import("build_options");
+// The generated plugin registry: its comptime block exports every in-tree
+// plugin's table (`mlx_serve_plugin_<name>_v1`), which the NIF .so must carry
+// for the media-plugin dlopen path. main.zig imports it the same way.
+const plugin_registry = @import("plugins/registry.zig");
+comptime {
+    _ = plugin_registry.entries.len;
+    // One compile unit (the embed lib never builds under -Dunits): the
+    // engine's table is exported from here, as main.zig does for the exe.
+    if (!build_options.units) _ = @import("engines/mlx/api.zig");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Event protocol (sent via the C callback).
@@ -540,7 +551,7 @@ fn bootEngine(cfg: *const InitConfig, slot: *?*Embed, mu: *std.c.pthread_mutex_t
     // Device selection (mirrors main.zig / ios_lib.zig).
     var metal_avail: bool = false;
     _ = mlx.mlx_metal_is_available(&metal_avail);
-    const force_cpu = if (std.c.getenv("MLXSERVE_DEVICE")) |d|
+    const force_cpu = if (env.get(.MLXSERVE_DEVICE)) |d|
         std.mem.eql(u8, std.mem.span(d), "cpu")
     else
         false;
@@ -1334,7 +1345,7 @@ fn ensureMediaCacheLimit() void {
     if (g_media_cache_latched) return;
     g_media_cache_latched = true;
     var mb: usize = 1024;
-    if (std.c.getenv("MLXSERVE_MEDIA_CACHE_MB")) |v| {
+    if (env.get(.MLXSERVE_MEDIA_CACHE_MB)) |v| {
         mb = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
     }
     var old: usize = 0;
@@ -1862,7 +1873,7 @@ fn mediaWorkerLoop() void {
     // Same device selection as mlxembed_init: Metal when available, else CPU.
     var metal_avail: bool = false;
     _ = mlx.mlx_metal_is_available(&metal_avail);
-    const force_cpu = if (std.c.getenv("MLXSERVE_DEVICE")) |d|
+    const force_cpu = if (env.get(.MLXSERVE_DEVICE)) |d|
         std.mem.eql(u8, std.mem.span(d), "cpu")
     else
         false;

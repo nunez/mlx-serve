@@ -12,6 +12,10 @@ pub fn add(b: *std.Build, g: *const macos.Graph) void {
         .root_module = g.embedModule(),
         .linkage = .static,
     });
+    // Bundle compiler_rt: the NIF .so dlopens the static lib, and macOS's
+    // compiler-rt excludes the quad/i128 soft-float symbols it references
+    // (__addtf3 etc.). Without this the dlopen fails on `___addtf3`.
+    lib.bundle_compiler_rt = true;
     const install = b.addInstallArtifact(lib, .{
         .dest_dir = .{ .override = .{ .custom = "lib" } },
     });
