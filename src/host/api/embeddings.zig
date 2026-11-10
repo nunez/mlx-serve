@@ -206,7 +206,7 @@ pub fn handleEmbeddings(
 /// it we'd pool the final text token and quietly diverge from the model card. Frees `raw_ids`.
 /// `appended`: the tokenizer's post-processor terminator (`Tokenizer.appended_special`), which can differ from
 /// config.json's eos (Qwen3-Embedding-4B: `<|im_end|>` there, `<|endoftext|>` pooled).
-fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, appended: ?u32, raw_ids: []u32) ![]u32 {
+pub fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, appended: ?u32, raw_ids: []u32) ![]u32 {
     const eos: ?u32 = if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null;
     if (config.use_bidirectional_attention) {
         defer allocator.free(raw_ids);

@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("build/config.zig");
+const embed_lib = @import("build/embed_lib.zig");
 const ios = @import("build/ios.zig");
 const kit = @import("build/kit.zig");
 const lint = @import("build/lint.zig");
@@ -62,6 +63,8 @@ pub fn build(b: *std.Build) void {
     const graph: macos.Graph = .init(b, target, optimize, host, units);
     // `install`, `units`, `units-check`, `run`.
     macos.addServer(&graph, plugin_names);
+    // `mac-lib`: the fleet embed static lib.
+    embed_lib.add(b, &graph);
     // `test-build`, `test`.
     const tests = macos.addUnitTests(&graph);
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load.

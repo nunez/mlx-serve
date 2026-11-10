@@ -17,6 +17,9 @@ pub const Graph = struct {
     /// The server's module (`src/main.zig`; `src/exe.zig` under `-Dunits`) and the unit tests' (`src/tests.zig`).
     exe_mod: *std.Build.Module,
     test_mod: *std.Build.Module,
+    /// What engineModule composes from: stored so the fleet embed lib builds the
+    /// same module over `src/embed.zig` (`build/embed_lib.zig`).
+    shared: Shared,
 
     pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host: config.Host, units: bool) Graph {
         // App version. Release builds pass it explicitly (app/build.sh computes the
@@ -88,6 +91,7 @@ pub const Graph = struct {
             .host = host,
             .version = version,
             .units = units,
+            .shared = shared,
             .exe_mod = blk: {
                 const m = shared.engineModule(b, target, optimize, host, "src/main.zig");
                 // CI and release pass -Dstrip: debug info is most of the ReleaseFast compile's peak memory, which
@@ -97,6 +101,12 @@ pub const Graph = struct {
             },
             .test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig"),
         };
+    }
+
+    /// The fleet embed's module: the server's module over `src/embed.zig`
+    /// (the C ABI static lib; `build/embed_lib.zig`).
+    pub fn embedModule(g: *const Graph) *std.Build.Module {
+        return g.shared.engineModule(g.b, g.target, g.optimize, g.host, "src/embed.zig");
     }
 };
 
