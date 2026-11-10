@@ -529,7 +529,41 @@ export fn mlxembed_last_error() callconv(.c) [*:0]const u8 {
 
 /// Boots one engine instance into `slot` under `mu`. Shared by the chat
 /// engine (`mlxembed_init`) and the embeddings engine (`mlxembed_embed_init`).
+/// The boot (config parse, tokenizer, engine start) runs on its OWN big-stack
+/// thread: erts dirty-CPU scheduler threads carry a ~320 KB native stack
+/// (`-sssdcpu` 40 kwords), and the config/tokenizer path needs more. The
+/// NIF-side caller (a BEAM process) waits on the boot thread.
 fn bootEngine(cfg: *const InitConfig, slot: *?*Embed, mu: *std.c.pthread_mutex_t, tag: []const u8) i32 {
+    var t = BootThread{ .cfg = cfg, .slot = slot, .mu = mu, .tag = tag };
+    return t.wait();
+}
+
+const BootThread = struct {
+    cfg: *const InitConfig,
+    slot: *?*Embed,
+    mu: *std.c.pthread_mutex_t,
+    tag: []const u8,
+    rc: i32 = -99,
+
+    fn init(cfg: *const InitConfig, slot: *?*Embed, mu: *std.c.pthread_mutex_t, tag: []const u8) ?BootThread {
+        return .{ .cfg = cfg, .slot = slot, .mu = mu, .tag = tag };
+    }
+
+    fn wait(self: *BootThread) i32 {
+        const th = std.Thread.spawn(.{ .stack_size = 32 << 20 }, run, .{self}) catch {
+            setErr("boot: thread spawn failed", .{});
+            return -1;
+        };
+        th.join();
+        return self.rc;
+    }
+
+    fn run(self: *BootThread) void {
+        self.rc = bootEngineInner(self.cfg, self.slot, self.mu, self.tag);
+    }
+};
+
+fn bootEngineInner(cfg: *const InitConfig, slot: *?*Embed, mu: *std.c.pthread_mutex_t, tag: []const u8) i32 {
     _ = std.c.pthread_mutex_lock(mu);
     defer _ = std.c.pthread_mutex_unlock(mu);
     if (slot.* != null) {
@@ -537,6 +571,7 @@ fn bootEngine(cfg: *const InitConfig, slot: *?*Embed, mu: *std.c.pthread_mutex_t
         return -1;
     }
     installErrorTrap();
+    @import("sdk/util/log.zig").enableStderr();
     const alloc = std.heap.c_allocator;
     const model_dir = std.mem.span(cfg.model_dir);
     if (model_dir.len == 0) {
@@ -1145,7 +1180,7 @@ export fn mlxembed_embed_texts(cfg: *const EmbedTextParams, cb: Callback, cb_ctx
         .media = false,
     };
     _ = e.feeders.fetchAdd(1, .release);
-    const th = std.Thread.spawn(.{}, feederEmbedMain, .{f}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = 32 << 20 }, feederEmbedMain, .{f}) catch {
         _ = e.feeders.fetchSub(1, .release);
         alloc.free(payload);
         alloc.free(lens_copy);
@@ -1221,7 +1256,7 @@ export fn mlxembed_embed_media(cfg: *const EmbedMediaParams, cb: Callback, cb_ct
         .media = true,
     };
     _ = e.feeders.fetchAdd(1, .release);
-    const th = std.Thread.spawn(.{}, feederEmbedMain, .{f}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = 32 << 20 }, feederEmbedMain, .{f}) catch {
         _ = e.feeders.fetchSub(1, .release);
         alloc.free(payload);
         alloc.free(lens_copy);
@@ -1534,7 +1569,7 @@ fn runPluginRoute(c: *MediaGenCtx, eng: *plugin_engine.Engine, route: gen_mod.Ge
     };
 
     var cx = Ctx{ .fd = sv[1], .out = &out };
-    const th = std.Thread.spawn(.{}, Ctx.run, .{&cx}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = 32 << 20 }, Ctx.run, .{&cx}) catch {
         _ = std.c.close(sv[0]);
         _ = std.c.close(sv[1]);
         out.deinit(alloc);
@@ -1930,7 +1965,7 @@ fn mediaTeardown() void {
 
 fn mediaEnsureWorker() void {
     if (g_worker != null) return;
-    g_worker = std.Thread.spawn(.{}, mediaWorkerLoop, .{}) catch {
+    g_worker = std.Thread.spawn(.{ .stack_size = 32 << 20 }, mediaWorkerLoop, .{}) catch {
         setErr("media: worker spawn failed", .{});
         return;
     };
@@ -2443,7 +2478,7 @@ fn generate(cfg: *const GenParams, images: []const EncodedImage, cb: Callback, c
     };
     _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
     _ = e.feeders.fetchAdd(1, .release);
-    const th = std.Thread.spawn(.{}, feederMain, .{f}) catch {
+    const th = std.Thread.spawn(.{ .stack_size = 32 << 20 }, feederMain, .{f}) catch {
         _ = std.c.pthread_mutex_lock(&g_generations_mutex);
         _ = g_generations.remove(gen_id);
         _ = std.c.pthread_mutex_unlock(&g_generations_mutex);
