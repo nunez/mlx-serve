@@ -63,7 +63,10 @@ comptime {
 //   ERR   (3): payload is a NUL-terminated UTF-8 message.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 9;
+/// v10: `GenParams.min_p` (after `repeat_penalty`); the feed path now reads the
+/// request's Stream (tokens, stats, finish reason) instead of the slot buffer.
+/// v9: the embeddings engine (`mlxembed_embed_init`, `*_embed_*` calls).
+pub const ABI_VERSION: u32 = 10;
 
 pub const Event = enum(u32) {
     text = 1,
@@ -142,6 +145,10 @@ pub const GenParams = extern struct {
     top_k: u32, // 0 => disabled
     presence_penalty: f32,
     repeat_penalty: f32, // 0 => 1.0
+    /// min_p cut; <= 0 falls back to the pack's `generation_config.json`
+    /// recommendation (`config.gen_min_p`), like the HTTP server's precedence.
+    /// ABI v10: append-only, sits after `repeat_penalty` and before `seed`.
+    min_p: f32,
     seed: u64, // 0 => unset (random)
     request_timeout_ms: u64, // 0 => none
 };
@@ -417,11 +424,11 @@ fn feederMain(f: *Feeder) void {
             const info = DoneInfo{
                 .finish_reason = reasonCode(final_reason),
                 ._pad = .{ 0, 0, 0 },
-                .prompt_tokens = f.slot.prompt_tokens,
-                .cached_tokens = f.slot.cached_tokens,
-                .completion_tokens = f.slot.completion_tokens,
-                .prefill_ns = f.slot.prefill_ns,
-                .decode_ns = f.slot.decode_ns,
+                .prompt_tokens = f.running.stream.prompt_tokens,
+                .cached_tokens = f.running.stream.cached_tokens,
+                .completion_tokens = f.running.stream.completion_tokens,
+                .prefill_ns = f.running.stream.prefill_ns,
+                .decode_ns = f.running.stream.decode_ns,
             };
             const ptr: [*]const u8 = @ptrCast(&info);
             f.cb(f.cb_ctx, f.gen_id, @backingInt(Event.done), ptr, @sizeOf(DoneInfo));
@@ -434,14 +441,17 @@ fn feederMain(f: *Feeder) void {
         alloc.destroy(f);
     }
 
+    // The submit attaches the request's Stream as the slot's sink, so tokens
+    // (and the stats + finish reason) land THERE; the slot's own out_buf stays
+    // empty and `waitNext` on it sees no tokens at all. Read the stream.
     while (true) {
-        const nr = f.slot.waitNextTimeout(200) orelse {
+        const nr = f.running.stream.waitNextTimeout(200) orelse {
             if (e.shutting_down.load(.acquire)) break;
             continue;
         };
         switch (nr) {
             .token => |tok_id| {
-                if (f.slot.cancelled.load(.acquire)) {
+                if (f.running.stream.cancelled.load(.acquire)) {
                     final_reason = "abort";
                     break;
                 }
@@ -480,14 +490,11 @@ fn feederMain(f: *Feeder) void {
                 flush(f, combined[0..emit_len]);
             },
             .done => {
-                final_reason = if (f.slot.cancelled.load(.acquire))
-                    "abort"
-                else
-                    f.slot.finish_reason;
+                final_reason = f.running.stream.finish_reason;
                 break;
             },
             .err => {
-                setErr("generation: {s}", .{f.slot.error_code orelse "unknown error"});
+                setErr("generation: {s}", .{f.running.stream.error_code orelse "unknown error"});
                 result = .errored;
                 break;
             },
@@ -1330,6 +1337,9 @@ const MediaGenCtx = struct {
 const MediaLoadReq = struct {
     dir: []u8,
     code: i32 = -99,
+    /// The worker thread's failure message (setErr is threadlocal); copied
+    /// out so the waiting caller's `mlxembed_last_error` reports it.
+    err: []const u8 = "",
     done: bool = false,
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
@@ -1409,7 +1419,13 @@ fn logMemStat(tag: []const u8) void {
 /// Does NOT register the engine in g_media — the caller owns that.
 fn mediaConstructEngine(io: std.Io, alloc: std.mem.Allocator, dir: []const u8) ?MediaEngine {
     ensureMediaCacheLimit();
-    const modality = gen_mod.detectModality(io, alloc, dir) orelse {
+    const modality = gen_mod.detectModality(io, alloc, dir) orelse blk: {
+        // The Voxtral realtime ASR pack has no media plugin on this tree, so
+        // the registry answers no modality for it; the `.diarization` arm
+        // below serves it through the in-embed decoder (src/embed/asr.zig).
+        const peeked = gen_mod.peekModelType(io, alloc, dir) orelse "";
+        if (std.mem.eql(u8, peeked, "voxtral_realtime")) break :blk gen_mod.Modality.diarization;
+        if (peeked.len > 0) alloc.free(peeked);
         setErr("media: undetectable model at {s}", .{dir});
         return null;
     };
@@ -1468,6 +1484,9 @@ fn doMediaLoad(req: *MediaLoadReq) void {
         return;
     }
     const engine = mediaConstructEngine(io, alloc, dir) orelse {
+        // `setErr` wrote on THIS thread (the media worker), but the caller
+        // reads `mlxembed_last_error` on its own; mirror it into the request.
+        req.err = alloc.dupe(u8, lastErr()) catch req.err;
         req.code = -3;
         req.done = true;
         _ = std.c.pthread_cond_signal(&req.cond);
@@ -2088,6 +2107,10 @@ export fn mlxembed_media_load(model_dir: [*:0]const u8) callconv(.c) i32 {
         _ = std.c.pthread_cond_wait(&req.cond, &req.mutex);
     }
     const code = req.code;
+    if (req.err.len > 0) {
+        setErr("{s}", .{req.err});
+        alloc.free(req.err);
+    }
     alloc.free(req.dir);
     alloc.destroy(req);
     return code;
@@ -2420,6 +2443,7 @@ fn generate(cfg: *const GenParams, images: []const EncodedImage, cb: Callback, c
             .temperature = temperature,
             .top_p = top_p,
             .top_k = cfg.top_k,
+            .min_p = if (cfg.min_p > 0) cfg.min_p else config.gen_min_p,
             .repeat_penalty = repeat_penalty,
             .presence_penalty = cfg.presence_penalty,
             .seed = seed,
@@ -2524,6 +2548,7 @@ export fn mlxembed_unload(model_id: [*:0]const u8) callconv(.c) i32 {
     return 0;
 }
 
+/// Loads a model into the engine by directory (register + ensureLoaded).
 export fn mlxembed_load(model_dir: [*:0]const u8) callconv(.c) i32 {
     _ = std.c.pthread_mutex_lock(&g_mutex);
     defer _ = std.c.pthread_mutex_unlock(&g_mutex);
