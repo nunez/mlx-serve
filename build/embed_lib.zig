@@ -21,4 +21,16 @@ pub fn add(b: *std.Build, g: *const macos.Graph) void {
     });
     const step = b.step("mac-lib", "Build the fleet embed static lib (libmlxserve_embed.a)");
     step.dependOn(&install.step);
+
+    // Host-side unit tests of embed.zig (the metal-limit retry guard's pure helpers ride the
+    // same module; the server's test step does not load embed.zig).
+    const embed_filter = b.option([]const u8, "embed-test-filter", "Only run embed tests whose name contains this substring");
+    const embed_tests = b.addTest(.{
+        .name = "embed-test",
+        .root_module = g.embedModule(),
+        .filters = if (embed_filter) |f| &.{f} else &.{},
+    });
+    const run_embed_tests = b.addRunArtifact(embed_tests);
+    if (embed_filter != null) run_embed_tests.has_side_effects = true;
+    step.dependOn(&run_embed_tests.step);
 }

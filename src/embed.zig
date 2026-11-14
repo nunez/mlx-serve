@@ -344,6 +344,44 @@ fn msg_dst(dst: []u8) []const u8 {
     return g_mlx_fail_msg[0..g_mlx_fail_len];
 }
 
+fn mlxFailClear() void {
+    _ = std.c.pthread_mutex_lock(&g_mlx_fail_mutex);
+    defer _ = std.c.pthread_mutex_unlock(&g_mlx_fail_mutex);
+    g_mlx_fail_len = 0;
+    g_mlx_fail_set.store(false, .release);
+}
+
+/// The metal allocator's per-process MTLBuffer COUNT ceiling (`resource_limit_`,
+/// `allocator.cpp`), NOT byte memory: once live buffer objects hit it every alloc throws
+/// `[metal::malloc] Resource limit (499000) exceeded` and the process latches. It is a
+/// recoverable count — freeing cached buffers drops it — so a speech job that dies on it is
+/// worth one retry after a cache clear, not a restart. Distinct from a byte OOM (`[malloc]
+/// Unable to allocate`), which a clear cannot fix.
+fn isMetalResourceLimit(msg: []const u8) bool {
+    return std.mem.indexOf(u8, msg, "Resource limit") != null;
+}
+
+/// Clear both failure latches and drop MLX's buffer cache, so a retry sees a clean allocator.
+/// Re-arm the embed trap AFTER the clear: any new failure during the retry latches again.
+fn reclaimMetalResources() void {
+    mlxFailClear();
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    _ = mlx.mlx_clear_cache();
+}
+
+/// Whether a just-failed speech job earns one retry: this job tripped the recoverable metal
+/// buffer-count limit (not a byte OOM, not another error) and no other job's failure is set.
+/// Consumes the latch on the yes path so the retry runs clean; a no path leaves it for the
+/// caller's error event. `tried` is whether the caller already retried (guards one retry).
+fn metalRetryWorthy(msg: ?[]const u8, tried: bool) bool {
+    if (tried) return false;
+    const m = msg orelse return false;
+    if (!isMetalResourceLimit(m)) return false;
+    reclaimMetalResources();
+    return true;
+}
+
 fn reasonCode(r: []const u8) u8 {
     if (std.mem.eql(u8, r, "stop")) return @backingInt(Reason.stop);
     if (std.mem.eql(u8, r, "length")) return @backingInt(Reason.length);
@@ -1330,6 +1368,8 @@ const MediaGenCtx = struct {
     stream_chunk_frames: u32,
     edit_images: []const []const u8,
     failbuf: [512:0]u8 = std.mem.zeroes([512:0]u8),
+    /// Set once this job has retried after a metal buffer-count failure; guards a single retry.
+    metal_retried: bool = false,
     video_json: []u8,
     decision_json: []u8,
 };
@@ -1821,22 +1861,50 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
                 .seed = if (c.seed == 0) null else c.seed,
             };
             if (c.stream != 0) {
-                const synth = be.synthesizeStream(alloc, req, breeze_mod.StreamSpec{
+                const spec = breeze_mod.StreamSpec{
                     .emit = ttsPcmEmit,
                     .emit_user = c,
                     .chunk_frames = c.stream_chunk_frames,
                     .cancel = mediaCancelled,
                     .cancel_user = c,
-                }) catch |err| {
-                    const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
-                    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                };
+                // A metal-limit hit surfaces as an error OR a clean return with the latch set;
+                // both run the same one-retry body. A retry re-emits the whole turn (a brief
+                // repeat on a stream), far better than the hours-silent latch this used to be.
+                const Attempt = struct {
+                    fn once(eng: *breeze_mod.Engine, a: std.mem.Allocator, rq: breeze_mod.Request, stream_spec: breeze_mod.StreamSpec) ?breeze_mod.Synthesis {
+                        return eng.synthesizeStream(a, rq, stream_spec) catch return null;
+                    }
+                };                var synth = Attempt.once(be, alloc, req, spec) orelse blk: {
+                    if (c.cancelled.load(.acquire)) {
+                        const msg = "cancelled";
+                        c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
+                        return;
+                    }
+                    if (metalRetryWorthy(mlxFailPeek(c.failbuf[0..]), c.metal_retried)) {
+                        c.metal_retried = true;
+                        break :blk Attempt.once(be, alloc, req, spec) orelse {
+                            ttsMlxFailEvent(c);
+                            return;
+                        };
+                    }
+                    const nm = lastErr();
+                    c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), nm.ptr, @intCast(nm.len));
                     return;
                 };
-                // Stream mode: PCM left via ttsPcmEmit; Synthesis.pcm is a
-                // static empty slice (do not free). On success the frames
-                // buffer is ours (run's errdefer only fires on error).
                 alloc.free(@constCast(synth.frames));
-                if (mlxFailPeek(c.failbuf[0..]) != null) {
+                if (metalRetryWorthy(mlxFailPeek(c.failbuf[0..]), c.metal_retried)) {
+                    c.metal_retried = true;
+                    synth = Attempt.once(be, alloc, req, spec) orelse {
+                        ttsMlxFailEvent(c);
+                        return;
+                    };
+                    alloc.free(@constCast(synth.frames));
+                    if (mlxFailPeek(c.failbuf[0..]) != null) {
+                        ttsMlxFailEvent(c);
+                        return;
+                    }
+                } else if (mlxFailPeek(c.failbuf[0..]) != null) {
                     ttsMlxFailEvent(c);
                     return;
                 }
@@ -1844,7 +1912,7 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
                 logMemStat("after-tts");
                 return;
             }
-            const synth = be.synthesize(alloc, req) catch |err| {
+            var synth = be.synthesize(alloc, req) catch |err| {
                 const msg = if (err == error.Cancelled) "cancelled" else @errorName(err);
                 c.cb(c.cb_ctx, c.gen_id, @backingInt(Event.err), msg.ptr, @intCast(msg.len));
                 return;
@@ -1852,8 +1920,20 @@ fn runMediaGenerate(c: *MediaGenCtx) void {
             defer alloc.free(synth.pcm);
             // A Metal failure mid-synthesis (e.g. the resource limit) can leave
             // empty arrays behind; synthesize may still return "successfully"
-            // with corrupt PCM. Drop it and fail the job instead.
-            if (mlxFailPeek(c.failbuf[0..]) != null) {
+            // with corrupt PCM. Retry once on the buffer-count limit; otherwise
+            // drop the corrupt audio and fail the job.
+            if (metalRetryWorthy(mlxFailPeek(c.failbuf[0..]), c.metal_retried)) {
+                c.metal_retried = true;
+                alloc.free(synth.pcm);
+                synth = be.synthesize(alloc, req) catch {
+                    ttsMlxFailEvent(c);
+                    return;
+                };
+                if (mlxFailPeek(c.failbuf[0..]) != null) {
+                    ttsMlxFailEvent(c);
+                    return;
+                }
+            } else if (mlxFailPeek(c.failbuf[0..]) != null) {
                 ttsMlxFailEvent(c);
                 return;
             }
@@ -2603,4 +2683,37 @@ export fn mlxembed_stats(out: ?[*]u64) callconv(.c) i32 {
         o[3] = @intCast(e.feeders.load(.acquire));
     }
     return 0;
+}
+test "a metal resource-limit failure is the only retry class" {
+    try std.testing.expect(isMetalResourceLimit("[metal::malloc] Resource limit (499000) exceeded. at array.cpp:352"));
+    // A byte OOM and a plain engine error are not recoverable by a cache clear.
+    try std.testing.expect(!isMetalResourceLimit("[malloc] Unable to allocate 8589934592 bytes."));
+    try std.testing.expect(!isMetalResourceLimit("[slice_update] Invalid slice sizes."));
+    try std.testing.expect(!isMetalResourceLimit(""));
+}
+
+test "metalRetryWorthy: one retry on the limit, never a second, never another class" {
+    const limit = "[metal::malloc] Resource limit (499000) exceeded. at array.cpp:352";
+    try std.testing.expect(metalRetryWorthy(limit, false)); // first trip: retry
+    try std.testing.expect(!metalRetryWorthy(limit, true)); // already retried: stop
+    try std.testing.expect(!metalRetryWorthy(null, false)); // no message: stop
+    try std.testing.expect(!metalRetryWorthy("cancelled", false)); // wrong class: stop
+}
+
+test "metalRetryWorthy clears both latches so the retry runs clean" {
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
+    mlxFailClear();
+    mlx.latchErrorForTest("[metal::malloc] Resource limit (499000) exceeded. at array.cpp:352");
+    mlxFailRecord("[metal::malloc] Resource limit (499000) exceeded. at array.cpp:352");
+    try std.testing.expect(mlxFailPeek(buf[0..]) != null);
+    try std.testing.expect(metalRetryWorthy(mlxFailPeek(buf[0..]), false));
+    // Both the embed trap and the mlx-c latch are clear for the retry.
+    try std.testing.expect(mlxFailPeek(buf[0..]) == null);
+    try std.testing.expect(!mlx.errorPending());
+    // A non-limit class leaves the mlx latch for the caller's error event.
+    mlx.latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try std.testing.expect(!metalRetryWorthy("[slice_update] Invalid slice sizes.", false));
+    try std.testing.expect(mlx.errorPending());
+    _ = mlx.takeError(&buf);
 }
