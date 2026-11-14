@@ -382,6 +382,19 @@ fn metalRetryWorthy(msg: ?[]const u8, tried: bool) bool {
     return true;
 }
 
+/// Clear MLX's allocator cache after a job holding `cached` bytes: always for media, from
+/// 256 MiB for decision jobs (the media worker's steady-state release, same rule the server's
+/// media runner uses — without it the metal buffer COUNT ratchets up until the 499000 latch).
+fn shouldClearCache(decision: bool, cached: usize) bool {
+    return !decision or cached >= 256 << 20;
+}
+
+fn maybeClearCache(decision: bool) void {
+    var cached: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cached);
+    if (shouldClearCache(decision, cached)) _ = mlx.mlx_clear_cache();
+}
+
 fn reasonCode(r: []const u8) u8 {
     if (std.mem.eql(u8, r, "stop")) return @backingInt(Reason.stop);
     if (std.mem.eql(u8, r, "length")) return @backingInt(Reason.length);
@@ -1370,6 +1383,9 @@ const MediaGenCtx = struct {
     failbuf: [512:0]u8 = std.mem.zeroes([512:0]u8),
     /// Set once this job has retried after a metal buffer-count failure; guards a single retry.
     metal_retried: bool = false,
+    /// A decision-class job (answers in KiB): its post-job cache release rides the 256 MiB
+    /// bar (the server media runner's rule); every other job clears unconditionally.
+    decision_class: bool = false,
     video_json: []u8,
     decision_json: []u8,
 };
@@ -1810,6 +1826,10 @@ fn runMediaAsr(c: *MediaGenCtx, eng: *embed_asr.Engine) void {
 
 fn runMediaGenerate(c: *MediaGenCtx) void {
     defer mediaFeederCleanup(c);
+    // Steady-state metal buffer-count release, same rule the server's media runner uses:
+    // media always, decision from 256 MiB. MLX's count-based latch has no byte-pressure path
+    // on big-RAM machines, so without this the count ratchets across the day's traffic.
+    defer maybeClearCache(c.decision_class);
     const alloc = c.alloc;
     const s = mlx.mlx_default_gpu_stream_new();
     _ = mlx.mlx_set_default_stream(s);
@@ -2330,6 +2350,7 @@ export fn mlxembed_media_generate(cfg: *const MediaGenConfig, cb: Callback, cb_c
         .edit_images = edit_images,
         .video_json = if (cfg.video_json) |p| alloc.dupe(u8, p[0..cfg.video_json_len]) catch &.{} else &.{},
         .decision_json = if (cfg.decision_json) |p| alloc.dupe(u8, p[0..cfg.decision_json_len]) catch &.{} else &.{},
+        .decision_class = cfg.decision_json != null and cfg.decision_json_len > 0,
     };
 
     const gen_id = g_next_id.fetchAdd(1, .monotonic);
@@ -2716,4 +2737,10 @@ test "metalRetryWorthy clears both latches so the retry runs clean" {
     try std.testing.expect(!metalRetryWorthy("[slice_update] Invalid slice sizes.", false));
     try std.testing.expect(mlx.errorPending());
     _ = mlx.takeError(&buf);
+}
+
+test "a media job always clears the allocator cache, a decision job only from 256 MiB" {
+    try std.testing.expect(shouldClearCache(false, 0));
+    try std.testing.expect(!shouldClearCache(true, (256 << 20) - 1));
+    try std.testing.expect(shouldClearCache(true, 256 << 20));
 }
