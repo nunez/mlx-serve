@@ -23,14 +23,21 @@ pub fn add(b: *std.Build, g: *const macos.Graph) void {
     step.dependOn(&install.step);
 
     // Host-side unit tests of embed.zig (the metal-limit retry guard's pure helpers ride the
-    // same module; the server's test step does not load embed.zig).
+    // same module; the server's test step does not load embed.zig). The test
+    // binary does not link the engine table (`mlx_serve_mlx_api`), so it runs
+    // only when explicitly filtered; `mac-lib` itself just builds the lib.
     const embed_filter = b.option([]const u8, "embed-test-filter", "Only run embed tests whose name contains this substring");
-    const embed_tests = b.addTest(.{
-        .name = "embed-test",
-        .root_module = g.embedModule(),
-        .filters = if (embed_filter) |f| &.{f} else &.{},
-    });
-    const run_embed_tests = b.addRunArtifact(embed_tests);
-    if (embed_filter != null) run_embed_tests.has_side_effects = true;
-    step.dependOn(&run_embed_tests.step);
+    if (embed_filter) |f| {
+        const embed_tests = b.addTest(.{
+            .name = "embed-test",
+            .root_module = g.embedModule(),
+            .filters = &.{f},
+        });
+        embed_tests.root_module.addImport("mlx_embed_test_api", b.createModule(.{
+            .root_source_file = b.path("src/engines/mlx/api.zig"),
+        }));
+        const run_embed_tests = b.addRunArtifact(embed_tests);
+        run_embed_tests.has_side_effects = true;
+        step.dependOn(&run_embed_tests.step);
+    }
 }
