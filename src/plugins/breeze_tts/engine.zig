@@ -106,13 +106,21 @@ pub fn voiceSlotValid(name: []const u8) bool {
 }
 
 /// Frame budget from speak units (see speakUnits): units / CHARS_PER_SEC ×
-/// FRAME_RATE, with a headroom factor, clamped by a request cap and
-/// MAX_FRAMES. The true stop is always CB_EOS; this is a runaway ceiling.
-pub fn estimateFrames(units: usize, req_max: ?u32) u32 {
+/// FRAME_RATE, with a headroom factor, clamped by a request cap, the
+/// generation window MAX_FRAMES, and whatever is left of it after the
+/// clone-prompt frames (ref audio + BOS + speaker/instruction tokens). A
+/// clone's prompt eats the window the model was trained on: past it RoPE
+/// positions are extrapolation, and the observed failure there is a ×N
+/// pitch artifact ("chipmunk"), not a graceful stop — so the budget clips
+/// before the artifact, cutting the tail speech, and the packer keeps
+/// segments inside this budget so the cut lands at a sentence seam.
+/// The true stop is always CB_EOS; this is a runaway ceiling.
+pub fn estimateFrames(units: usize, req_max: ?u32, prompt_frames: u32) u32 {
     const est: f64 = @as(f64, @floatFromInt(units)) / CHARS_PER_SEC * FRAME_RATE * FRAME_EST_DIV + 4.0;
     var frames: u32 = @intFromFloat(@ceil(est));
     if (req_max) |m| frames = @min(frames, m);
-    return @min(frames, MAX_FRAMES);
+    frames = @min(frames, MAX_FRAMES);
+    return @min(frames, MAX_FRAMES - @min(prompt_frames, MAX_FRAMES));
 }
 
 /// Speakable-character units: 1 per ASCII char, 3 per non-ASCII. CJK speech
@@ -675,7 +683,9 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
     var idx = [_]u32{@intCast(L - 1)};
     var taken = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(taken);
-    try mlx.check(mlx.mlx_take_axis(&taken, last, hostU32(&idx, &[_]c_int{1}), 0, s));
+    const indices = hostU32(&idx, &[_]c_int{1});
+    defer _ = mlx.mlx_array_free(indices);
+    try mlx.check(mlx.mlx_take_axis(&taken, last, indices, 0, s));
     try evalHost(s, taken, out_last);
     _ = mlx.mlx_array_free(x);
 }
@@ -1353,14 +1363,27 @@ pub const Engine = struct {
         defer for (ref_frames.items) |f| allocator.free(f);
         if (clone) {
             const d = try wav_mod.decode(allocator, req.ref_audio.?);
-            defer allocator.free(d.pcm);
+            // The reference tokenizer encodes audio at MIMI_RATE; callers ship
+            // Telegram/browser-converted refs at arbitrary rates (16 kHz is
+            // common). Trust the header, resample to the codec rate; a
+            // rate-blind decode is what makes ref_audio a chipmunk generator
+            // when the container's sample_rate disagrees with the truth.
+            var resampled: []f32 = &.{};
+            var mono: []f32 = &.{};
+            defer {
+                allocator.free(d.pcm);
+                if (resampled.len > 0) allocator.free(resampled);
+                if (mono.len > 0) allocator.free(mono);
+            }
             var pcm = d.pcm;
+            if (d.sample_rate != MIMI_RATE) {
+                resampled = try wav_mod.resampleLinear(allocator, d.pcm, d.channels, d.sample_rate, MIMI_RATE);
+                pcm = resampled;
+            }
             if (d.channels == 2) {
-                const m = try allocator.alloc(f32, d.pcm.len / 2);
-                defer allocator.free(m);
-                for (0..m.len) |i| m[i] = (d.pcm[i * 2] + d.pcm[i * 2 + 1]) / 2;
-                if (d.sample_rate != MIMI_RATE) return error.UnsupportedRefRate; // mixed resample skipped
-                pcm = m;
+                mono = try allocator.alloc(f32, pcm.len / 2);
+                for (0..mono.len) |i| mono[i] = (pcm[i * 2] + pcm[i * 2 + 1]) / 2;
+                pcm = mono;
             }
             if (self.mimi == null) {
                 const tok_dir = try std.fs.path.join(allocator, &.{ self.model_dir, "audio_tokenizer" });
@@ -1470,7 +1493,8 @@ pub const Engine = struct {
 
             const text_len = ids.items.len;
             if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
-            var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames);
+            var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames,
+                @intCast(if (clone) ref_frames.items.len + 1 else 0));
             // The packer keeps segments window-safe; this clamp is the safety
             // net so even a model that never emits EOS stays in the span.
             if (text_len < MAX_SEQ and frames_cap > MAX_SEQ - text_len)
@@ -1759,11 +1783,16 @@ test "voice slot validation" {
 }
 
 test "estimateFrames clamp" {
-    const a = estimateFrames(300, null);
+    const a = estimateFrames(300, null, 0);
     try std.testing.expect(a > 0);
     try std.testing.expect(a <= MAX_FRAMES);
-    const b = estimateFrames(300, 50);
+    const b = estimateFrames(300, 50, 0);
     try std.testing.expectEqual(@as(u32, 50), @min(b, 50));
+    // A 211-frame clone prompt (16 s of 24 kHz ref) leaves 1289 generated frames.
+    const c = estimateFrames(300, null, 211);
+    try std.testing.expect(c <= MAX_FRAMES - 211);
+    // Prompt bigger than the whole window still yields a safe budget, not underflow.
+    try std.testing.expectEqual(@as(u32, 0), estimateFrames(300, null, MAX_FRAMES + 500));
 }
 
 test "splitSentences latin, cjk, hard split" {
@@ -1833,6 +1862,54 @@ test "frameEmbed sums table rows" {
     }
     try std.testing.expectEqual(@as(f32, 4), out[0]);
     try std.testing.expectEqual(@as(f32, 6), out[1]);
+}
+
+test "breeze forward releases temporary device arrays" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const values: [128]f32 = @splat(1);
+    const norm = hostF32(&values, &.{128});
+    defer _ = mlx.mlx_array_free(norm);
+    var out: [128]f32 = undefined;
+    try qwenForward(s, &.{}, norm, 1e-6, B_THETA, &values, 1, 128, 1, 0, null_arr, null, &out);
+    try mlx.check(mlx.mlx_synchronize(s));
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    for (0..32) |_| {
+        try qwenForward(s, &.{}, norm, 1e-6, B_THETA, &values, 1, 128, 1, 0, null_arr, null, &out);
+    }
+    try mlx.check(mlx.mlx_synchronize(s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    try std.testing.expectEqual(before, after);
+}
+
+// The chipmunk guard: a reference clip whose container declares 16 kHz (the
+// Telegram/browser conversion rate) used to fall through to encodeSamples
+// rate-blind and condition the model on pitch-shifted frames. The ref path
+// must resample by header rate, not trust the samples to already be 24 kHz.
+test "clone ref resamples by container rate" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const period_f = @as(f32, @floatFromInt(MIMI_RATE)) / 400.0; // 400 Hz at 24 kHz
+    var tone = std.ArrayList(f32).empty;
+    defer tone.deinit(a);
+    for (0..16_000) |i| {
+        // Emulate a 16 kHz clip: a 400 Hz tone when played at the header rate.
+        const v = @sin(@as(f32, @floatFromInt(i)) / (period_f / 2) * std.math.pi);
+        try tone.append(a, v);
+    }
+    const wav_bytes = try wav_mod.encodePcm16Mono(a, tone.items, 16_000);
+    defer a.free(wav_bytes);
+    const d = try wav_mod.decode(a, wav_bytes);
+    defer a.free(d.pcm);
+    try std.testing.expectEqual(@as(u32, 16_000), d.sample_rate);
+    const r = try wav_mod.resampleLinear(a, d.pcm, d.channels, d.sample_rate, MIMI_RATE);
+    defer a.free(r);
+    // 16 kHz → 24 kHz keeps duration; the frame count the encoder sees must
+    // match the clip's real seconds (0.6 s → 7-8 frames at 12.5 fps).
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6 * 12.5), @as(f32, @floatFromInt(r.len)) / 1920.0, 1.0);
 }
 
 test "live synthesize (MLX_SERVE_BREEZE_MODEL)" {

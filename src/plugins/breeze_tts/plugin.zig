@@ -150,6 +150,7 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
     const ref_audio = body.str("ref_audio");
     var ref_bytes: []u8 = &.{};
     defer gpa.free(ref_bytes);
+    var prompt_frames: u32 = 0; // clone: ref frames + EOS slot, reserved out of the frame budget
     if (ref_audio) |b64| {
         ref_bytes = job.base64Decode(gpa, b64) catch
             return bad("'ref_audio' is not valid base64");
@@ -158,6 +159,12 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
             ref_bytes = &.{};
             return bad("'ref_audio' is not a decodable WAV");
         };
+        const ref_frames_est = std.math.divCeil(
+            u64,
+            @as(u64, @intCast(decoded.pcm.len)) * engine.MIMI_RATE,
+            @as(u64, decoded.sample_rate) * 1920,
+        ) catch 0;
+        prompt_frames = @intCast(@min(ref_frames_est + 1, @as(u64, std.math.maxInt(u32))));
         gpa.free(decoded.pcm);
         const ref_text = body.str("ref_text") orelse
             return bad("'ref_audio' needs its transcript in 'ref_text'");
@@ -169,7 +176,7 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
     const max_frames = body.whole("max_frames") catch
         return bad("'max_frames' must be a whole number");
 
-    const total = engine.estimateFrames(engine.speakUnits(text), if (max_frames) |m| @intCast(@min(m, @as(u64, std.math.maxInt(u32)))) else null);
+    const total = engine.estimateFrames(engine.speakUnits(text), if (max_frames) |m| @intCast(@min(m, @as(u64, std.math.maxInt(u32)))) else null, prompt_frames);
 
     var sink = Sink{
         .p = job.progressOf(progress),
@@ -199,7 +206,6 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
         error.EmptyText => bad("'input' has nothing speakable"),
         error.CloneMissingRefText => bad("'ref_audio' needs its transcript in 'ref_text'"),
         error.UnknownVoice => bad("'voice' must be \"S0\"..\"S9\""),
-        error.UnsupportedRefRate => bad("'ref_audio' must be mono PCM at 16 or 24 kHz"),
         error.PromptTooLongForFrameBudget => bad("the prompt needs more frames than the budget allows; raise 'max_frames'"),
         error.TokenBeyondTeVocab => bad("the prompt holds a token the text encoder cannot represent"),
         else => {
