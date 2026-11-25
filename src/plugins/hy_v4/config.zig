@@ -657,6 +657,9 @@ pub fn parse(
         .inv_freq = .of(c.mrope_inv[0..c.mrope_inv_len]),
         .mrope_newline_rows = c.has_vision,
     };
+    // DFly2's draft layers load and the native drafter runs a block of num_spec_tokens+1 rows.
+    p.spec.native_stages = c.dfly_layers;
+    p.spec.native_block = 6;
     p.cache.layout_namespace = abi.Str.of("hy4-mla-latent-v1");
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);

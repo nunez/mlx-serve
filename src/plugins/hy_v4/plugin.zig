@@ -27,6 +27,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .cache = &.{ .layout = &layout },
     .media = &.{ .tower = &vision_mod.tower, .prepare = &vision_mod.prepare },
+    .spec = &.{ .native_drafter = &trunk_mod.hooks },
     .weights = &.{ .resident_bytes = &residentBytes },
 };
 
