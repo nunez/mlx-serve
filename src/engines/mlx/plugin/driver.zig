@@ -1466,12 +1466,16 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
     defer ablated.deinit();
+    var slot = slotFor(xfm, ctx);
+    const handles = [_]abi.Handle{slot.handle()};
     const f: abi.Forward = .{
         .mode = .decode,
         .rows = 1,
         .tokens = .of(&tokens),
         .slots = .of(&slot_ids),
         .positions = .of(&pos),
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
         .accept_cap = cap,
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
